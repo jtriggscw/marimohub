@@ -279,6 +279,27 @@ describe('makeCompute fail-fast', () => {
 		).toThrow(/MARIMOHUB_COMPUTE_KUBERNETES_IMAGE_PULL_POLICY/);
 	});
 
+	it('forwards Kubernetes workload identity and non-root settings', () => {
+		expect(
+			configOf(
+				makeCompute({
+					MARIMOHUB_COMPUTE_BACKEND: 'kubernetes',
+					MARIMOHUB_COMPUTE_KUBERNETES_PROJECTED_TOKEN_AUDIENCE: 'fabric-gateway',
+					MARIMOHUB_COMPUTE_KUBERNETES_RUN_AS_USER: '1000',
+				}),
+			),
+		).toMatchObject({ projectedTokenAudience: 'fabric-gateway', runAsUser: 1000 });
+	});
+
+	it.each(['0', '-1', '1.5'])('rejects invalid Kubernetes user ID %s', (runAsUser) => {
+		expect(() =>
+			makeCompute({
+				MARIMOHUB_COMPUTE_BACKEND: 'kubernetes',
+				MARIMOHUB_COMPUTE_KUBERNETES_RUN_AS_USER: runAsUser,
+			}),
+		).toThrow(/MARIMOHUB_COMPUTE_KUBERNETES_RUN_AS_USER/);
+	});
+
 	it('forwards kubernetes ingress annotations and default-certificate TLS mode', () => {
 		expect(
 			configOf(

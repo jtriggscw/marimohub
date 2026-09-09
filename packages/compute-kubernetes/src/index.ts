@@ -253,6 +253,8 @@ class KubernetesSandboxInstance implements SandboxInstance {
 			ingressTlsMode: this.config.ingressTlsMode,
 			tlsSecretName: this.config.tlsSecretName,
 			serviceAccountName: this.config.serviceAccountName,
+			projectedTokenAudience: this.config.projectedTokenAudience,
+			runAsUser: this.config.runAsUser,
 			imagePullSecret: this.config.imagePullSecret,
 			imagePullPolicy: this.config.imagePullPolicy,
 			resources: this.config.resources,

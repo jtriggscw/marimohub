@@ -21,7 +21,7 @@
 {{- define "marimohub.labels" -}}
 helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{ include "marimohub.selectorLabels" . }}
-app.kubernetes.io/version: {{ .Values.image.tag | default .Chart.AppVersion | quote }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 
@@ -40,9 +40,14 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- end -}}
 
-{{/* Resolved image ref: repository:(tag|appVersion). */}}
+{{/* Resolved image ref: repository:(tag|appVersion) or repository@digest. */}}
 {{- define "marimohub.image" -}}
-{{- printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) -}}
+{{- $tag := .Values.image.tag | default .Chart.AppVersion -}}
+{{- if hasPrefix "@" $tag -}}
+{{- printf "%s%s" .Values.image.repository $tag -}}
+{{- else -}}
+{{- printf "%s:%s" .Values.image.repository $tag -}}
+{{- end -}}
 {{- end -}}
 
 {{/* Name of the Secret to consume via envFrom (existing or chart-managed). */}}

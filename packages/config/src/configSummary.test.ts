@@ -123,6 +123,8 @@ describe('buildConfigSummary', () => {
 			// Names of k8s Secret objects, not their contents.
 			'MARIMOHUB_COMPUTE_KUBERNETES_TLS_SECRET',
 			'MARIMOHUB_COMPUTE_KUBERNETES_IMAGE_PULL_SECRET',
+			// JWT audience, not token material.
+			'MARIMOHUB_COMPUTE_KUBERNETES_PROJECTED_TOKEN_AUDIENCE',
 			// LLM token limits/TTLs, not credentials.
 			'MARIMOHUB_AI_MAX_TOKENS',
 			'MARIMOHUB_AI_TOKEN_TTL_SECONDS',

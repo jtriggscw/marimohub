@@ -446,6 +446,13 @@ export function makeCompute(env: Env, opts?: ComputeOptions): SandboxProvider {
 				'MARIMOHUB_COMPUTE_KUBERNETES_POD_READY_TIMEOUT_SECONDS',
 			);
 			const pullPolicy = env.MARIMOHUB_COMPUTE_KUBERNETES_IMAGE_PULL_POLICY;
+			const runAsUser = parseIntEnv(env, 'MARIMOHUB_COMPUTE_KUBERNETES_RUN_AS_USER');
+			if (runAsUser !== undefined && (!Number.isSafeInteger(runAsUser) || runAsUser < 1)) {
+				throw new ConfigError(
+					`Invalid MARIMOHUB_COMPUTE_KUBERNETES_RUN_AS_USER: ${runAsUser} (expected a positive safe integer)`,
+					{ variable: 'MARIMOHUB_COMPUTE_KUBERNETES_RUN_AS_USER' },
+				);
+			}
 			const proxyExposure = opts?.sandboxExposureMode === 'proxy';
 			const ingressTlsMode = proxyExposure ? undefined : kubernetesIngressTlsMode(env);
 			const hostnameTemplate = env.MARIMOHUB_COMPUTE_KUBERNETES_HOSTNAME_TEMPLATE;
@@ -486,6 +493,9 @@ export function makeCompute(env: Env, opts?: ComputeOptions): SandboxProvider {
 				ingressTlsMode,
 				tlsSecretName: proxyExposure ? undefined : env.MARIMOHUB_COMPUTE_KUBERNETES_TLS_SECRET,
 				serviceAccountName: env.MARIMOHUB_COMPUTE_KUBERNETES_SERVICE_ACCOUNT,
+				projectedTokenAudience:
+					env.MARIMOHUB_COMPUTE_KUBERNETES_PROJECTED_TOKEN_AUDIENCE?.trim() || undefined,
+				runAsUser,
 				imagePullSecret: env.MARIMOHUB_COMPUTE_KUBERNETES_IMAGE_PULL_SECRET,
 				imagePullPolicy: pullPolicy as 'Always' | 'IfNotPresent' | 'Never' | undefined,
 				resources: hasResources ? resources : undefined,

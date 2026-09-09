@@ -60,6 +60,7 @@ import {
 	defaultImagePullPolicy,
 	MANAGED_BY_LABEL,
 	MANAGED_BY_VALUE,
+	PROJECTED_TOKEN_DIRECTORY,
 	SANDBOX_ID_ANNOTATION,
 } from './shared';
 
@@ -105,6 +106,8 @@ describe('createK8sClient', () => {
 				},
 				tlsSecretName: 'wildcard-cert',
 				serviceAccountName: 'kernel-sa',
+				projectedTokenAudience: 'fabric-gateway',
+				runAsUser: 1000,
 				imagePullSecret: 'regcred',
 				resources: { cpu: '2', memory: '4Gi', gpu: '1' },
 			}),
@@ -123,8 +126,32 @@ describe('createK8sClient', () => {
 				// Short grace: the keep-alive `sleep` ignores SIGTERM, and 30s of
 				// Terminating per deleted Pod holds resources for nothing.
 				terminationGracePeriodSeconds: 5,
+				automountServiceAccountToken: false,
+				enableServiceLinks: false,
 				serviceAccountName: 'kernel-sa',
 				imagePullSecrets: [{ name: 'regcred' }],
+				securityContext: {
+					runAsNonRoot: true,
+					runAsUser: 1000,
+					seccompProfile: { type: 'RuntimeDefault' },
+				},
+				volumes: [
+					{
+						name: 'marimohub-token',
+						projected: {
+							defaultMode: 0o444,
+							sources: [
+								{
+									serviceAccountToken: {
+										audience: 'fabric-gateway',
+										expirationSeconds: 600,
+										path: 'token',
+									},
+								},
+							],
+						},
+					},
+				],
 				containers: [
 					{
 						name: 'marimo',
@@ -136,6 +163,13 @@ describe('createK8sClient', () => {
 							requests: { cpu: '2', memory: '4Gi' },
 							limits: { 'nvidia.com/gpu': '1' },
 						},
+						securityContext: {
+							allowPrivilegeEscalation: false,
+							capabilities: { drop: ['ALL'] },
+						},
+						volumeMounts: [
+							{ name: 'marimohub-token', mountPath: PROJECTED_TOKEN_DIRECTORY, readOnly: true },
+						],
 					},
 				],
 			},
