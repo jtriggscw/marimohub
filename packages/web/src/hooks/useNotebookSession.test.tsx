@@ -103,6 +103,29 @@ describe('useNotebookSession', () => {
 		expect(result.current.sandboxUrl).toBeUndefined();
 	});
 
+	it.each(['expired', 'terminated', 'terminating', 'failed'] as const)(
+		'shows the ended state when start returns a %s session and allows retry',
+		async (status) => {
+			const fetchMock = vi
+				.fn()
+				.mockResolvedValueOnce(jsonOk(makeSession({ status })))
+				.mockImplementation(async () => jsonOk(makeSession()));
+			vi.stubGlobal('fetch', fetchMock);
+			const { result } = renderHookWithClient(() => useNotebookSession(PID, NID), {
+				toaster: false,
+			});
+
+			await waitFor(() => expect(result.current.ended).toBe(status));
+			expect(result.current.session).toBeNull();
+			expect(result.current.isProvisioning).toBe(false);
+			expect(result.current.isRunning).toBe(false);
+
+			act(() => result.current.start());
+			await waitFor(() => expect(result.current.isRunning).toBe(true));
+			expect(result.current.ended).toBeNull();
+		},
+	);
+
 	it('captures the error message when start fails', async () => {
 		vi.stubGlobal(
 			'fetch',

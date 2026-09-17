@@ -25,6 +25,29 @@ function NavigationControls() {
 afterEach(() => vi.useRealTimers());
 
 describe('NotebookPage query parameters', () => {
+	it('opens a triage editor in presentation view after its metadata loads', async () => {
+		let resolveMetadata!: () => void;
+		const notebookPromise = new Promise<void>((resolve) => {
+			resolveMetadata = resolve;
+		});
+		const impl = makeFetch({
+			role: 'editor',
+			tags: ['triage'],
+			notebookPromise,
+			session: runningSession({ mode: 'edit' }),
+		});
+		const { container } = renderPage('edit');
+		await waitFor(() => expect(sessionPosts(impl)).toHaveLength(1));
+		expect(container.querySelector('iframe')).toBeNull();
+		await act(async () => resolveMetadata());
+		const frame = await screen.findByTitle('Forecast');
+		expect(frame).toHaveAttribute(
+			'src',
+			'https://sandbox.example/kernel?theme=light&view-as=present',
+		);
+		expect(sessionPosts(impl)[0]?.[1]?.body).toBeUndefined();
+	});
+
 	it.each(['app', 'edit'] as const)(
 		'uses the latest deep link after a failed %s startup is retried',
 		async (variant) => {

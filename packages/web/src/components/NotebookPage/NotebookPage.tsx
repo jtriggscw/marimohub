@@ -210,19 +210,25 @@ function useNotebookPageModel({ variant = 'edit', target }: NotebookPageProps) {
 	const { theme } = useTheme();
 	const [iframeLocation, setIframeLocation] = useState(() => ({ sandboxUrl, theme }));
 	if (iframeLocation.sandboxUrl !== sandboxUrl) setIframeLocation({ sandboxUrl, theme });
-	const iframeSrc = iframeLocation.sandboxUrl
-		? notebookFrameUrl(iframeLocation.sandboxUrl, location.search, iframeLocation.theme, isApp)
-		: undefined;
-
 	// Metadata for the "created by" line — loaded lazily so it never blocks the
 	// kernel from starting. The author id is resolved to a name via the directory.
 	// It also carries the head version for the staleness banners, which must track
 	// versions committed server-side (snapshotter, teardown, git push) — hence the
 	// poll; a cached-once head would never fire (or mis-fire) a banner. Edit pages
 	// poll only git-synced sources — the one head that can move mid-edit.
-	const { data: notebook } = useNotebookQuery(pid!, nid!, {
+	const { data: notebook, isPending: notebookPending } = useNotebookQuery(pid!, nid!, {
 		refetchIntervalMs: isApp ? 30_000 : (n) => (n?.source.type === 'git' ? 30_000 : undefined),
 	});
+	const iframeSrc =
+		iframeLocation.sandboxUrl && !notebookPending
+			? notebookFrameUrl(
+					iframeLocation.sandboxUrl,
+					location.search,
+					iframeLocation.theme,
+					isApp,
+					notebook?.meta.tags?.includes('triage'),
+				)
+			: undefined;
 	const author = notebook?.meta.author;
 	// Prefer the canonical title once detail loads, so a rename reflects immediately.
 	const title = notebook?.meta.title ?? notebookTitle;

@@ -12,6 +12,7 @@ export const MANAGED_BY_LABEL = 'app.kubernetes.io/managed-by';
 export const MANAGED_BY_VALUE = 'marimohub';
 /** Annotation that carries the verbatim `SandboxId` for `listActive()` mapping. */
 export const SANDBOX_ID_ANNOTATION = 'marimohub.io/sandbox-id';
+export const PROJECTED_TOKEN_DIRECTORY = '/var/run/secrets/marimohub';
 
 /** `imagePullPolicy` for the kernel container. See `defaultImagePullPolicy`. */
 export type ImagePullPolicy = 'Always' | 'IfNotPresent' | 'Never';
@@ -185,6 +186,10 @@ export interface KubernetesConfig {
 	tlsSecretName?: string;
 	/** ServiceAccount the kernel Pod runs as. Omit for the namespace default. */
 	serviceAccountName?: string;
+	/** Audience for a 600-second projected ServiceAccount token. */
+	projectedTokenAudience?: string;
+	/** Numeric user ID for the kernel process. Enables `runAsNonRoot`. */
+	runAsUser?: number;
 	/** `imagePullSecrets` name for pulling a private kernel image. */
 	imagePullSecret?: string;
 	/** Kernel-container pull policy. Default: see `defaultImagePullPolicy`. */
@@ -221,6 +226,8 @@ export interface EnsureSandboxOptions {
 	ingressTlsMode?: IngressTlsMode;
 	tlsSecretName?: string;
 	serviceAccountName?: string;
+	projectedTokenAudience?: string;
+	runAsUser?: number;
 	imagePullSecret?: string;
 	imagePullPolicy?: ImagePullPolicy;
 	resources?: KubernetesResources;
