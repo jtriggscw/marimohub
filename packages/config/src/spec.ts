@@ -860,6 +860,21 @@ export const CONFIG_SPEC: ConfigGroup[] = [
 						example: 'marimo-kernel',
 					},
 					{
+						id: 'MARIMOHUB_COMPUTE_KUBERNETES_PROJECTED_TOKEN_AUDIENCE',
+						name: 'Kubernetes projected token audience',
+						description:
+							'Audience for a 600-second projected ServiceAccount token mounted at `/var/run/secrets/marimohub/token`. The default Kubernetes token is never mounted.',
+						example: 'internal-api',
+						optIn: true,
+					},
+					{
+						id: 'MARIMOHUB_COMPUTE_KUBERNETES_RUN_AS_USER',
+						name: 'Kubernetes kernel user ID',
+						description:
+							'Numeric user ID for the kernel process. Setting this also requires the kernel to run as non-root.',
+						example: '1000',
+					},
+					{
 						id: 'MARIMOHUB_COMPUTE_KUBERNETES_IMAGE_PULL_SECRET',
 						name: 'Kubernetes image pull secret',
 						description: '`imagePullSecrets` name for pulling a private kernel image.',

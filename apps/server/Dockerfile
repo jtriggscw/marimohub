@@ -30,6 +30,10 @@ ENV MARIMOHUB_VERSION=$MARIMOHUB_VERSION \
 # Local compute needs uv and Python 3.11+ for the setup step's tomllib parser.
 # Off by default to keep the production image lean; enabled by examples/docker-compose.
 ARG INSTALL_UV=false
+ARG INSTALL_KUBERNETES=false
+RUN if [ "$INSTALL_KUBERNETES" = "true" ]; then \
+      npm install --no-save --package-lock=false @kubernetes/client-node@1.4.0; \
+    fi
 RUN if [ "$INSTALL_UV" = "true" ]; then \
       apt-get update && apt-get install -y --no-install-recommends ca-certificates curl python3 \
       && curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh \

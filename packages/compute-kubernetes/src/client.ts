@@ -28,6 +28,7 @@ import {
 	MANAGED_BY_LABEL,
 	MANAGED_BY_VALUE,
 	portName,
+	PROJECTED_TOKEN_DIRECTORY,
 	resolveIngressTlsMode,
 	SANDBOX_ID_ANNOTATION,
 	validateIngressAnnotations,
@@ -103,6 +104,23 @@ function buildResources(r: EnsureSandboxOptions['resources']): V1Container['reso
 }
 
 function podManifest(o: EnsureSandboxOptions): V1Pod {
+	const projectedTokenVolume = o.projectedTokenAudience
+		? {
+				name: 'marimohub-token',
+				projected: {
+					defaultMode: 0o444,
+					sources: [
+						{
+							serviceAccountToken: {
+								audience: o.projectedTokenAudience,
+								expirationSeconds: 600,
+								path: 'token',
+							},
+						},
+					],
+				},
+			}
+		: undefined;
 	return {
 		metadata: {
 			name: o.name,
@@ -112,6 +130,12 @@ function podManifest(o: EnsureSandboxOptions): V1Pod {
 		},
 		spec: {
 			restartPolicy: 'Never',
+			automountServiceAccountToken: false,
+			enableServiceLinks: false,
+			securityContext: {
+				seccompProfile: { type: 'RuntimeDefault' },
+				...(o.runAsUser === undefined ? {} : { runAsNonRoot: true, runAsUser: o.runAsUser }),
+			},
 			// The keep-alive `sleep` ignores SIGTERM, so the k8s default 30s grace
 			// would leave every deleted Pod Terminating (still holding its resources,
 			// still phase Running) for 30s. Nothing in the Pod needs a graceful stop —
@@ -119,6 +143,7 @@ function podManifest(o: EnsureSandboxOptions): V1Pod {
 			terminationGracePeriodSeconds: 5,
 			serviceAccountName: o.serviceAccountName,
 			imagePullSecrets: o.imagePullSecret ? [{ name: o.imagePullSecret }] : undefined,
+			volumes: projectedTokenVolume ? [projectedTokenVolume] : undefined,
 			containers: [
 				{
 					name: CONTAINER_NAME,
@@ -129,6 +154,19 @@ function podManifest(o: EnsureSandboxOptions): V1Pod {
 					command: ['sh', '-c', 'sleep infinity'],
 					ports: o.ports.map((p, i) => ({ containerPort: p.port, name: portName(i, p.port) })),
 					resources: buildResources(o.resources),
+					securityContext: {
+						allowPrivilegeEscalation: false,
+						capabilities: { drop: ['ALL'] },
+					},
+					volumeMounts: projectedTokenVolume
+						? [
+								{
+									name: projectedTokenVolume.name,
+									mountPath: PROJECTED_TOKEN_DIRECTORY,
+									readOnly: true,
+								},
+							]
+						: undefined,
 				},
 			],
 		},
