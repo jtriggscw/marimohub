@@ -2045,6 +2045,19 @@ describe('Session routes', () => {
 		).toBe(shorter);
 	});
 
+	it('does not reuse an expired editor whose sandbox still holds the claim', async () => {
+		const started = await expectOk<ApiSession>(await owner('POST', sessionsPath()));
+		const sessions = createServices(bucket).sessions;
+		const stored = await sessions.getSession(pid, started.session_id);
+		await bucket.put(
+			paths.session(pid, stored.session_id),
+			JSON.stringify({ ...stored, status: 'expired' }),
+		);
+
+		await expectError(await owner('POST', sessionsPath()), 409, 'CONFLICT');
+		expect((await sessions.getEditorClaim(pid, nid))?.session_id).toBe(stored.session_id);
+	});
+
 	it('an editor-claim race applies the attaching credential deadline to the winner', async () => {
 		const winner = makeSession({
 			project_id: pid,

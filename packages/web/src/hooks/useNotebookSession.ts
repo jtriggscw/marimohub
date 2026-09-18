@@ -194,6 +194,12 @@ export function useNotebookSession(
 						return;
 					}
 					setStarting(false);
+					if (data.status !== 'starting' && data.status !== 'running') {
+						commitSession(null);
+						setEndedByUserId(data.ended_by_user_id ?? null);
+						setEnded(data.ended_reason === 'takeover' ? 'takeover' : data.status);
+						return;
+					}
 					if (data.status === 'running' && !data.sandbox_url) {
 						concludeAccessLost(data.can?.attach ?? false);
 						return;

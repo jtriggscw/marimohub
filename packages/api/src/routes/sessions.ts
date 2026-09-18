@@ -1899,6 +1899,11 @@ export async function startNotebookSession(input: {
 			if (session) await sessions.markTerminated(pid, session.session_id).catch(() => {});
 			const winnerCandidate = await sessions.getSession(pid, err.holder).catch(() => null);
 			if (winnerCandidate?.notebook_id === nid && sessionMode(winnerCandidate) === 'edit') {
+				if (winnerCandidate.status !== 'starting' && winnerCandidate.status !== 'running') {
+					throw new ConflictError(
+						'The previous editor session is no longer active. Retry shortly.',
+					);
+				}
 				const winner = await tightenAuthorizationDeadline(winnerCandidate);
 				if (
 					winner.authorization_expires_at &&
