@@ -282,7 +282,7 @@ export async function captureWorkspace(
 	const present = new Set<string>();
 
 	if (mode === 'workspace') {
-		const listing = await sandbox.listFiles(workingDir, { recursive: true });
+		const listing = await sandbox.listFiles(workingDir, { recursive: true, includeHidden: true });
 		if (!listing.success) {
 			// Could not enumerate the working dir — bail out entirely. Falling through
 			// to the mirror-delete below with an empty `present` set would treat every

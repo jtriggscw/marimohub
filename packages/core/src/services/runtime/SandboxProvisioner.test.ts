@@ -2144,12 +2144,10 @@ describe('SandboxProvisioner', () => {
 
 		it('still destroys the sandbox when captureWorkspace throws (best-effort)', async () => {
 			const { instance: base, calls } = makeFakeSandbox();
-			// Fail only the capture listing (no includeHidden); readSessionArtifacts passes
-			// includeHidden:true and is left to succeed.
+			// Artifact reads tolerate a listing failure; workspace capture does not.
 			const instance = {
 				...base,
-				listFiles: async (path: string, options?: { includeHidden?: boolean }) => {
-					if (options?.includeHidden) return { success: true, files: [] };
+				listFiles: async () => {
 					throw new Error('list boom');
 				},
 			} as unknown as SandboxInstance;
@@ -2410,12 +2408,10 @@ describe('SandboxProvisioner', () => {
 
 		it('throws the workspace error and logs the commit error when both reject', async () => {
 			const { instance: base, calls } = makeFakeSandbox();
-			// Fail the workspace capture (listFiles without includeHidden); the commit
-			// (readSessionArtifacts passes includeHidden:true) is failed via commitSession.
+			// Artifact reads tolerate a listing failure; workspace capture does not.
 			const instance = {
 				...base,
-				listFiles: async (_path: string, options?: { includeHidden?: boolean }) => {
-					if (options?.includeHidden) return { success: true, files: [] };
+				listFiles: async () => {
 					throw new Error('workspace list boom');
 				},
 			} as unknown as SandboxInstance;

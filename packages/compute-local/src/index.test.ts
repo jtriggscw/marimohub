@@ -878,12 +878,15 @@ describe('LocalCompute process hygiene', () => {
 		await expect.poll(() => processIsAlive(pid), { timeout: 5000, interval: 20 }).toBe(false);
 	}, 10_000);
 
-	it('exec retains only the trailing output', async () => {
+	it('exec preserves large file contents for workspace capture', async () => {
 		const sb = newSandbox();
-		const res = await sb.exec(`node -e "process.stdout.write('a'.repeat(300 * 1024))"`);
+		const content = Uint8Array.from({ length: 300 * 1024 }, (_, i) => i % 256);
+		await sb.writeFiles([{ path: '/workspace/data.bin', content }]);
+		const res = await sb.exec(
+			`node -e "process.stdout.write(require('fs').readFileSync('/workspace/data.bin').toString('base64'))"`,
+		);
 		expect(res.success).toBe(true);
-		expect(res.stdout.length).toBeLessThanOrEqual(64 * 1024);
-		expect(res.stdout.endsWith('a')).toBe(true);
+		expect(Buffer.from(res.stdout, 'base64')).toEqual(Buffer.from(content));
 	});
 
 	it('exec decodes multi-byte UTF-8 split across chunks', async () => {

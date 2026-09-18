@@ -64,8 +64,8 @@ import { execResult, listFilesFailure, readFileFailure } from '@marimo-hub/core/
 // Kernel processes can run for hours; diagnostics only need their recent output.
 const OUTPUT_TAIL_CHARS = 64 * 1024;
 
-function captureOutput(child: ChildProcess) {
-	const stdout = new Utf8TailBuffer(OUTPUT_TAIL_CHARS);
+function captureOutput(child: ChildProcess, stdoutLimit = OUTPUT_TAIL_CHARS) {
+	const stdout = new Utf8TailBuffer(stdoutLimit);
 	const stderr = new Utf8TailBuffer(OUTPUT_TAIL_CHARS);
 	child.stdout?.on('data', (chunk: Buffer) => stdout.append(chunk));
 	child.stderr?.on('data', (chunk: Buffer) => stderr.append(chunk));
@@ -373,7 +373,8 @@ class LocalSandboxInstance implements SandboxInstance {
 		await this.ensureRoot();
 		return new Promise((resolve) => {
 			const child = this.trackChild(this.spawnShell(this.rewriteCmd(cmd), { detached: true }));
-			const { stdout, stderr } = captureOutput(child);
+			// Workspace capture reads file contents through exec; stdout must be complete.
+			const { stdout, stderr } = captureOutput(child, Infinity);
 			let timedOut = false;
 			const timer =
 				options?.timeout !== undefined && options.timeout > 0
