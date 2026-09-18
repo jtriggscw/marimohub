@@ -116,6 +116,10 @@ extraEnv: []
 #  - name: MARIMOHUB_DEFAULT_ROLE
 #    value: editor
 
+# Extra volumes and mounts for both API and maintenance pods.
+extraVolumes: []
+extraVolumeMounts: []
+
 containerPort: 3000
 
 service:
