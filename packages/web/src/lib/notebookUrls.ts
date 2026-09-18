@@ -8,6 +8,7 @@ export function notebookFrameUrl(
 	search: string,
 	theme: Theme,
 	isApp: boolean,
+	present = false,
 ): string {
 	try {
 		const parsed = new URL(url, window.location.origin);
@@ -17,6 +18,7 @@ export function notebookFrameUrl(
 		}
 		parsed.searchParams.set('theme', theme);
 		if (isApp) parsed.searchParams.set('show-code', 'false');
+		else if (present) parsed.searchParams.set('view-as', 'present');
 		return parsed.toString();
 	} catch {
 		return url;

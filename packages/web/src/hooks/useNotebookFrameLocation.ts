@@ -10,6 +10,7 @@ export function useNotebookFrameLocation(
 	sandboxUrl: string | undefined,
 	theme: Theme,
 	isApp: boolean,
+	present = false,
 ) {
 	const location = useLocation();
 	const navigate = useNavigate();
@@ -41,8 +42,8 @@ export function useNotebookFrameLocation(
 		const queryNavigation =
 			!mirrored &&
 			sandboxUrl !== undefined &&
-			notebookFrameUrl(sandboxUrl, frame.currentSearch, frame.theme, isApp) !==
-				notebookFrameUrl(sandboxUrl, location.search, frame.theme, isApp);
+			notebookFrameUrl(sandboxUrl, frame.currentSearch, frame.theme, isApp, present) !==
+				notebookFrameUrl(sandboxUrl, location.search, frame.theme, isApp, present);
 		setFrame({
 			...frame,
 			locationKey: location.key,
@@ -78,10 +79,10 @@ export function useNotebookFrameLocation(
 	return {
 		frameKey: frame.frameKey,
 		iframeSrc: frame.sandboxUrl
-			? notebookFrameUrl(frame.sandboxUrl, frame.search, frame.theme, isApp)
+			? notebookFrameUrl(frame.sandboxUrl, frame.search, frame.theme, isApp, present)
 			: undefined,
 		latestSrc: sandboxUrl
-			? notebookFrameUrl(sandboxUrl, location.search, frame.theme, isApp)
+			? notebookFrameUrl(sandboxUrl, location.search, frame.theme, isApp, present)
 			: undefined,
 		onQuery,
 	};

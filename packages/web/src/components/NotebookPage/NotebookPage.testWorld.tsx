@@ -51,6 +51,7 @@ interface FetchOptions {
 	/** The notebook's source type; `git` models a GitHub-synced notebook. */
 	sourceType?: 'local' | 'git';
 	entryNotebook?: string;
+	tags?: string[];
 	notebookPromise?: Promise<void>;
 	/** When set, POST .../sessions fails with this error code at this status. */
 	createError?: { code: string; message: string; status: number };
@@ -251,6 +252,7 @@ export function makeFetch(opts: FetchOptions) {
 					id: NID,
 					title: 'Forecast',
 					author: 'me',
+					tags: opts.tags ?? [],
 					...(opts.computeProfile ? { compute_profile: opts.computeProfile } : {}),
 				},
 				source:
