@@ -1,5 +1,5 @@
 import { Millis, Seconds } from '@marimo-hub/core';
-import type { SandboxExposureMode, SandboxProvider } from '@marimo-hub/core';
+import type { SandboxExposureMode, SandboxProvider, WarmPoolSupport } from '@marimo-hub/core';
 import type { SandboxConfig } from '@marimo-hub/api';
 import { LocalCompute } from '@marimo-hub/compute-local';
 import { ModalCompute } from '@marimo-hub/compute-modal';
@@ -11,10 +11,12 @@ import { E2bCompute } from '@marimo-hub/compute-e2b';
 import { FargateCompute, validateFargateTaskDefinition } from '@marimo-hub/compute-fargate';
 import {
 	KubernetesCompute,
+	loadPodTemplateFile,
 	parseIngressAnnotations,
 	portRoutingCollision,
 	resolveIngressTlsMode,
 	validateIngressHostnameTemplate,
+	validateLabels,
 } from '@marimo-hub/compute-kubernetes';
 import { parseBool, parseEnum, parseIntEnv, parseList, requiredVar } from './env';
 import type { Env } from './env';
@@ -249,13 +251,78 @@ function rejectUnsupportedCoreWeaveVars(env: Env): void {
 	}
 }
 
+function parseLabels(env: Env, key: string): Record<string, string> | undefined {
+	const entries: [string, string][] = [];
+	for (const pair of parseList(env[key]) ?? []) {
+		const eq = pair.indexOf('=');
+		const name = eq === -1 ? '' : pair.slice(0, eq).trim();
+		if (!name)
+			throw new ConfigError(`Invalid ${key} entry: ${pair} (expected key=value)`, {
+				variable: key,
+			});
+		entries.push([name, pair.slice(eq + 1).trim()]);
+	}
+	if (entries.length === 0) return undefined;
+	const out = Object.fromEntries(entries);
+	try {
+		validateLabels(out);
+	} catch (cause) {
+		const detail = cause instanceof Error ? cause.message : 'invalid labels';
+		throw new ConfigError(`Invalid ${key} (${detail})`, {
+			variable: key,
+			docs: 'docs/setup/compute/kubernetes.md',
+		});
+	}
+	return out;
+}
+
+// Linux uids are unsigned 32-bit; Kubernetes rejects negatives at admission.
+const MAX_UID = 0xffff_ffff;
+
+function parseRunAsUser(env: Env, key: string): number | undefined {
+	const uid = parseIntEnv(env, key);
+	if (uid === undefined) return undefined;
+	if (uid < 0 || uid > MAX_UID)
+		throw new ConfigError(`Invalid ${key}: ${uid} (expected a uid between 0 and ${MAX_UID})`, {
+			variable: key,
+			docs: 'docs/setup/compute/kubernetes.md',
+		});
+	return uid;
+}
+
 function parseObjectStoragePermission(env: Env): 'read' | 'read-write' | undefined {
-	const raw = env.MARIMOHUB_COMPUTE_COREWEAVE_OBJECT_STORAGE_PERMISSION;
+	const raw = env.MARIMOHUB_COMPUTE_COREWEAVE_OBJECT_STORAGE_PERMISSION?.trim() || undefined;
 	if (raw === undefined || raw === 'read' || raw === 'read-write') return raw;
 	throw new ConfigError(
 		`Invalid MARIMOHUB_COMPUTE_COREWEAVE_OBJECT_STORAGE_PERMISSION: ${raw} (expected read or read-write)`,
 		{ variable: 'MARIMOHUB_COMPUTE_COREWEAVE_OBJECT_STORAGE_PERMISSION' },
 	);
+}
+
+// Mirrors the modal SDK's own object-name check (`isValidObjectName` in its
+// name_utils): at most 64 of [A-Za-z0-9._-], and not shaped like an app id.
+const MODAL_OBJECT_NAME = /^[A-Za-z0-9._-]{1,64}$/;
+const MODAL_APP_ID = /^ap-[A-Za-z0-9]{22}$/;
+
+function parseModalSecretNames(env: Env): string[] | undefined {
+	const key = 'MARIMOHUB_COMPUTE_MODAL_SECRETS';
+	const names = parseList(env[key]);
+	if (!names) return undefined;
+	for (const name of names) {
+		if (!MODAL_OBJECT_NAME.test(name) || MODAL_APP_ID.test(name)) {
+			throw new ConfigError(`Invalid ${key} entry: ${JSON.stringify(name)}`, {
+				variable: key,
+				remediation:
+					'Use a comma-separated list of Modal secret names. Each name has at most 64 letters, digits, dots, dashes or underscores.',
+				docs: 'docs/setup/compute/modal.md',
+			});
+		}
+	}
+	return [...new Set(names)];
+}
+
+function withWarmPoolSupport(provider: SandboxProvider, support: WarmPoolSupport): SandboxProvider {
+	return Object.assign(provider, { warmPool: support });
 }
 
 export function makeCompute(env: Env, opts?: ComputeOptions): SandboxProvider {
@@ -296,6 +363,7 @@ export function makeCompute(env: Env, opts?: ComputeOptions): SandboxProvider {
 				tokenSecret,
 				image: defaultImage,
 				environment: env.MARIMOHUB_COMPUTE_MODAL_ENVIRONMENT,
+				secretNames: parseModalSecretNames(env),
 				// App name scopes reconciler enumeration (listActive) to sandboxes this
 				// deployment owns, so it never reaps co-tenant sandboxes in the workspace.
 				appName: env.MARIMOHUB_COMPUTE_MODAL_APP_NAME,
@@ -304,7 +372,7 @@ export function makeCompute(env: Env, opts?: ComputeOptions): SandboxProvider {
 					: {}),
 			});
 		}
-		case 'coreweave':
+		case 'coreweave': {
 			// CoreWeave Sandboxes via the @coreweave/cwsandbox SDK (Sandbox v1, Node
 			// gRPC). A marimo-capable image (marimo + uv + python) should be supplied
 			// via MARIMOHUB_COMPUTE_IMAGE; the kernel is reached at its public-ingress
@@ -327,10 +395,20 @@ export function makeCompute(env: Env, opts?: ComputeOptions): SandboxProvider {
 					},
 				);
 			}
-			return new CoreWeaveCompute({
+			const maxLifetimeSeconds = resolveLifetimeBackstop(
+				env,
+				'MARIMOHUB_COMPUTE_COREWEAVE_MAX_LIFETIME_SECONDS',
+				opts?.sessionMaxLifetimeSeconds,
+			);
+			const provider = new CoreWeaveCompute({
 				apiKey: computeVar(env, 'MARIMOHUB_COMPUTE_COREWEAVE_API_KEY', 'coreweave'),
 				extraPorts: coreWeaveExtraPorts(opts?.surfaces),
 				baseUrl: env.MARIMOHUB_COMPUTE_COREWEAVE_BASE_URL,
+				dataPlaneMode: parseEnum(env, 'MARIMOHUB_COMPUTE_COREWEAVE_DATA_PLANE_MODE', {
+					allowed: ['direct', 'auto', 'gateway'] as const,
+					fallback: 'auto',
+					docs: 'docs/configuration.md#coreweave-sandbox',
+				}),
 				image: defaultImage,
 				ownerTag: env.MARIMOHUB_COMPUTE_COREWEAVE_OWNER_TAG,
 				hostnameTemplate: env.MARIMOHUB_COMPUTE_COREWEAVE_HOSTNAME_TEMPLATE,
@@ -357,11 +435,7 @@ export function makeCompute(env: Env, opts?: ComputeOptions): SandboxProvider {
 				// run under the runner's default policy.
 				templateId: env.MARIMOHUB_COMPUTE_COREWEAVE_TEMPLATE_ID,
 				userHomeTemplateId: env.MARIMOHUB_COMPUTE_COREWEAVE_USER_HOME_TEMPLATE_ID,
-				maxLifetimeSeconds: resolveLifetimeBackstop(
-					env,
-					'MARIMOHUB_COMPUTE_COREWEAVE_MAX_LIFETIME_SECONDS',
-					opts?.sessionMaxLifetimeSeconds,
-				),
+				maxLifetimeSeconds,
 				// Off by default; do NOT enable alongside MARIMOHUB_PERSIST_WORKSPACE=workspace,
 				// which would double-persist the same state.
 				filesystemSnapshot: parseBool(env, 'MARIMOHUB_COMPUTE_COREWEAVE_FILESYSTEM_SNAPSHOT'),
@@ -370,6 +444,10 @@ export function makeCompute(env: Env, opts?: ComputeOptions): SandboxProvider {
 				objectStorageEndpoint: env.MARIMOHUB_COMPUTE_COREWEAVE_OBJECT_STORAGE_ENDPOINT,
 				objectStorageRegion: env.MARIMOHUB_COMPUTE_COREWEAVE_OBJECT_STORAGE_REGION,
 			});
+			return maxLifetimeSeconds === undefined
+				? provider
+				: withWarmPoolSupport(provider, { maxLifetimeMs: maxLifetimeSeconds * 1000 });
+		}
 		case 'wandb':
 			// CoreWeave Sandboxes via the W&B gateway — the same adapter and endpoint as
 			// `coreweave`, authenticated with a W&B API key (gRPC metadata) instead of a
@@ -377,7 +455,7 @@ export function makeCompute(env: Env, opts?: ComputeOptions): SandboxProvider {
 			// does not support profile/placement overrides, GPU requests, or non-default
 			// egress modes, and CAIOS vending is unconfirmed through it (use hub-minted
 			// WIF for bucket access). Kernel URLs need no hostname config: the managed
-			// runner assigns each sandbox a public IP the adapter resolves at expose time.
+			// runner assigns each kernel an HTTPS endpoint the adapter resolves at expose time.
 			return createWandbCompute({
 				apiKey: computeVar(env, 'MARIMOHUB_COMPUTE_WANDB_API_KEY', 'wandb'),
 				entity: env.MARIMOHUB_COMPUTE_WANDB_ENTITY,
@@ -437,6 +515,20 @@ export function makeCompute(env: Env, opts?: ComputeOptions): SandboxProvider {
 				ports: parsePortRange(env.MARIMOHUB_COMPUTE_LOCAL_PORTS),
 			});
 		case 'kubernetes': {
+			const templateKey = 'MARIMOHUB_COMPUTE_KUBERNETES_POD_TEMPLATE_FILE';
+			const templatePath = env[templateKey]?.trim();
+			let podTemplate;
+			if (templatePath) {
+				try {
+					podTemplate = loadPodTemplateFile(templatePath);
+				} catch (cause) {
+					const detail = cause instanceof Error ? cause.message : 'invalid pod template';
+					throw new ConfigError(`Invalid ${templateKey}: ${detail}`, {
+						variable: templateKey,
+						docs: 'docs/setup/compute/kubernetes.md',
+					});
+				}
+			}
 			// Native Kubernetes: a Pod + Service per session, with an Ingress added for
 			// subdomain exposure. Proxy exposure reaches the Service inside the cluster.
 			const resources = {
@@ -449,7 +541,7 @@ export function makeCompute(env: Env, opts?: ComputeOptions): SandboxProvider {
 				env,
 				'MARIMOHUB_COMPUTE_KUBERNETES_POD_READY_TIMEOUT_SECONDS',
 			);
-			const pullPolicy = env.MARIMOHUB_COMPUTE_KUBERNETES_IMAGE_PULL_POLICY;
+			const pullPolicy = env.MARIMOHUB_COMPUTE_KUBERNETES_IMAGE_PULL_POLICY?.trim() || undefined;
 			const proxyExposure = opts?.sandboxExposureMode === 'proxy';
 			const ingressTlsMode = proxyExposure ? undefined : kubernetesIngressTlsMode(env);
 			const ports = surfacePorts(opts?.surfaces);
@@ -503,7 +595,8 @@ export function makeCompute(env: Env, opts?: ComputeOptions): SandboxProvider {
 					},
 				);
 			}
-			return new KubernetesCompute({
+			const provider = new KubernetesCompute({
+				podTemplate,
 				exposureMode: opts?.sandboxExposureMode,
 				namespace: env.MARIMOHUB_COMPUTE_KUBERNETES_NAMESPACE,
 				image: defaultImage,
@@ -522,9 +615,12 @@ export function makeCompute(env: Env, opts?: ComputeOptions): SandboxProvider {
 				imagePullSecret: env.MARIMOHUB_COMPUTE_KUBERNETES_IMAGE_PULL_SECRET,
 				imagePullPolicy: pullPolicy as 'Always' | 'IfNotPresent' | 'Never' | undefined,
 				resources: hasResources ? resources : undefined,
+				extraLabels: parseLabels(env, 'MARIMOHUB_COMPUTE_KUBERNETES_POD_LABELS'),
+				runAsUser: parseRunAsUser(env, 'MARIMOHUB_COMPUTE_KUBERNETES_RUN_AS_USER'),
 				podReadyTimeout:
 					podReadySeconds === undefined ? undefined : Millis.seconds(podReadySeconds),
 			});
+			return withWarmPoolSupport(provider, { maxLifetimeMs: null, configuration: podTemplate });
 		}
 		case 'fargate': {
 			if (env.MARIMOHUB_COMPUTE_IMAGE?.trim()) {

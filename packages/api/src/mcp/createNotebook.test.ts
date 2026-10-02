@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
 	AppPoolService,
+	WarmPoolStore,
+	WarmPoolService,
 	CatalogService,
 	BadRequestError,
 	ForbiddenError,
@@ -65,7 +67,7 @@ afterEach(() => {
 });
 
 describe('create_notebook MCP tool', () => {
-	it('does not advertise dependency metadata as an input', async () => {
+	it('documents inline dependencies on create and update', async () => {
 		const { deps } = await setup();
 		const client = await connect(deps);
 
@@ -73,7 +75,54 @@ describe('create_notebook MCP tool', () => {
 
 		const createNotebook = tools.tools.find((tool) => tool.name === 'create_notebook');
 		expect(createNotebook?.inputSchema.properties).not.toHaveProperty('deps');
+		for (const name of ['create_notebook', 'update_notebook']) {
+			const tool = tools.tools.find((tool) => tool.name === name);
+			expect(tool?.inputSchema.properties?.code).toMatchObject({
+				description: expect.stringContaining('PEP 723'),
+			});
+		}
 	});
+
+	it.each(['create_notebook', 'update_notebook'])(
+		'installs inline dependencies supplied through %s at launch',
+		async (tool) => {
+			vi.mocked(bootstrapKernel).mockResolvedValue({ status: 'ready' });
+			const { instance, calls } = makeFakeSandbox();
+			const { deps, project } = await setup({ compute: fakeComputeFrom(instance) });
+			const client = await connect(deps);
+			const code = '# /// script\n# dependencies = ["cowsay==6.1"]\n# ///\nimport marimo';
+			let response;
+			if (tool === 'create_notebook') {
+				response = await client.callTool({
+					name: tool,
+					arguments: { project: project.id, title: 'Inline dependencies', code, launch: true },
+				});
+			} else {
+				const notebook = await deps.services.notebooks.createNotebook(
+					project.id,
+					{ title: 'Notebook', description: '', code: 'import marimo' },
+					USER_ID,
+				);
+				const update = await client.callTool({
+					name: tool,
+					arguments: { project: project.id, notebook: notebook.id, code },
+				});
+				expect(update.isError).not.toBe(true);
+				expect(await deps.services.notebooks.getNotebookContent(project.id, notebook.id)).toBe(
+					code,
+				);
+				response = await client.callTool({
+					name: 'start_session',
+					arguments: { project: project.id, notebook: notebook.id, mode: 'edit' },
+				});
+			}
+			expect(response.isError).not.toBe(true);
+			const setupCommand = calls.exec.find((command) => command.includes('uv sync --inexact'))!;
+			expect(setupCommand).toContain("uv export --script 'notebook.py'");
+			expect(setupCommand).toContain('uv pip install');
+			expect(calls.startProcess).toHaveLength(1);
+		},
+	);
 
 	it('creates a notebook without a session when launch is omitted', async () => {
 		const { deps, project } = await setup();
@@ -634,6 +683,45 @@ describe('stored notebook MCP tools', () => {
 });
 
 describe('MCP session execution readiness', () => {
+	it('claims a warm sandbox through start_session', async () => {
+		vi.mocked(bootstrapKernel).mockResolvedValue({ status: 'ready' });
+		const { instance } = makeFakeSandbox();
+		const { deps, project } = await setup({
+			compute: { ...fakeComputeFrom(instance), connectExisting: () => instance },
+		});
+		deps.warmPool = new WarmPoolService(
+			new WarmPoolStore(deps.bucket, 'kubernetes'),
+			deps.compute,
+			deps.services.sessions,
+			{
+				enabled: true,
+				size: 1,
+				profiles: [{ key: 'default', resources: {} }],
+				creationTimeoutMs: 300_000,
+				minimumRemainingMs: 60_000,
+			},
+		);
+		await deps.warmPool.sweep();
+		const warm = (await deps.warmPool.store.read()).pools[0].members[0];
+		const notebook = await deps.services.notebooks.createNotebook(
+			project.id,
+			{ title: 'Warm', description: '', code: NOTEBOOK_CODE },
+			USER_ID,
+		);
+		const client = await connect(deps);
+		const response = await client.callTool({
+			name: 'start_session',
+			arguments: { project: project.id, notebook: notebook.id, wait_seconds: 0 },
+		});
+		expect(response).toMatchObject({ structuredContent: { status: 'running' } });
+		const data = response.structuredContent as { session_id: string };
+		const session = await deps.services.sessions.getSession(
+			project.id,
+			SessionId.parse(data.session_id),
+		);
+		expect(session.sandbox_id).toBe(warm.sandbox_id);
+	});
+
 	it.each([
 		{ ready: false, status: 'initializing' as const },
 		{ ready: false, status: 'awaiting_client' as const },

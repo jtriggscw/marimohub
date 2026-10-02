@@ -7,11 +7,18 @@ workflow is untouched: an app runs alongside edit sessions, in its own sandbox.
 App sharing is independent of [editor sandbox sharing](./editor-sessions.md).
 See [App pools](./app-pools.md) for capacity settings, sticky routing, and coordinated rollout requirements.
 
+<figure class="doc-screenshot">
+  <a href="/screenshots/notebook-app.png" target="_blank" rel="noreferrer" aria-label="Open full-size screenshot: Revenue explorer app with a region selector and stacked bar chart (new tab)">
+    <img src="/screenshots/notebook-app.png" alt="Revenue explorer app with a region selector and stacked bar chart" width="1000" height="560" loading="lazy" decoding="async" />
+  </a>
+  <figcaption>The same notebook as an app: interactive controls and outputs, with code hidden.</figcaption>
+</figure>
+
 ## How it works
 
-- **Shared sandboxes, with a separate view for each user.** "Run as app" assigns
-  an account to a sandbox in the notebook's pool. Tabs and devices for that account
-  share one capacity slot. Browsers on a sandbox share files, credentials, and
+- **Shared sandboxes, with a separate session for each tab.** "Run as app" assigns
+  each page visit to a sandbox in the notebook's pool. Tabs and devices from the same account
+  consume separate capacity slots. Browsers on a sandbox share files, credentials, and
   compute capacity, but each gets its own marimo session and UI state.
   The project page shows each sandbox's starter, version, occupancy, and pool state.
 - **Apps serve a point-in-time copy.** The app loads the notebook's saved state
@@ -19,15 +26,15 @@ See [App pools](./app-pools.md) for capacity settings, sticky routing, and coord
   workspace change. Interacting with an app cannot modify the notebook. One
   caveat: local auxiliary files retain their mutable workspace semantics.
   Code and dependencies come from the selected committed version.
-- **New accounts receive the latest committed version.** Periodic editor saves
-  also create eligible versions. Active accounts remain on their assigned
+- **New visits receive the latest committed version.** Periodic editor saves
+  also create eligible versions. Active visits remain on their assigned
   sandbox while older versions drain. An explicit restart replaces the selected
   sandbox and disconnects its users, so the hub asks for confirmation.
 - **Apps stay up while in use.** Open app tabs keep the session alive. After
   everyone leaves, `MARIMOHUB_SESSION_APP_IDLE_TIMEOUT_SECONDS` controls idle
   retirement after the last assignment expires, including reconnect grace.
   This value inherits `MARIMOHUB_SESSION_IDLE_TIMEOUT_SECONDS` when unset.
-  Fresh account leases and active connections protect against idle retirement.
+  Fresh visit leases and active connections protect against idle retirement.
   Credential expiry and provider lifetime limits still apply.
 
   The [maintenance worker](./operations.md) handles hub-managed idle reaping and
@@ -36,29 +43,75 @@ See [App pools](./app-pools.md) for capacity settings, sticky routing, and coord
   app stops under an open tab, the page shows the reason.
 
 - **Resource model.** `marimo run` starts one kernel per connected browser
-  inside each app sandbox, so memory scales with its concurrent users.
-  Set the account limit per sandbox to distribute users across additional sandboxes.
+  inside each app sandbox, so memory scales with its concurrent browser sessions.
+  Set the visit limit per sandbox to distribute browser sessions across additional sandboxes.
 
-Start an app from the notebook's actions menu ("Run as app"), or via the API:
+Start an app from **Open → Run as app** in the notebook header, or via the API:
 `POST /api/v1/projects/{pid}/notebooks/{nid}/sessions` with body
-`{"mode": "app"}`. The router reuses the account's assignment or reserves
-capacity on the latest committed version.
+`{"mode": "app", "app_visit_id": "<unique-visit-id>"}`. The router assigns a new visit to the latest committed version.
+Reuse `app_visit_id` when retrying admission. Use the returned `app_assignment` for heartbeats and departure.
+
+## Copy app and snapshot URLs
+
+From an app, select **Share app → Copy URL** to copy its current URL.
+From an editor, select **Share notebook → Copy URL**.
+Copied URLs preserve allowed query parameters and remove [reserved parameters](#reserved-parameters).
+Copying a URL does not change notebook permissions.
+Recipients must sign in and have access to the requested view.
+
+To share saved outputs without starting a sandbox, select **Open → View static outputs**.
+On the snapshot page, select **Share snapshot → Copy URL**.
+A snapshot URL with `?version=<version-id>` keeps that version selected.
+Without a version parameter, the URL opens the latest captured outputs.
+App users cannot open snapshots because their role does not grant access to saved HTML.
 
 ## Authenticated app links
 
 From a notebook, open **Share notebook → App links** to create or copy a URL
 such as `/app/sales`. Project managers and admins can create and remove links.
-Each name is unique across the hub. Names contain 1–63 lowercase letters,
-digits, or hyphens, and start and end with a letter or digit.
+Each name is unique across the hub and contains 1–63 characters, including `/` separators.
+Names can have segments, such as `team/sales`. Each segment contains lowercase letters,
+digits, or hyphens, and starts and ends with a letter or digit.
 
 Links inherit the notebook's permissions. Recipients must sign in and have
 permission to run the app. Several names can point to one notebook, and each
-uses the same notebook pool and account assignments.
+uses the same notebook pool and visit assignments.
+
+<figure class="doc-screenshot doc-screenshot--narrow">
+  <a href="/screenshots/app-links.png" target="_blank" rel="noreferrer" aria-label="Open full-size screenshot: App links dialog with a revenue link and access requirements (new tab)">
+    <img src="/screenshots/app-links.png" alt="App links dialog with a revenue link and access requirements" width="510" height="191" loading="lazy" decoding="async" />
+  </a>
+  <figcaption>A named app link keeps the notebook’s existing permissions.</figcaption>
+</figure>
 
 Removing a link releases its name immediately. Old shared URLs can then open
 another notebook that registers the same name. Removal does not stop running
 apps or change notebook permissions. Deleting the notebook or project also
 releases its names.
+
+## Link between apps
+
+A link inside a notebook can open another app in the outer Hub page.
+First, create an [app link](#authenticated-app-links) for the target notebook.
+Then use its path in HTML output or `mo.nav_menu`:
+
+```python
+mo.Html('<a href="/app/match?id=xyz">Open match</a>')
+
+mo.nav_menu({"/app/match?id=xyz": "Match"})
+```
+
+HTML links also accept `app/match?id=xyz` without the leading slash.
+Hub supplies its origin and deployment prefix, so the link does not need the sandbox hostname.
+The target receives the link parameters, including repeated and empty values.
+Hub removes [reserved parameters](#reserved-parameters) and parameters from the source sandbox URL.
+The target keeps its existing sign-in and access requirements.
+
+This works in Hub app and editor views with a connected notebook bridge.
+Normal clicks open the target in the same tab. New-tab actions use the Hub URL.
+Downloads and external links retain their normal behavior.
+Standalone sandbox pages, static outputs, nested iframes, forms, and programmatic redirects do not use this feature.
+Existing sandbox sessions need a restart after the upgrade.
 
 ## Notebooks with query parameters
 
@@ -183,7 +236,7 @@ Do not automatically replace app-user with viewer: viewer grants source access.
 ### Verification
 
 Run `uv run scripts/test-app-source.py` to check the pinned marimo runtime.
-The test checks interaction, bootstrap data, WebSocket messages, error output, source endpoints, and HTML exports.
+The test checks interaction, independent session state, bootstrap data, WebSocket messages, error output, source endpoints, and HTML exports.
 CI runs this check with the Chromium end-to-end job.
 
 ## Configuration
@@ -191,7 +244,7 @@ CI runs this check with the Chromium end-to-end job.
 | Variable                                 | Effect on apps                                                                                                         |
 | ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
 | `MARIMOHUB_VIEWER_MODE`                  | `applications` or `ephemeral-sandbox` enables viewer app access. Default `static` denies it. App users are unaffected. |
-| `MARIMOHUB_APP_MAX_USERS_PER_SESSION`    | Accounts per sandbox; unset means unlimited.                                                                           |
+| `MARIMOHUB_APP_MAX_VISITS_PER_SESSION`   | Browser sessions per sandbox; unset means unlimited.                                                                   |
 | `MARIMOHUB_APP_MAX_SESSIONS_PER_VERSION` | Unexpired starting reservations and ready sandboxes per notebook's current version; unset means unlimited.             |
 | `MARIMOHUB_MAX_APPS_PER_PROJECT`         | Physical app sandboxes per project, including draining versions (default `5`, `0` = unlimited).                        |
 | `MARIMOHUB_MAX_SESSIONS_PER_USER`        | Also bounds the apps a single user may have _started_, across all projects.                                            |

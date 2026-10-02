@@ -6,7 +6,7 @@ import type { ApiDeps } from '@marimo-hub/api';
 import { createApi } from '@marimo-hub/api';
 import { createFromEnvAsync, isConfigError } from '@marimo-hub/config';
 import { disposeNotifier, InFlightWork } from '@marimo-hub/core';
-import { startJobScheduler, startMaintenance, startSessionLifecycle } from './cron';
+import { startJobScheduler, startMaintenance, startSessionLifecycle, startWarmPools } from './cron';
 import { validateServerEnv } from './env';
 import { logEvent } from './log';
 import { fanoutMetrics, OtelMetrics, WideEventMetrics } from './metrics';
@@ -121,13 +121,26 @@ export async function bootstrap(
 		}
 	}
 
-	// Security headers for the SPA/static responses: anti-clickjacking
-	// (X-Frame-Options: SAMEORIGIN), MIME-sniffing (nosniff), HSTS, Referrer-Policy,
-	// and cross-origin isolation defaults. Registered after createApi, so it wraps the
-	// fall-through static/HTML responses (the framing/XSS-delivery surface); the
-	// terminal /api/* JSON routes inside createApi are unaffected. No CSP is set here —
-	// a tuned CSP (allowing the font CDN + the sandbox iframe origin) is a follow-up.
-	app.use('*', secureHeaders());
+	// Keep SPA policy separate from terminal API, kernel-proxy, and snapshot responses.
+	app.use(
+		'*',
+		secureHeaders({
+			contentSecurityPolicyReportOnly: {
+				defaultSrc: ["'self'"],
+				baseUri: ["'self'"],
+				objectSrc: ["'none'"],
+				scriptSrc: ["'self'", "'wasm-unsafe-eval'"],
+				styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+				fontSrc: ["'self'", 'https://fonts.gstatic.com'],
+				imgSrc: ["'self'", 'data:', 'blob:', 'https:'],
+				connectSrc: ["'self'"],
+				// Direct exposure uses provider-issued origins that are unknown at startup.
+				frameSrc:
+					deps.sandbox.exposure?.mode === 'proxy' ? ["'self'"] : ["'self'", 'https:', 'http:'],
+				workerSrc: ["'self'", 'blob:'],
+			},
+		}),
+	);
 
 	// Serve the prebuilt SPA. API routes (registered inside createApi) are terminal,
 	// so they take precedence; everything else falls through to static assets, with
@@ -144,7 +157,13 @@ export async function bootstrap(
 	// defense-in-depth guards.
 	const stops: (() => void)[] = [];
 	let drainJobRuns: () => Promise<void> = () => Promise.resolve();
+	let drainWarmPools: () => Promise<void> = () => Promise.resolve();
 	if (validatedEnv.MARIMOHUB_RUN_MAINTENANCE === 'true') {
+		const warmPools = startWarmPools(deps);
+		if (warmPools) {
+			stops.push(warmPools.stop);
+			drainWarmPools = warmPools.drain;
+		}
 		stops.push(startMaintenance(deps, wideEvents));
 		const stopLifecycle = startSessionLifecycle(deps);
 		if (stopLifecycle) stops.push(stopLifecycle);
@@ -156,10 +175,12 @@ export async function bootstrap(
 	}
 
 	const port = Number(validatedEnv.PORT ?? 3000);
+	// Unset listens on every interface, which a container needs to publish the port.
+	const hostname = overrides.hostname ?? validatedEnv.MARIMOHUB_BIND_HOST;
 	const serverOptions = {
 		fetch: app.fetch,
 		port,
-		...(overrides.hostname ? { hostname: overrides.hostname } : {}),
+		...(hostname ? { hostname } : {}),
 	};
 	const server = serveFn(serverOptions, (info) => {
 		const address = info.address.includes(':') ? `[${info.address}]` : info.address;
@@ -196,7 +217,7 @@ export async function bootstrap(
 				return dataBrowserClose;
 			};
 			const disposeCompute = deps.compute[Symbol.asyncDispose];
-			const schedulerDrained = drainJobRuns();
+			const schedulerDrained = Promise.all([drainJobRuns(), drainWarmPools()]);
 			const shutdowns: PromiseLike<unknown>[] = [
 				closed,
 				...(deps.dataBrowser?.close ? [closed.then(closeDataBrowser)] : []),

@@ -118,6 +118,13 @@ export function readFileFailure(
 	return { success: false, content: '', error: { code } };
 }
 
+export interface BoundedReadOptions {
+	/** Nonnegative safe integer whose base64 size is also a safe integer. */
+	maxBytes: number;
+	/** Positive, at most 2^31 - 1 ms; fractional milliseconds round up. */
+	timeoutMs: number;
+}
+
 export interface FileInfo {
 	name: string;
 	absolutePath: string;
@@ -161,6 +168,7 @@ export interface ExecStreamOptions {
 
 export interface ExecOptions {
 	timeout?: number;
+	maxOutputBytes?: number;
 }
 
 /** One file to write into a sandbox. `Uint8Array` content is written verbatim. */
@@ -189,6 +197,8 @@ export interface SandboxInstance {
 	exec(cmd: string, options?: ExecOptions): Promise<ExecResult>;
 	execStream(cmd: string, options?: ExecStreamOptions): Promise<ReadableStream>;
 	readFile(path: string): Promise<ReadFileResult>;
+	/** Reject symlinks/nonregular files; cap transport bytes and cancel on deadline/overflow. */
+	readFileBounded?(path: string, options: BoundedReadOptions): Promise<ReadFileResult>;
 	/**
 	 * List entries below a directory. An existing non-directory path returns
 	 * `NOT_A_DIRECTORY`; it must never succeed with an empty file list.
@@ -299,11 +309,26 @@ export interface CreateSandboxOptions {
 	owner?: SandboxOwner;
 }
 
+export interface WarmPoolSupport {
+	/** Guaranteed lifetime from before creation; null means no provider lifetime cap. */
+	maxLifetimeMs: number | null;
+	/** Serializable creation inputs not represented by environment variables, such as loaded templates. */
+	configuration?: unknown;
+}
+
 export interface SandboxProvider {
+	/** Opt-in requires strict reconnect and idempotent destruction by the original sandbox ID. */
+	readonly warmPool?: WarmPoolSupport;
 	readonly capabilities?: {
 		multiPort: boolean;
+		/** Applies resources.cpu and resources.memoryBytes from compute profiles. */
+		computeProfiles?: boolean;
+		/** Applies resources.gpu from compute profiles; implies computeProfiles. */
+		gpuProfiles?: boolean;
 	};
 	create(id: SandboxId, options?: CreateSandboxOptions): SandboxInstance;
+	/** Attach without creating; a missing or stopped sandbox must fail on first use. */
+	connectExisting?(id: SandboxId, options?: CreateSandboxOptions): SandboxInstance;
 	/**
 	 * Proxy an incoming request to a sandbox's exposed port.
 	 * Returns a Response if the request matched a sandbox URL, null otherwise.

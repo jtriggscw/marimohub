@@ -1,11 +1,16 @@
 import { randomUUID } from 'node:crypto';
 import { posix } from 'node:path';
+import { all } from 'better-all';
 import {
 	ModalClient,
 	NotFoundError as ModalNotFoundError,
 	SandboxFilesystemNotADirectoryError,
 } from 'modal';
+import type { App, ContainerProcess, Sandbox, Secret } from 'modal';
 import {
+	validateOutputBudget,
+	readBoundedFile,
+	collectBoundedOutput,
 	buildLaunchCommand,
 	buildGitCloneCommand,
 	errorMessage,
@@ -23,8 +28,10 @@ import {
 } from '@marimo-hub/compute-commons';
 import type { LaunchProtocolOutcome } from '@marimo-hub/compute-commons';
 import { NotFoundError } from '@marimo-hub/core/errors';
+import { logOperationalError } from '@marimo-hub/core/operational-log';
 import { SandboxId } from '@marimo-hub/core/ids';
 import type {
+	BoundedReadOptions,
 	ActiveSandbox,
 	ComputeResources,
 	CreateSandboxOptions,
@@ -62,72 +69,34 @@ export interface ModalConfig {
 	environment?: string;
 	/** Modal app name that owns the sandboxes. */
 	appName?: string;
+	/** Named Modal secrets injected into every new sandbox in this deployment. */
+	secretNames?: string[];
 	/** Provider-side fallback, set later than marimohub's graceful idle deadline. */
 	idleFallbackMs?: number;
 }
 
-export interface ModalProcessLike {
-	stdout: ReadableStream<string>;
-	stderr: ReadableStream<string>;
-	wait(): Promise<number>;
-}
-
-export interface ModalFileInfoLike {
-	name: string;
-	path: string;
-	type: 'file' | 'directory' | 'symlink';
-	size: number;
-}
-
-export interface ModalSandboxLike {
-	filesystem: {
-		readText(path: string): Promise<string>;
-		writeText(content: string, path: string): Promise<void>;
-		writeBytes(content: Uint8Array, path: string): Promise<void>;
-		listFiles(path: string): Promise<ModalFileInfoLike[]>;
-	};
-	exec(
-		command: string[],
-		options?: {
-			mode?: 'text';
-			workdir?: string;
-			timeoutMs?: number;
-			env?: Record<string, string>;
-			pty?: boolean;
-		},
-	): Promise<ModalProcessLike>;
-	getTags(): Promise<Record<string, string>>;
-	terminate(): Promise<void>;
-	tunnels(timeoutMs?: number): Promise<Record<number, { url: string }>>;
-}
-
-export interface ModalClientLike {
-	apps: {
-		fromName(name: string, options?: { createIfMissing?: boolean }): Promise<{ appId: string }>;
-	};
-	images: {
-		fromRegistry(image: string): unknown;
-	};
-	sandboxes: {
-		create(
-			app: unknown,
-			image: unknown,
-			options: {
-				name: string;
-				command: string[];
-				tags: Record<string, string>;
-				encryptedPorts: number[];
-				timeoutMs: number;
-				idleTimeoutMs?: number;
-				cpu?: number;
-				memoryMiB?: number;
-				gpu?: string;
-			},
-		): Promise<ModalSandboxLike>;
-		fromName(appName: string, name: string): Promise<ModalSandboxLike>;
-		list(options: { appId: string; tags: Record<string, string> }): AsyncIterable<ModalSandboxLike>;
-	};
-}
+// Modal exposes stdin EOF, but no process signal API. Keep cancellation outside
+// the command's process group so closing stdin also stops surviving descendants.
+const BOUNDED_EXEC = `import os, signal, subprocess, sys, threading
+child = subprocess.Popen(sys.argv[2:], stdin=subprocess.DEVNULL, start_new_session=True)
+def kill():
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+def watch_stdin():
+    os.read(0, 1)
+    kill()
+threading.Thread(target=watch_stdin, daemon=True).start()
+timeout = float(sys.argv[1]) / 1000
+if timeout > 0:
+    timer = threading.Timer(timeout, kill)
+    timer.daemon = True
+    timer.start()
+try:
+    sys.exit(child.wait())
+finally:
+    kill()`;
 
 const DEFAULT_APP_NAME = 'marimohub';
 const KERNEL_PORT = 2718;
@@ -153,6 +122,29 @@ function isNotFound(error: unknown): boolean {
 	return (
 		error instanceof ModalNotFoundError ||
 		(error instanceof Error && error.name === 'NotFoundError')
+	);
+}
+
+// Deliberately not a NotFoundError: `isNotFound` treats that name as "sandbox
+// gone", and a missing secret must never be mistaken for one.
+class ModalSecretLookupError extends Error {
+	override readonly name = 'ModalSecretLookupError';
+}
+
+async function resolveSecrets(client: ModalClient, names: readonly string[]): Promise<Secret[]> {
+	const environment = client.environmentName();
+	const where = environment ? `in environment "${environment}"` : 'in the default environment';
+	return Promise.all(
+		names.map(async (name) => {
+			try {
+				return await client.secrets.fromName(name);
+			} catch (cause) {
+				throw new ModalSecretLookupError(
+					`could not resolve Modal secret "${name}" (MARIMOHUB_COMPUTE_MODAL_SECRETS) ${where}: ${errorMessage(cause)}`,
+					{ cause },
+				);
+			}
+		}),
 	);
 }
 
@@ -195,7 +187,7 @@ async function consumeStream(
 	}
 }
 
-async function runProcess(process: ModalProcessLike): Promise<ExecResult> {
+async function runProcess(process: ContainerProcess<string>): Promise<ExecResult> {
 	const [stdout, stderr, exitCode] = await Promise.all([
 		readStream(process.stdout),
 		readStream(process.stderr),
@@ -218,43 +210,46 @@ class ModalLaunchTimeoutError extends Error {
 
 class ModalSandboxInstance implements SandboxInstance {
 	readonly supportsBucketMount = false;
-	private sandboxPromise?: Promise<ModalSandboxLike>;
+	private sandboxPromise?: Promise<Sandbox>;
 	private env: Record<string, string> = {};
 	private envDefaults: Record<string, string> = {};
 
 	constructor(
 		private readonly id: SandboxId,
 		private readonly config: ModalConfig,
-		private readonly client: ModalClientLike,
+		private readonly client: ModalClient,
 		private readonly resources: ReturnType<typeof modalProfileResources>,
 		private readonly reuse: boolean,
 	) {}
 
-	private createSandbox(): Promise<ModalSandboxLike> {
+	private async createSandbox(): Promise<Sandbox> {
 		const appName = this.config.appName ?? DEFAULT_APP_NAME;
-		return this.client.apps.fromName(appName, { createIfMissing: true }).then((app) =>
-			this.client.sandboxes.create(app, this.client.images.fromRegistry(this.config.image), {
-				name: this.id,
-				// Pin an idle main process. With no command the SDK sends empty
-				// entrypointArgs and Modal boots the image's ENTRYPOINT — a marimo
-				// that grabs the kernel port before the provisioner's `setup && start`
-				// exec, which then rewrites /opt/venv under the live server (#103).
-				command: ['sleep', 'infinity'],
-				tags: {
-					[OWNER_TAG]: appName,
-					[SANDBOX_ID_TAG]: this.id,
-				},
-				encryptedPorts: [KERNEL_PORT],
-				timeoutMs: MAX_SANDBOX_LIFETIME_MS,
-				...(this.config.idleFallbackMs !== undefined
-					? { idleTimeoutMs: this.config.idleFallbackMs }
-					: {}),
-				...this.resources,
-			}),
-		);
+		const { app, secrets } = await all({
+			app: async () => this.client.apps.fromName(appName, { createIfMissing: true }),
+			secrets: async () => resolveSecrets(this.client, this.config.secretNames ?? []),
+		});
+		return this.client.sandboxes.create(app, this.client.images.fromRegistry(this.config.image), {
+			name: this.id,
+			// Pin an idle main process. With no command the SDK sends empty
+			// entrypointArgs and Modal boots the image's ENTRYPOINT — a marimo
+			// that grabs the kernel port before the provisioner's `setup && start`
+			// exec, which then rewrites /opt/venv under the live server (#103).
+			command: ['sleep', 'infinity'],
+			tags: {
+				[OWNER_TAG]: appName,
+				[SANDBOX_ID_TAG]: this.id,
+			},
+			encryptedPorts: [KERNEL_PORT],
+			timeoutMs: MAX_SANDBOX_LIFETIME_MS,
+			...(this.config.idleFallbackMs !== undefined
+				? { idleTimeoutMs: this.config.idleFallbackMs }
+				: {}),
+			...this.resources,
+			...(secrets.length > 0 ? { secrets } : {}),
+		});
 	}
 
-	private getSandbox(createIfMissing = true): Promise<ModalSandboxLike> {
+	private getSandbox(createIfMissing = true): Promise<Sandbox> {
 		if (this.sandboxPromise) return this.sandboxPromise;
 		if (!this.reuse) {
 			if (!createIfMissing) {
@@ -280,21 +275,50 @@ class ModalSandboxInstance implements SandboxInstance {
 			timeout?: number;
 			pty?: boolean;
 		},
-	): Promise<ModalProcessLike> {
+	): Promise<ContainerProcess<string>> {
+		const timeout = options?.timeout;
+		if (timeout !== undefined && (!Number.isFinite(timeout) || timeout < 0)) {
+			throw new RangeError('Sandbox exec timeout must be finite and nonnegative');
+		}
 		const sandbox = await this.getSandbox();
 		return sandbox.exec(command, {
 			mode: 'text',
 			...(options?.cwd ? { workdir: options.cwd } : {}),
-			...(options?.timeout !== undefined ? { timeoutMs: options.timeout } : {}),
+			// Modal requires whole seconds; round up to preserve the caller's budget.
+			...(timeout !== undefined && timeout > 0
+				? { timeoutMs: Math.ceil(timeout / 1000) * 1000 }
+				: {}),
 			env: { ...this.env, ...definedEnv(options?.env) },
 			...(options?.pty ? { pty: true } : {}),
 		});
 	}
 
 	async exec(cmd: string, options?: ExecOptions): Promise<ExecResult> {
-		return runProcess(
-			await this.spawn(['sh', '-lc', this.withDefaults(cmd)], { timeout: options?.timeout }),
+		if (options?.maxOutputBytes === undefined) {
+			return runProcess(
+				await this.spawn(['sh', '-lc', this.withDefaults(cmd)], {
+					timeout: options?.timeout,
+				}),
+			);
+		}
+		validateOutputBudget(options.maxOutputBytes);
+		const timeout = options.timeout ?? 10_000;
+		if (!Number.isFinite(timeout) || timeout < 0)
+			throw new RangeError('Sandbox output timeout must be finite and nonnegative');
+		const process = await this.spawn(
+			['python3', '-I', '-c', BOUNDED_EXEC, String(timeout), 'sh', '-lc', this.withDefaults(cmd)],
+			// Let the supervisor kill its process group before the provider deadline.
+			{ timeout: timeout > 0 ? timeout + 1000 : 0 },
 		);
+		try {
+			const { stdout, stderr, result } = await collectBoundedOutput(
+				{ stdout: process.stdout, stderr: process.stderr, wait: () => process.wait() },
+				{ maxOutputBytes: options.maxOutputBytes, timeout },
+			);
+			return execResult(result === 0, stdout, stderr);
+		} finally {
+			await process.stdin.close().catch(() => {});
+		}
 	}
 
 	async execStream(cmd: string, options?: ExecStreamOptions): Promise<ReadableStream> {
@@ -304,6 +328,10 @@ class ModalSandboxInstance implements SandboxInstance {
 		void readStream(process.stderr).catch(() => {});
 		void process.wait().catch(() => {});
 		return process.stdout;
+	}
+
+	async readFileBounded(path: string, options: BoundedReadOptions): Promise<ReadFileResult> {
+		return readBoundedFile(path, options, (command, limits) => this.exec(command, limits));
 	}
 
 	async readFile(path: string): Promise<ReadFileResult> {
@@ -419,10 +447,18 @@ class ModalSandboxInstance implements SandboxInstance {
 				settled = true;
 				void execInSandbox(`rm -f ${shellQuote(pidPath)}`).catch(() => {});
 			});
+		const processId = options?.processId ?? `modal-process-${++processSequence}`;
 		const completed = Promise.all([stdoutDone, stderrDone, exited]).then(() => {});
+		void completed.catch((error) => {
+			logOperationalError(
+				'sandbox_process_failed',
+				{ operation: 'modal.start_process', sandbox: this.id, process_id: processId },
+				error,
+			);
+		});
 
 		const sandboxProcess: SandboxProcess = {
-			id: options?.processId ?? `modal-process-${++processSequence}`,
+			id: processId,
 			command: cmd,
 			async kill(signal?: string): Promise<void> {
 				if (settled) return;
@@ -622,21 +658,20 @@ class ModalSandboxInstance implements SandboxInstance {
 
 export class ModalCompute implements SandboxProvider {
 	readonly capabilities = { multiPort: false } as const;
-	private readonly client: ModalClientLike;
+	private readonly client: ModalClient;
 
 	constructor(
 		private readonly config: ModalConfig,
-		client?: ModalClientLike,
+		client?: ModalClient,
 	) {
 		this.client =
 			client ??
-			// oxlint-disable-next-line anti-slop/no-chained-type-assertions -- the SDK class implements this injected seam
-			(new ModalClient({
+			new ModalClient({
 				tokenId: config.tokenId,
 				tokenSecret: config.tokenSecret,
 				environment: config.environment,
 				...(config.apiBase ? { endpoint: config.apiBase } : {}),
-			}) as unknown as ModalClientLike);
+			});
 	}
 
 	create(id: SandboxId, options?: CreateSandboxOptions): SandboxInstance {
@@ -660,9 +695,24 @@ export class ModalCompute implements SandboxProvider {
 		return null;
 	}
 
+	async healthCheck(): Promise<void> {
+		await all({
+			app: async () => {
+				try {
+					return await this.client.apps.fromName(this.config.appName ?? DEFAULT_APP_NAME);
+				} catch (error) {
+					// The first sandbox create makes the app; a missing one is not a fault.
+					if (isNotFound(error)) return;
+					throw error;
+				}
+			},
+			secrets: async () => resolveSecrets(this.client, this.config.secretNames ?? []),
+		});
+	}
+
 	async listActive(): Promise<ActiveSandbox[]> {
 		const appName = this.config.appName ?? DEFAULT_APP_NAME;
-		let app: { appId: string };
+		let app: App;
 		try {
 			app = await this.client.apps.fromName(appName);
 		} catch (error) {

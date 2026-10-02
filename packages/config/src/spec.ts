@@ -102,6 +102,90 @@ const AI_TOKEN_TTL_SECONDS: ConfigVar = {
 
 export const CONFIG_SPEC: ConfigGroup[] = [
 	{
+		name: 'Theme',
+		description:
+			'Deployment branding for the hub UI. All values are public. See the [theming guide](./theming.md) for examples and asset hosting.',
+		backends: [
+			{
+				name: 'Branding',
+				vars: [
+					{
+						id: 'MARIMOHUB_THEME_NAME',
+						name: 'Display name',
+						description: 'Display name, browser-title suffix, and installed app name.',
+						example: 'Research Hub',
+						optIn: true,
+						default: 'marimohub',
+					},
+					{
+						id: 'MARIMOHUB_THEME_FAVICON',
+						name: 'Favicon',
+						description:
+							'SVG, PNG, or ICO favicon. Use an HTTPS URL or root-relative same-origin path. Falls back to the 192px app icon, then 512px, then the built-in favicon.',
+						example: 'https://hub.example.com/brand/favicon.svg',
+						optIn: true,
+					},
+					{
+						id: 'MARIMOHUB_THEME_LOGO',
+						name: 'Logo',
+						description:
+							'SVG or PNG logo that replaces the full icon and wordmark. Use an HTTPS URL or root-relative same-origin path.',
+						example: 'https://hub.example.com/brand/logo.svg',
+						optIn: true,
+					},
+					{
+						id: 'MARIMOHUB_THEME_LOGO_DARK',
+						name: 'Dark-mode logo',
+						description: 'SVG or PNG logo for dark mode. Defaults to the main logo.',
+						example: 'https://hub.example.com/brand/logo-dark.svg',
+						optIn: true,
+					},
+					{
+						id: 'MARIMOHUB_THEME_PRIMARY_COLOR',
+						name: 'Primary color',
+						description:
+							'Opaque #RGB or #RRGGBB color for actions, links, and focus. Generates readable light and dark palettes.',
+						example: '#2563eb',
+						optIn: true,
+					},
+					{
+						id: 'MARIMOHUB_THEME_SECONDARY_COLOR',
+						name: 'Secondary color',
+						description:
+							'Opaque #RGB or #RRGGBB color for accents and surface tints. Defaults to the primary color.',
+						example: '#7c3aed',
+						optIn: true,
+					},
+					{
+						id: 'MARIMOHUB_THEME_PWA_ICON_192',
+						name: '192px app icon',
+						description:
+							'192×192 PNG app icon. Use an HTTPS URL or root-relative same-origin path. Defaults to the built-in icon.',
+						example: 'https://hub.example.com/brand/icon-192.png',
+						optIn: true,
+					},
+					{
+						id: 'MARIMOHUB_THEME_PWA_ICON_512',
+						name: '512px app icon',
+						description:
+							'512×512 PNG app icon. Use an HTTPS URL or root-relative same-origin path. Defaults to the built-in icon.',
+						example: 'https://hub.example.com/brand/icon-512.png',
+						optIn: true,
+					},
+					{
+						id: 'MARIMOHUB_THEME_APPLE_TOUCH_ICON',
+						name: 'Apple touch icon',
+						description:
+							'180×180 PNG Apple touch icon. Use an HTTPS URL or root-relative same-origin path. Falls back to the 192px app icon, then 512px, then the built-in icon.',
+						example: 'https://hub.example.com/brand/apple-touch-icon.png',
+						optIn: true,
+					},
+				],
+			},
+		],
+	},
+
+	{
 		name: 'Storage',
 		selector: 'MARIMOHUB_STORAGE_BACKEND',
 		selectorDefault: 's3',
@@ -301,8 +385,32 @@ export const CONFIG_SPEC: ConfigGroup[] = [
 						id: 'MARIMOHUB_COMPUTE_PROFILES',
 						name: 'Compute profiles',
 						description:
-							'Ordered named CPU, memory, and optional GPU profiles. Use `name:cpu=<cores>;mem=<Mi|Gi|Ti>;gpu=<type>[:<count>]`. The maximum GPU count is 8. The first profile is the default. Supported backends apply the selected profile when overrides are enabled. The Modal backend applies GPU requests. Other backends ignore GPU values and log a startup warning.',
+							'Ordered named CPU, memory, and optional GPU profiles. Use `name:cpu=<cores>;mem=<Mi|Gi|Ti>;gpu=<type>[:<count>]`. The maximum GPU count is 8. The first profile is the default. Supported backends apply the selected profile when overrides are enabled. The Modal backend, and library adapters that declare `gpuProfiles`, apply GPU requests. Other backends ignore GPU values and log a startup warning.',
 						example: 'small:cpu=1;mem=2Gi,gpu-large:cpu=8;mem=32Gi;gpu=A100',
+						optIn: true,
+					},
+					{
+						id: 'MARIMOHUB_COMPUTE_WARM_POOL_ENABLED',
+						name: 'Warm sandbox pools',
+						description:
+							'Keep unassigned CoreWeave or Kubernetes sandboxes ready for editor and app sessions. Requires a maintenance replica. Jobs, sandbox startup diagnostics, personal-home mounts, snapshot restores, and non-default images use cold creation. Idle sandboxes consume compute.',
+						default: 'false',
+						optIn: true,
+					},
+					{
+						id: 'MARIMOHUB_COMPUTE_WARM_POOL_SIZE',
+						name: 'Warm sandboxes per profile',
+						description:
+							'Positive integer target of idle sandboxes per selected profile, shared across all server replicas. Used only when warm pools are enabled.',
+						default: '1',
+						optIn: true,
+					},
+					{
+						id: 'MARIMOHUB_COMPUTE_WARM_POOL_PROFILES',
+						name: 'Warm pool profiles',
+						description:
+							'`default` warms the first compute profile; `all` warms every configured profile. With no profiles, warms adapter defaults. Each pool uses only the default image.',
+						default: 'default',
 						optIn: true,
 					},
 					{
@@ -441,6 +549,13 @@ export const CONFIG_SPEC: ConfigGroup[] = [
 						default: 'https://api.cwsandbox.com (SDK default)',
 					},
 					{
+						id: 'MARIMOHUB_COMPUTE_COREWEAVE_DATA_PLANE_MODE',
+						name: 'CoreWeave data connection mode',
+						description:
+							'Connection mode for exec, logs, and file transfers. `direct` requires runner mTLS and fails if unavailable. `auto` tries direct, then uses the Gateway if unavailable. `gateway` always uses the Gateway. Lifecycle calls still use the API.',
+						default: 'auto',
+					},
+					{
 						id: 'MARIMOHUB_COMPUTE_COREWEAVE_OWNER_TAG',
 						name: 'CoreWeave owner tag',
 						description: 'Tag applied to owned sandboxes for discovery and cleanup.',
@@ -543,7 +658,7 @@ export const CONFIG_SPEC: ConfigGroup[] = [
 				selectorValue: 'wandb',
 				supportsComputeProfiles: true,
 				description:
-					'CoreWeave Sandboxes via the W&B (Weights & Biases) gateway — the `coreweave` backend authenticated with a W&B API key. Kernel URLs are resolved automatically: the managed runner assigns each sandbox a public IP served over plain HTTP, so no sandbox hostname is needed. Profile/placement overrides, GPU requests, egress overrides, and CAIOS vending are not available through the gateway; use hub-minted WIF (docs/workload-identity-federation.md) for bucket access.',
+					'CoreWeave Sandboxes via the W&B (Weights & Biases) gateway — the `coreweave` backend authenticated with a W&B API key. Kernel URLs are resolved automatically: the managed runner assigns each kernel an HTTPS endpoint, so no sandbox hostname is needed. Profile/placement overrides, GPU requests, egress overrides, and CAIOS vending are not available through the gateway; use hub-minted WIF (docs/workload-identity-federation.md) for bucket access.',
 				vars: [
 					{
 						id: 'MARIMOHUB_COMPUTE_WANDB_API_KEY',
@@ -620,6 +735,14 @@ export const CONFIG_SPEC: ConfigGroup[] = [
 						description:
 							'Limits cleanup to sandboxes this deployment created, so it never stops others sharing the same Modal workspace.',
 						example: 'marimohub',
+					},
+					{
+						id: 'MARIMOHUB_COMPUTE_MODAL_SECRETS',
+						name: 'Modal secrets',
+						description:
+							'Comma-separated Modal secret names injected into every new sandbox, deployment-wide. Secrets must exist in the configured Modal environment. Unset or empty adds none. Every editor, app, and job sandbox in every project receives these values, and any notebook author can read them. Use project integration secret references for project-scoped credentials.',
+						example: 'shared-credentials,huggingface',
+						optIn: true,
 					},
 				],
 			},
@@ -854,6 +977,14 @@ export const CONFIG_SPEC: ConfigGroup[] = [
 						optIn: true,
 					},
 					{
+						id: 'MARIMOHUB_COMPUTE_KUBERNETES_POD_TEMPLATE_FILE',
+						name: 'Kubernetes pod template file',
+						description:
+							'Path to a YAML or JSON partial Pod manifest, read at startup for new kernel Pods. Explicit configuration overrides template values. See [pod templates](compute.md#pod-templates) for an example, precedence, and compatibility limits.',
+						example: '/etc/marimohub/kernel-pod.yaml',
+						optIn: true,
+					},
+					{
 						id: 'MARIMOHUB_COMPUTE_KUBERNETES_SERVICE_ACCOUNT',
 						name: 'Kubernetes service account',
 						description: 'ServiceAccount the kernel Pod runs as. Omit for the namespace default.',
@@ -890,6 +1021,22 @@ export const CONFIG_SPEC: ConfigGroup[] = [
 						name: 'Kubernetes GPU count',
 						description: 'GPU count, mapped to the `nvidia.com/gpu` limit.',
 						example: '1',
+					},
+					{
+						id: 'MARIMOHUB_COMPUTE_KUBERNETES_POD_LABELS',
+						name: 'Kubernetes pod labels',
+						description:
+							'Comma-separated `key=value` labels added to each kernel Pod, Service, and Ingress. Use for ownership labels that cluster admission policies require on every object.',
+						example: 'team=data,app.kubernetes.io/part-of=marimohub',
+						optIn: true,
+					},
+					{
+						id: 'MARIMOHUB_COMPUTE_KUBERNETES_RUN_AS_USER',
+						name: 'Kubernetes run-as user',
+						description:
+							'Sets Pod `runAsUser`, matching `fsGroup`, and `runAsNonRoot` (false for UID `0`). Overrides these template fields only. Unset preserves the template security context. The UID needs write access to the image workdir. `fsGroup` affects mounted volumes only.',
+						example: '1000',
+						optIn: true,
 					},
 					{
 						id: 'MARIMOHUB_COMPUTE_KUBERNETES_POD_READY_TIMEOUT_SECONDS',
@@ -988,7 +1135,7 @@ export const CONFIG_SPEC: ConfigGroup[] = [
 				name: 'Subdomain (direct, isolated domain)',
 				selectorValue: 'subdomain',
 				description:
-					"The compute adapter's public kernel URL is used as-is. Set `MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME` to a domain separate from the app host.",
+					'Uses the public kernel URL directly. Set `MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME` to a sibling subdomain or separate domain.',
 				vars: [],
 			},
 			{
@@ -1327,6 +1474,13 @@ export const CONFIG_SPEC: ConfigGroup[] = [
 						default: '3000',
 					},
 					{
+						id: 'MARIMOHUB_BIND_HOST',
+						name: 'HTTP bind address',
+						description:
+							'IP address the HTTP server listens on. Unset listens on all interfaces; an empty value is rejected. Set `127.0.0.1` to accept only connections from the same host, such as a reverse proxy. In a container, leave it unset and publish the port on loopback instead (`-p 127.0.0.1:3000:3000`).',
+						example: '127.0.0.1',
+					},
+					{
 						id: 'MARIMOHUB_APP_BASE_URL',
 						name: 'App base URL',
 						description:
@@ -1362,10 +1516,10 @@ export const CONFIG_SPEC: ConfigGroup[] = [
 						default: '5',
 					},
 					{
-						id: 'MARIMOHUB_APP_MAX_USERS_PER_SESSION',
-						name: 'Max users per app session',
+						id: 'MARIMOHUB_APP_MAX_VISITS_PER_SESSION',
+						name: 'Max visits per app sandbox',
 						description:
-							'Distinct accounts per sandbox. Unset means unlimited users in one current-version sandbox.',
+							'Browser sessions (managed page visits) per sandbox. Each tab consumes a slot, including tabs from the same account. Unset means unlimited.',
 					},
 					{
 						id: 'MARIMOHUB_APP_MAX_SESSIONS_PER_VERSION',
@@ -1391,7 +1545,7 @@ export const CONFIG_SPEC: ConfigGroup[] = [
 						id: 'MARIMOHUB_SESSION_APP_IDLE_TIMEOUT_SECONDS',
 						name: 'App session idle timeout (seconds)',
 						description:
-							'Time an app sandbox remains empty after its last account assignment expires, including reconnect grace, subject to connection protection. Falls back to MARIMOHUB_SESSION_IDLE_TIMEOUT_SECONDS (1800 seconds by default). Credential and provider lifetime limits still apply.',
+							'Time an app sandbox remains empty after its last visit assignment expires, including reconnect grace, subject to connection protection. Falls back to MARIMOHUB_SESSION_IDLE_TIMEOUT_SECONDS (1800 seconds by default). Credential and provider lifetime limits still apply.',
 					},
 					{
 						id: 'MARIMOHUB_AUTOMATIC_THUMBNAILS',
@@ -1526,7 +1680,7 @@ export const CONFIG_SPEC: ConfigGroup[] = [
 						id: 'MARIMOHUB_PERSIST_WORKSPACE',
 						name: 'Persist workspace',
 						description:
-							'Which sandbox working-dir files survive a session (source | workspace). `source` persists only the source files (notebook.py + pyproject.toml); `workspace` also captures runtime files (e.g. generated data) into the notebook workspace on teardown and restores them on the next session.',
+							'Which sandbox working-dir files survive a session (source | workspace). `source` persists only the source files (notebook.py + pyproject.toml). `workspace` also captures runtime files (e.g. generated data) into the notebook workspace on teardown and restores them on the next session. This includes hidden files such as `.env` and `.gitignore`, `.git/`, and `__marimo__/`. It excludes regenerable caches such as `.venv/`, `__pycache__/`, `node_modules/`, and `.pytest_cache/`. Any project member with read access can read the captured files, and every later session restores them.',
 						example: 'workspace',
 						default: 'source',
 					},
@@ -1561,7 +1715,7 @@ export const CONFIG_SPEC: ConfigGroup[] = [
 						id: 'MARIMOHUB_MCP',
 						name: 'MCP server',
 						description:
-							'Enables the MCP endpoint and OAuth server. Requires `MARIMOHUB_APP_BASE_URL`. Values: `on`, `off`.',
+							'Enables the MCP endpoint and OAuth server. Requires an HTTPS `MARIMOHUB_APP_BASE_URL` (plain http is accepted only for localhost and 127.0.0.1). Values: `on`, `off`.',
 						default: 'off',
 						example: 'on',
 					},
@@ -1669,6 +1823,14 @@ export const CONFIG_SPEC: ConfigGroup[] = [
 						example: '-----BEGIN RSA PRIVATE KEY-----\\n...\\n-----END RSA PRIVATE KEY-----',
 						optIn: true,
 						secret: true,
+					},
+					{
+						id: 'MARIMOHUB_SOURCE_CONTROL_GITHUB_ALLOWED_REPOSITORIES',
+						name: 'GitHub repository project policy',
+						description:
+							'Optional JSON array of `{resource, projects}` rules. Unset or blank policies keep shared access with a startup warning. `[]` denies all. See [GitHub project policies](syncing.md#github-project-policies) for syntax.',
+						example: '[{"resource":"team/notebooks","projects":["proj-0000000000000000"]}]',
+						optIn: true,
 					},
 				],
 			},
@@ -1780,7 +1942,7 @@ export const CONFIG_SPEC: ConfigGroup[] = [
 				name: 'Amazon Bedrock',
 				selectorValue: 'bedrock',
 				description:
-					'Uses the Amazon Bedrock OpenAI-compatible endpoint and signs requests with the runtime AWS identity. No Bedrock API key or AWS credential is injected into a sandbox.',
+					'Uses Bedrock Converse for Claude chat and SQL generation, and the OpenAI-compatible endpoint for other requests. The runtime AWS identity authenticates requests. Credentials stay outside sandboxes.',
 				vars: [
 					{
 						id: 'MARIMOHUB_AI_AWS_REGION',
@@ -1896,6 +2058,13 @@ export const CONFIG_SPEC: ConfigGroup[] = [
 						name: 'Resolve cache TTL (seconds)',
 						description: 'Cache duration for resolved values. A value of `0` disables caching.',
 						default: '0',
+					},
+					{
+						id: 'MARIMOHUB_SECRETS_AWS_ALLOWED_SECRETS',
+						name: 'AWS secret project policy',
+						description:
+							'Optional JSON array of `{resource, projects}` rules. Unset or blank policies keep shared access with a startup warning. `[]` denies all. See [AWS project policies](integration-secrets.md#aws-project-policies) for syntax.',
+						example: '[{"resource":"prod/warehouse","projects":["proj-0000000000000000"]}]',
 					},
 				],
 			},

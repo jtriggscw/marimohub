@@ -1,24 +1,35 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { afterEach, describe, it, expect, beforeEach, vi } from 'vitest';
 import {
-	ACTOR,
-	advanceTime,
-	expectNotFound,
-	MemoryBucket,
-	restoreClock,
-	TEST_KERNEL_AUTH_TOKEN,
-	uid,
-} from '../../testing';
-import { ConflictError, PreconditionFailedError } from '../../errors';
-import {
+	createSandboxId,
 	createNotebookId,
 	createProjectId,
 	createSessionId,
 	createVersionId,
 	SandboxId,
 } from '../../ids';
+
+import {
+	ACTOR,
+	advanceTime,
+	expectNotFound,
+	makeLocalSource,
+	MemoryBucket,
+	restoreClock,
+	TEST_KERNEL_AUTH_TOKEN,
+	uid,
+} from '../../testing';
+import { ConflictError, PreconditionFailedError } from '../../errors';
+
 import type { SessionId } from '../../ids';
+import { Millis } from '../../duration';
 import { paths } from '../../paths';
-import { SessionService } from './SessionService';
+import type { Source } from '../../schema';
+import {
+	isPastAuthorizationDeadline,
+	isReusableSession,
+	SessionService,
+	sessionWorkspaceDir,
+} from './SessionService';
 
 describe('SessionService', () => {
 	let bucket: MemoryBucket;
@@ -30,6 +41,58 @@ describe('SessionService', () => {
 	beforeEach(() => {
 		bucket = new MemoryBucket();
 		sessions = new SessionService(bucket);
+	});
+
+	describe('replaceStartingSandbox', () => {
+		it('clears old reclamation and fences delayed cleanup against the replacement ID', async () => {
+			const oldId = createSandboxId();
+			const replacement = createSandboxId();
+			const session = await sessions.createSession({
+				project_id: projectId,
+				notebook_id: notebookId,
+				user_id: ACTOR,
+				sandbox_id: oldId,
+			});
+			await sessions.markSandboxReclaimed(projectId, session.session_id, new Date().toISOString());
+			await sessions.replaceStartingSandbox(projectId, session.session_id, oldId, replacement);
+			const result = await sessions.markSandboxReclaimed(
+				projectId,
+				session.session_id,
+				new Date().toISOString(),
+				oldId,
+			);
+			expect(result.sandbox_id).toBe(replacement);
+			expect(result.sandbox_reclaimed_at).toBeUndefined();
+		});
+
+		it.each(['changed sandbox', 'running', 'failed'])(
+			'rejects replacement of %s',
+			async (reason) => {
+				const oldId = createSandboxId();
+				const session = await sessions.createSession({
+					project_id: projectId,
+					notebook_id: notebookId,
+					user_id: ACTOR,
+					sandbox_id: oldId,
+				});
+				if (reason === 'running')
+					await sessions.setRunning(projectId, session.session_id, 'https://sandbox.example');
+				if (reason === 'failed')
+					await sessions.markFailed(projectId, session.session_id, {
+						code: 'FAILED',
+						message: 'failed',
+					});
+				await expect(
+					sessions.replaceStartingSandbox(
+						projectId,
+						session.session_id,
+						reason === 'changed sandbox' ? createSandboxId() : oldId,
+						createSandboxId(),
+					),
+				).rejects.toThrow('starting session sandbox changed');
+				expect((await sessions.getSession(projectId, session.session_id)).sandbox_id).toBe(oldId);
+			},
+		);
 	});
 
 	describe('inspectSessions', () => {
@@ -1317,5 +1380,87 @@ describe('SessionService', () => {
 
 			restoreClock();
 		});
+	});
+});
+
+describe('SessionService terminal retention', () => {
+	let bucket: MemoryBucket;
+	let sessions: SessionService;
+	const notebookId = createNotebookId();
+	const projectId = createProjectId();
+
+	beforeEach(() => {
+		bucket = new MemoryBucket();
+		sessions = new SessionService(bucket);
+	});
+
+	afterEach(() => restoreClock());
+
+	it('keeps a terminal record whose sandbox has not been confirmed reclaimed', async () => {
+		const session = await sessions.createSession({
+			notebook_id: notebookId,
+			project_id: projectId,
+			user_id: ACTOR,
+			sandbox_id: createSandboxId(),
+		});
+		await sessions.setRunning(projectId, session.session_id, 'https://sandbox.example');
+
+		advanceTime(25 * 60 * 60 * 1000);
+		await sessions.expireStale();
+		expect((await sessions.getSession(projectId, session.session_id)).status).toBe('expired');
+
+		const reaped = await sessions.reapTerminated();
+
+		expect(reaped).toBe(0);
+		expect(await sessions.listSessions()).toHaveLength(1);
+	});
+});
+
+describe('session predicates', () => {
+	const now = Date.parse('2026-01-01T00:00:00.000Z');
+	const iso = (offsetMs: number) => new Date(now + offsetMs).toISOString();
+
+	it.each([
+		{ deadline: undefined, expired: false },
+		{ deadline: iso(1), expired: false },
+		{ deadline: iso(0), expired: true },
+		{ deadline: iso(-1), expired: true },
+	])('treats the authorization deadline as inclusive ($deadline)', ({ deadline, expired }) => {
+		expect(isPastAuthorizationDeadline({ authorization_expires_at: deadline }, now)).toBe(expired);
+	});
+
+	it.each([
+		{ status: 'running', sandbox_url: 'http://k', age: Millis.hours(1), reusable: true },
+		{ status: 'running', sandbox_url: undefined, age: 0, reusable: false },
+		{ status: 'starting', sandbox_url: undefined, age: Millis.minutes(5) - 1, reusable: true },
+		{ status: 'starting', sandbox_url: undefined, age: Millis.minutes(5), reusable: false },
+		{ status: 'terminating', sandbox_url: 'http://k', age: 0, reusable: false },
+	] as const)(
+		'reuses a $status session aged $age ms: $reusable',
+		({ status, sandbox_url, age, reusable }) => {
+			expect(isReusableSession({ status, sandbox_url, started_at: iso(-Number(age)) }, now)).toBe(
+				reusable,
+			);
+		},
+	);
+
+	it('runs a pull source from its subtree and everything else from the workdir', () => {
+		const git = {
+			schema_version: 1,
+			type: 'git',
+			provider: null,
+			repo: 'org/repo',
+			branch: 'main',
+			root_path: 'python',
+			sync_mode: 'pull',
+			current_version_id: null,
+			commit: null,
+			last_synced_at: null,
+		} as unknown as Source;
+		expect(sessionWorkspaceDir(git, '/workspace')).toBe('/workspace/python');
+		expect(sessionWorkspaceDir({ ...git, sync_mode: 'push' } as Source, '/workspace')).toBe(
+			'/workspace',
+		);
+		expect(sessionWorkspaceDir(makeLocalSource(), '/workspace')).toBe('/workspace');
 	});
 });

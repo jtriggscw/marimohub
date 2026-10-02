@@ -1,8 +1,10 @@
+import type { SandboxProvider, SandboxInstance } from '../../ports/sandbox';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createNotebookId, createProjectId, createSandboxId } from '../../ids';
 import { paths } from '../../paths';
-import type { SandboxInstance } from '../../ports/sandbox';
-import { listFilesFailure } from '../../ports/sandbox';
+import { MAX_ARTIFACT_BYTES } from '../../constants';
+
+import { execResult, listFilesFailure, readFileFailure } from '../../ports/sandbox';
 import type { Session } from '../../schema';
 import {
 	fakeComputeFrom,
@@ -15,7 +17,11 @@ import type { SandboxCalls } from '../../testing';
 import { CatalogService } from '../catalog/CatalogService';
 import { NotebookService } from '../content/NotebookService';
 import { SandboxProvisioner } from './SandboxProvisioner';
-import { kernelActiveConnections, SessionLifecycleService } from './sessionLifecycle';
+import {
+	kernelActiveConnections,
+	RECLAIM_PROVISION_GRACE_MS,
+	SessionLifecycleService,
+} from './sessionLifecycle';
 import type { SessionLifecycleConfig } from './sessionLifecycle';
 import { SessionService } from './SessionService';
 import { SessionRetirer } from './SessionRetirer';
@@ -389,11 +395,99 @@ describe('SessionLifecycleService', () => {
 			expect((await getStored(s)).sandbox_reclaimed_at).toBeDefined();
 		});
 
-		it('leaves a fresh expired record alone (provision may still be restoring files)', async () => {
+		// Legacy-shape record (no `surfaces`): nothing proves the restore finished.
+		it('leaves a fresh expired record without surface state alone (provision may still be restoring files)', async () => {
 			const s = await putSession({
 				status: 'expired',
 				started_at: iso(-6 * 60 * 1000),
 				last_heartbeat: iso(-6 * 60 * 1000),
+			});
+
+			const result = await makeService().sweep(now);
+
+			expect(result.reclaimed).toBe(0);
+			expect(sandboxCalls.destroy).toBe(0);
+			expect((await getStored(s)).sandbox_reclaimed_at).toBeUndefined();
+		});
+
+		it('reclaims a fresh expired record that already finished provisioning', async () => {
+			const started = iso(-6 * 60 * 1000);
+			const s = await putSession({
+				status: 'expired',
+				started_at: started,
+				last_heartbeat: started,
+				surfaces: { marimo: { status: 'ready', port: 2718, started_at: started } },
+			});
+
+			const result = await makeService().sweep(now);
+
+			expect(result.reclaimed).toBe(1);
+			expect(notebooks.commitSession).toHaveBeenCalledTimes(1);
+			expect(sandboxCalls.destroy).toBe(1);
+			expect((await getStored(s)).sandbox_reclaimed_at).toBeDefined();
+		});
+
+		it('reclaims a provisioned idle record WITHOUT saving when a newer live session owns the notebook', async () => {
+			const started = iso(-6 * 60 * 1000);
+			const s = await putSession({
+				status: 'expired',
+				started_at: started,
+				last_heartbeat: started,
+				surfaces: { marimo: { status: 'ready', port: 2718, started_at: started } },
+			});
+			await putSession({
+				status: 'running',
+				sandbox_id: createSandboxId(),
+				last_snapshot_at: iso(0),
+			});
+
+			const result = await makeService().sweep(now);
+
+			expect(result.reclaimed).toBe(1);
+			expect(notebooks.commitSession).not.toHaveBeenCalled();
+			expect((await getStored(s)).sandbox_reclaimed_at).toBeDefined();
+		});
+
+		it('keeps the provision grace for a provisioned record when connection-aware reaping is off', async () => {
+			const started = iso(-6 * 60 * 1000);
+			const s = await putSession({
+				status: 'expired',
+				started_at: started,
+				last_heartbeat: started,
+				surfaces: { marimo: { status: 'ready', port: 2718, started_at: started } },
+			});
+
+			const result = await makeService({ connectionAware: false }).sweep(now);
+
+			expect(probe).not.toHaveBeenCalled();
+			expect(result.reclaimed).toBe(0);
+			expect(sandboxCalls.destroy).toBe(0);
+			expect((await getStored(s)).sandbox_reclaimed_at).toBeUndefined();
+		});
+
+		it.each([
+			{ age: RECLAIM_PROVISION_GRACE_MS - 1, reclaimed: 0 },
+			{ age: RECLAIM_PROVISION_GRACE_MS, reclaimed: 1 },
+		])('ends the provision grace exactly $age ms after start', async ({ age, reclaimed }) => {
+			await putSession({
+				status: 'expired',
+				started_at: iso(-age),
+				last_heartbeat: iso(-age),
+			});
+
+			const result = await makeService().sweep(now);
+
+			expect(result.reclaimed).toBe(reclaimed);
+		});
+
+		it('keeps the provision grace for a provisioned record when the editor probe is unknown', async () => {
+			probe.mockResolvedValue(null);
+			const started = iso(-6 * 60 * 1000);
+			const s = await putSession({
+				status: 'expired',
+				started_at: started,
+				last_heartbeat: started,
+				surfaces: { marimo: { status: 'ready', port: 2718, started_at: started } },
 			});
 
 			const result = await makeService().sweep(now);
@@ -470,6 +564,42 @@ describe('SessionLifecycleService', () => {
 	});
 
 	describe('periodic snapshots', () => {
+		it.each(['adapter error', 'oversized payload', 'malformed base64'])(
+			'retries a notebook read after %s on the next sweep without advancing the cadence',
+			async (failure) => {
+				const { instance, calls } = makeFakeSandbox({
+					files: { '/workspace/notebook.py': 'edited' },
+				});
+				const read = vi.spyOn(instance, 'readFileBounded');
+				if (failure === 'adapter error') {
+					read.mockResolvedValue(readFileFailure('READ_FAILED'));
+				} else if (failure === 'oversized payload') {
+					read.mockResolvedValue({ success: true, content: 'x'.repeat(MAX_ARTIFACT_BYTES + 1) });
+				} else {
+					read.mockResolvedValue({ success: true, content: '!!!!', encoding: 'base64' });
+				}
+				compute = fakeComputeFrom(instance);
+				vi.spyOn(console, 'error').mockImplementation(() => {});
+				const s = await putSession({ last_snapshot_at: iso(-SNAPSHOT_INTERVAL_MS - 1000) });
+				const service = makeService();
+
+				expect((await service.sweep(now)).snapshotted).toBe(0);
+				expect((await getStored(s)).last_snapshot_at).toBe(iso(-SNAPSHOT_INTERVAL_MS - 1000));
+				expect(notebooks.commitSession).not.toHaveBeenCalled();
+
+				read.mockRestore();
+				expect((await service.sweep(now + 1000)).snapshotted).toBe(1);
+				expect((await getStored(s)).last_snapshot_at).toBe(iso(1000));
+				expect(notebooks.commitSession).toHaveBeenCalledWith(
+					projectId,
+					notebookId,
+					expect.objectContaining({ code: 'edited' }),
+					s.user_id,
+				);
+				expect(calls.destroy).toBe(0);
+			},
+		);
+
 		it('saves a due session source-only and advances last_snapshot_at', async () => {
 			const render = vi.spyOn(thumbnailCapture, 'captureThumbnail');
 			const captureSpy = vi.spyOn(SandboxProvisioner.prototype, 'captureSession');
@@ -604,6 +734,58 @@ describe('SessionLifecycleService', () => {
 			expect(notebooks.commitSession).not.toHaveBeenCalled();
 		});
 	});
+
+	it.each(['surface stop', 'sandbox handle'])(
+		'continues sweeping after a %s failure',
+		async (failure) => {
+			const badId = createSandboxId();
+			const goodId = createSandboxId();
+			const bad = makeFakeSandbox({
+				execResult: execResult(false, '', 'sandbox unavailable', 'BACKEND_ERROR'),
+			}).instance;
+			const good = makeFakeSandbox();
+			const compute: SandboxProvider = {
+				create: (id) => {
+					if (id === badId && failure === 'sandbox handle') throw new Error('Sandbox unavailable');
+					return id === badId ? bad : good.instance;
+				},
+				proxy: async () => null,
+			};
+
+			await putSession({
+				status: 'expired',
+				last_heartbeat: iso(-10 * 60 * 1000),
+				sandbox_id: badId,
+				surfaces: {
+					vscode: {
+						status: 'ready',
+						port: 8443,
+						url: 'https://vscode.example',
+						started_at: iso(0),
+					},
+				},
+			});
+			const healthy = await putSession({
+				status: 'expired',
+				last_heartbeat: iso(-10 * 60 * 1000),
+				sandbox_id: goodId,
+			});
+
+			const svc = new SessionLifecycleService(sessions, notebooks, compute, bucket, {
+				...CFG,
+				snapshotIntervalMs: 0,
+				connectionAware: false,
+			});
+
+			await expect(svc.sweep(now)).resolves.toMatchObject({
+				reclaimed: failure === 'sandbox handle' ? 1 : 2,
+			});
+			expect(good.calls.destroy).toBe(1);
+			expect(
+				(await sessions.getSession(projectId, healthy.session_id)).sandbox_reclaimed_at,
+			).toBeDefined();
+		},
+	);
 });
 
 describe('kernelActiveConnections', () => {

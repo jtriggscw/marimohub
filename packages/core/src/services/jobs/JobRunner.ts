@@ -14,16 +14,20 @@ import type {
 	SandboxProvider,
 } from '../../ports/sandbox';
 import { paths } from '../../paths';
-import type { JobDefinition, JobRun, Project, RunError } from '../../schema';
+import type { VersionPaths } from '../../paths';
+import { readStored, VersionSchema } from '../../schema';
+import type { GitSourceRevision, JobDefinition, JobRun, Project, RunError } from '../../schema';
 import { utf8Tail } from '../../text';
 import { Stopwatch } from '../../timing';
 import { workspaceSourcePolicy } from '../../integrations/remoteWorkspace';
+import { pullSourceGitOptions } from '../runtime/workspaceLayout';
 import type { NotebookDetail, NotebookService } from '../content/NotebookService';
 import type { ProjectService } from '../content/ProjectService';
 import { resolveBaseImage } from '../runtime/resolveBaseImage';
 import { resolveComputeProfile, toComputeResourceRecord } from '../runtime/resolveComputeProfile';
 import type { ResolvedComputeProfile } from '../runtime/resolveComputeProfile';
 import { resolveLaunchStrategyForSession } from '../runtime/launchStrategy';
+import { resolveNotebookLaunchSource } from '../runtime/notebookLaunchSource';
 import { SandboxProvisioner } from '../runtime/SandboxProvisioner';
 import type { BucketConfig, PreparedSandbox, SessionEnv } from '../runtime/SandboxProvisioner';
 import { listFileSizes, readCappedFile } from '../runtime/sandboxFiles';
@@ -457,6 +461,14 @@ export class JobRunner {
 		};
 	}
 
+	private async pinnedSourceRevision(
+		version: VersionPaths,
+	): Promise<GitSourceRevision | undefined> {
+		const object = await this.deps.bucket.get(version.meta);
+		if (!object) return undefined;
+		return (await readStored(VersionSchema, object, version.meta)).git_source;
+	}
+
 	private async provisionOptions(
 		context: JobRunContext,
 		sandboxId: ReturnType<typeof createSandboxId>,
@@ -472,17 +484,25 @@ export class JobRunner {
 		}
 		const nb = paths.project(run.project_id).notebook(run.notebook_id);
 		const syncedPaths = syncedVersionId ? nb.version(syncedVersionId) : undefined;
+		// A queued run pins the version it was enqueued against, which may predate
+		// a settings edit that moved the subtree or entry notebook. The pinned
+		// revision, not the live source, describes the workspace being restored.
+		const pinned =
+			syncedPaths && run.source_version_id
+				? await this.pinnedSourceRevision(syncedPaths)
+				: undefined;
+		const entryNotebook = pinned?.entry_notebook ?? policy.entryNotebook;
 		const localVersion =
 			policy.persistSessionEdits && run.source_version_id
 				? nb.version(run.source_version_id)
 				: undefined;
-		const gitPrefix =
-			notebook.source.type === 'git' && notebook.source.sync_mode === 'pull'
-				? syncedPaths?.gitPrefix
-				: undefined;
+		const launchSource = resolveNotebookLaunchSource({
+			entryNotebook,
+			workspacePrefix: syncedPaths?.workspacePrefix ?? nb.workspacePrefix,
+			localVersion,
+		});
 		const launchStrategy = await resolveLaunchStrategyForSession({
-			entryNotebook: policy.entryNotebook,
-			workspacePrefix: syncedPaths?.workspacePrefix,
+			entryNotebookKey: launchSource.entryNotebookKey,
 			bucket,
 		});
 		// A resolver failure surfaces as the sanitized provision error, never as the
@@ -508,20 +528,15 @@ export class JobRunner {
 			image: context.image,
 			resources: context.computeProfile.resources,
 			sessionEnv,
-			entryNotebook: policy.entryNotebook,
+			entryNotebook,
 			launchStrategy: launchStrategy.strategy,
 			launchMode: 'job' as const,
 			// Never a mount: an unattended sandbox must not write through to the
 			// workspace mirror, and outputs belong under the run prefix only.
 			workspaceLoadMode: 'copy-only' as const,
 			workspacePrefix: syncedPaths?.workspacePrefix,
-			workspaceOverlay: localVersion
-				? [
-						{ path: 'notebook.py', key: localVersion.code },
-						{ path: 'pyproject.toml', key: localVersion.deps },
-					]
-				: undefined,
-			gitPrefix,
+			workspaceOverlay: launchSource.workspaceOverlay,
+			...pullSourceGitOptions(notebook.source, syncedPaths, pinned?.root_path),
 			workspaceArchive: syncedPaths?.workspaceArchive,
 		};
 	}

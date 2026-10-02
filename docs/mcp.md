@@ -19,6 +19,10 @@ MARIMOHUB_APP_BASE_URL=https://hub.example.com
 ```
 
 `MARIMOHUB_APP_BASE_URL` must include the public origin and any path prefix.
+`MARIMOHUB_APP_BASE_URL` must use HTTPS, because the OAuth issuer derives from
+it. The server refuses to start with a plain `http://` URL unless the host is
+`localhost` or `127.0.0.1`.
+
 The MCP server URL adds `/mcp` to this value:
 
 ```text
@@ -113,8 +117,38 @@ if __name__ == "__main__":
 ```
 
 The Hub stores source verbatim, without syntax validation or script conversion.
-Local notebook dependencies come from the workspace `pyproject.toml`.
-PEP 723 headers remain in the source but do not install dependencies for local notebooks.
+
+### Notebook dependencies
+
+Prefix the `code` supplied to `create_notebook` or `update_notebook` with a
+[PEP 723](https://peps.python.org/pep-0723/) header:
+
+```python
+# /// script
+# dependencies = ["cowsay==6.1"]
+# ///
+```
+
+For local and synced notebooks, dependencies install before edit sessions, app
+sessions, and jobs start. Creation without `launch: true` only saves the source.
+Imports alone do not declare dependencies.
+
+Workspace `pyproject.toml` dependencies install first, then inline dependencies.
+Keep requirements compatible: inline pins can replace project versions.
+The sandbox image supplies marimo. See [the dependency contract](sandbox-image.md#inline-dependencies)
+for source-version behavior, Python requirements, and custom indexes.
+
+To change dependencies:
+
+1. Stop the persistent edit session.
+2. Read its saved source with `get_notebook`.
+3. Call `update_notebook` with the complete updated source.
+4. Start a new session.
+
+Running kernels do not reinstall dependencies after header changes.
+Invalid metadata or unresolved dependencies fail startup with `PYTHON_ENV_SETUP_FAILED`.
+If the MCP client times out during installation, retry `start_session` to inspect startup.
+[Preinstall large packages](sandbox-image.md) to avoid repeated cold installs.
 
 ### Work in a live session
 
@@ -141,10 +175,13 @@ Session `status` describes the sandbox lifecycle. `execution.status` reports ker
 | `app_mode`                                       | Call `start_session` with `mode: "edit"` to execute code.                                                   |
 | `terminating`, `terminated`, `failed`, `expired` | Check the session status and error before retrying `start_session`.                                         |
 
-`wait_seconds` bounds polling and initialization after sandbox startup. Zero only
-inspects existing kernels, including browser sessions, without creating a kernel or running cells.
-Custom images need compatible marimo and WebSocket support. MCP does not install
-or upgrade packages during requests.
+`wait_seconds` accepts integers from `0` to `120` (default `60`). It bounds kernel
+initialization retries after sandbox startup while readiness remains `initializing`.
+If the wait expires, call `start_session` again. Zero inspects existing kernels,
+including browser sessions, without creating a kernel or running cells.
+
+Custom images need compatible marimo and WebSocket support.
+`execute_code` does not install dependencies automatically.
 
 A browser can attach later without losing notebook variables or cell edits.
 If the kernel disappears, `execute_code` directs you to `start_session`.

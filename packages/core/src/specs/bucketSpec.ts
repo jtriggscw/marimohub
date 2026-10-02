@@ -1,3 +1,4 @@
+import { WarmPoolRecordSchema } from '../services/runtime/WarmPoolStore';
 import { AppPoolSchema } from '../services/runtime/AppPoolRouter';
 import { ThumbnailRecordSchema } from '../services/content/ThumbnailService';
 import { DeepLinkRecordSchema } from '../deepLinks';
@@ -313,10 +314,19 @@ const OBJECTS: BucketObject[] = [
 		tag: 'session',
 	},
 	{
+		name: 'WarmPool',
+		key: paths.warmPool('{backend}'),
+		schema: WarmPoolRecordSchema,
+		summary: 'Deployment-wide warm sandbox reservations and session handoffs.',
+		mutability: 'cas',
+		owner: 'WarmPoolStore',
+		tag: 'session',
+	},
+	{
 		name: 'AppPool',
 		key: paths.appPool(PID, NID),
 		schema: AppPoolSchema,
-		summary: 'App sandbox reservations, account assignments, and visit leases.',
+		summary: 'App sandbox reservations, visit assignments, and visit leases.',
 		mutability: 'cas',
 		owner: 'AppPoolStore',
 		tag: 'session',

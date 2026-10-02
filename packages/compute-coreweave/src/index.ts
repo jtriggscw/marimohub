@@ -33,8 +33,8 @@
  *
  * INTEGRATION SURFACE (validate against the live CoreWeave API before production,
  * same caveat the Modal adapter carries): the kernel `services` declaration
- * (public visibility, no product endpoint — v1 Create rejects a set endpoint
- * as unimplemented); the public kernel URL is CONSTRUCTED from a hostname template (inspect's
+ * (public visibility; a product endpoint only with `kernelEndpoint`, which the
+ * managed serverless pool requires); the public kernel URL is CONSTRUCTED from a hostname template (inspect's
  * `serviceUrls` is assigned-not-edge-ready per the SDK docs); and the
  * `waitForPort` probe assumes `python3` is on the image PATH.
  *
@@ -47,10 +47,16 @@
  * the caller's cluster, so CKS deployments must keep `runnerId` set (the
  * config layer defaults it).
  */
-import { CWSandboxConfigurationError, CWSandboxNotFoundError } from '@coreweave/cwsandbox';
+import {
+	CWSandboxConfigurationError,
+	CWSandboxNotFoundError,
+	CWSandboxUnavailableError,
+} from '@coreweave/cwsandbox';
 import type {
 	CommandProcess,
 	CommandProcessStatus,
+	DataPlaneMode,
+	Endpoint,
 	FileWrites,
 	ListSandboxesResult,
 	ProcessResult,
@@ -70,6 +76,10 @@ import {
 } from '@coreweave/cwsandbox/node';
 import type { KernelIngressPublisher } from './kernelIngress';
 import {
+	readBoundedFile,
+	collectBoundedOutput,
+	LAUNCH_MARKER_GRACE_MS,
+	launchTimeoutResult,
 	buildFindFilesCommand,
 	buildGitCloneCommand,
 	buildLaunchCommand,
@@ -85,14 +95,17 @@ import {
 	removeUndefined,
 	shellQuote,
 	transportFailureResult,
-	withEnvPrefix,
+	ShellEnvironment,
+	privateEnvironmentWriteCommand,
 } from '@marimo-hub/compute-commons';
 import type { LaunchProtocolOutcome } from '@marimo-hub/compute-commons';
 import type { SandboxId } from '@marimo-hub/core/ids';
+import { logOperationalError } from '@marimo-hub/core/operational-log';
 import type { Seconds } from '@marimo-hub/core/duration';
 import type { Timings } from '@marimo-hub/core/timing';
 import { logEvent } from '@marimo-hub/core/logs';
 import type {
+	BoundedReadOptions,
 	ComputeResources,
 	SandboxUserHome,
 	CreateSandboxOptions,
@@ -142,6 +155,33 @@ const PORT_WAIT_FIRST_CHUNK_MS = 2_000;
 const SLOW_BOOT_MS = 10_000;
 const SLOW_BOOT_HINT =
 	'boot > 10 s usually means the node cold-pulled the sandbox image; pre-pull the configured image tags on the sandbox node pool';
+
+const PROCESS_CANCEL_TIMEOUT_MS = 1_000;
+/** Backoff before each retry of a file write the gateway answered with UNAVAILABLE. */
+const WRITE_RETRY_DELAYS_MS = [250, 1_000, 3_000];
+
+async function cancelLaunchProcess(proc: CommandProcess): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		await Promise.race([
+			proc.cancel(),
+			new Promise<never>((_resolve, reject) => {
+				timer = setTimeout(
+					() => reject(new DOMException('Process cancellation timed out', 'TimeoutError')),
+					PROCESS_CANCEL_TIMEOUT_MS,
+				);
+			}),
+		]);
+	} catch (error) {
+		logOperationalError(
+			'sandbox_process_cancel_failed',
+			{ operation: 'coreweave.cancel_launch_process' },
+			error,
+		);
+	} finally {
+		if (timer !== undefined) clearTimeout(timer);
+	}
+}
 
 /**
  * Process states a kernel never comes back from. `failed` is a stream fault (a
@@ -200,6 +240,8 @@ export interface CoreWeaveConfig {
 	apiKey?: string;
 	/** API base URL (`CWSANDBOX_BASE_URL`); defaults to the SDK's production endpoint. */
 	baseUrl?: string;
+	/** Defaults to auto, which allows Gateway fallback when a runner is unreachable. */
+	dataPlaneMode?: DataPlaneMode;
 	/** Container image with marimo + uv + python. Defaults to the SDK's `python:3.11`. */
 	image?: string;
 	/** Port marimo binds inside the sandbox; declared public at create. Default 2718. */
@@ -220,6 +262,12 @@ export interface CoreWeaveConfig {
 	 * `kernelIngress` then publishes. Default `public`.
 	 */
 	kernelVisibility?: 'public' | 'custom';
+	/**
+	 * Product endpoint requested on each service. The managed serverless pool
+	 * rejects a bare `public` service and only assigns ingress through an HTTPS
+	 * endpoint, whose URL then arrives on `serviceUrls`.
+	 */
+	kernelEndpoint?: Endpoint;
 	/** Publishes each kernel's hostname (an Ingress in the sandbox namespace). */
 	kernelIngress?: KernelIngressPublisher;
 	/** Secondary-surface ports reserved when the sandbox is created. */
@@ -325,7 +373,12 @@ export interface CoreWeaveSandbox {
 			command: readonly string[],
 			options?: { cwd?: string; timeoutMs?: number },
 		): Promise<ProcessResult>;
-		start(command: readonly string[], options?: { cwd?: string }): Promise<CommandProcess>;
+		start(
+			command: readonly string[],
+			options?: { cwd?: string; timeoutMs?: number; bufferedMaxKiB?: number; stdin?: boolean },
+		): Promise<
+			CommandProcess & { stdin?: { write(data: string): Promise<void>; close(): Promise<void> } }
+		>;
 	};
 	readonly files: {
 		readText(path: string): Promise<string>;
@@ -347,8 +400,6 @@ class CoreWeaveSandboxInstance implements SandboxInstance {
 	private readonly idTag: string;
 	private readonly kernelPort: number;
 	private sandbox?: CoreWeaveSandbox;
-	private env: Record<string, string> = {};
-	private envDefaults: Record<string, string> = {};
 	private lastEnsureTimings?: Timings;
 	/** Shell snippet to splice onto the next command; see `takeBootstrap`. */
 	private pendingBootstrap?: string;
@@ -362,6 +413,7 @@ class CoreWeaveSandboxInstance implements SandboxInstance {
 		/** Reconnect-by-tag before creating. False on a fresh provision (skips a wasted list). */
 		private readonly reuse = true,
 		private readonly userHome?: SandboxUserHome,
+		private readonly existingOnly = false,
 	) {
 		this.idTag = ID_TAG_PREFIX + id;
 		this.kernelPort = config.kernelPort ?? DEFAULT_KERNEL_PORT;
@@ -375,12 +427,16 @@ class CoreWeaveSandboxInstance implements SandboxInstance {
 	 */
 	private async ensure(): Promise<CoreWeaveSandbox> {
 		if (this.sandbox) return this.sandbox;
+		this.environment.invalidate();
 		// find = the reconnect lookup, create = the API accepting the start request,
 		// boot = reaching `running` (cold start + image pull). create and boot are
 		// split because only that says whether the dominant startup cost is a real
 		// container start or time spent waiting on a poll.
 		const t0 = Date.now();
 		const existing = this.reuse ? await this.findByOurId() : undefined;
+		if (this.existingOnly && existing?.status !== 'running') {
+			throw new Error(`CoreWeave sandbox ${this.id} is no longer available`);
+		}
 		const t1 = Date.now();
 		// Create-then-wait (rather than `waitUntilRunning: true`) keeps the create
 		// and boot phases separately measurable for the wide event below.
@@ -451,21 +507,21 @@ class CoreWeaveSandboxInstance implements SandboxInstance {
 	}
 
 	/**
-	 * The kernel port is declared as a service ("the platform chooses the
-	 * mechanism"). No `endpoint`: the v1 proto documents Create as rejecting a
-	 * set endpoint as unimplemented. Egress follows the runner policy default —
-	 * there is no per-create egress knob.
+	 * Services request a product endpoint only when `kernelEndpoint` is set;
+	 * otherwise exposure depends on the runner's network configuration.
 	 */
 	private kernelServices(): readonly Service[] {
 		const visibility = this.config.kernelVisibility ?? 'public';
+		const endpoint = this.config.kernelEndpoint ? { endpoint: this.config.kernelEndpoint } : {};
 		return [
-			{ name: 'kernel', port: this.kernelPort, protocol: 'tcp', visibility },
+			{ name: 'kernel', port: this.kernelPort, protocol: 'tcp', visibility, ...endpoint },
 			...(this.config.extraPorts ?? []).map((port) => ({
 				// Names reach pod container-port names; keep them unique + DNS-safe.
 				name: `port-${port}`,
 				port,
 				protocol: 'tcp' as const,
 				visibility,
+				...endpoint,
 			})),
 		];
 	}
@@ -587,15 +643,50 @@ class CoreWeaveSandboxInstance implements SandboxInstance {
 		return `${bootstrap} ${cmd}`;
 	}
 
-	/** Prefix accumulated env vars onto a shell command (the SDK has no per-command env). */
-	private withEnv(cmd: string): string {
-		return withEnvPrefix(this.takeBootstrap(cmd), this.env, this.envDefaults);
-	}
+	private readonly environment = new ShellEnvironment(async (path, content) => {
+		const sandbox = await this.ensure();
+		const process = await sandbox.commands.start(
+			['sh', '-c', privateEnvironmentWriteCommand(path)],
+			{ stdin: true, timeoutMs: 10_000, bufferedMaxKiB: 64 },
+		);
+		try {
+			if (!process.stdin) throw new Error('Sandbox command does not support stdin');
+			await process.stdin.write(content);
+			await process.stdin.close();
+			const result = await process.wait();
+			if (result.exitCode !== 0) throw new Error('Could not prepare sandbox environment');
+		} finally {
+			void cancelLaunchProcess(process);
+		}
+	});
 
+	private async withEnv(cmd: string, extra: Record<string, string> = {}): Promise<string> {
+		const prefix = await this.environment.command('', extra);
+		return `${prefix}${this.takeBootstrap(cmd)}`;
+	}
 	async exec(cmd: string, options?: ExecOptions): Promise<ExecResult> {
 		const sandbox = await this.ensure();
 		this.execCount++;
-		const res = await sandbox.commands.run(['sh', '-lc', this.withEnv(cmd)], {
+		if (options?.maxOutputBytes !== undefined) {
+			const proc = await sandbox.commands.start(['sh', '-lc', await this.withEnv(cmd)], {
+				timeoutMs: options.timeout,
+				bufferedMaxKiB: 0,
+			});
+			try {
+				const { stdout, stderr, result } = await collectBoundedOutput(
+					{
+						stdout: iterableToStream(proc.stdout),
+						stderr: iterableToStream(proc.stderr),
+						wait: (signal) => proc.wait({ signal }),
+					},
+					{ maxOutputBytes: options.maxOutputBytes, timeout: options.timeout },
+				);
+				return execResult(result.exitCode === 0, stdout, stderr);
+			} finally {
+				void cancelLaunchProcess(proc);
+			}
+		}
+		const res = await sandbox.commands.run(['sh', '-lc', await this.withEnv(cmd)], {
 			timeoutMs: options?.timeout,
 		});
 		return execResult(res.exitCode === 0, res.stdout, res.stderr);
@@ -603,8 +694,12 @@ class CoreWeaveSandboxInstance implements SandboxInstance {
 
 	async execStream(cmd: string, _options?: ExecStreamOptions): Promise<ReadableStream> {
 		const sandbox = await this.ensure();
-		const proc = await sandbox.commands.start(['sh', '-lc', this.withEnv(cmd)]);
+		const proc = await sandbox.commands.start(['sh', '-lc', await this.withEnv(cmd)]);
 		return iterableToStream(proc.stdout);
+	}
+
+	async readFileBounded(path: string, options: BoundedReadOptions): Promise<ReadFileResult> {
+		return readBoundedFile(path, options, (command, limits) => this.exec(command, limits));
 	}
 
 	async readFile(path: string): Promise<ReadFileResult> {
@@ -626,7 +721,25 @@ class CoreWeaveSandboxInstance implements SandboxInstance {
 			await this.exec('true');
 		}
 		// FileContent is `string | Uint8Array`, so bytes pass straight through.
-		await sandbox.files.write(files.map((f) => ({ path: f.path, content: f.content })));
+		const batch = files.map((f) => ({ path: f.path, content: f.content }));
+		// The W&B gateway intermittently answers a write with 503 shortly after
+		// boot. A whole-file write is idempotent, so retrying it is safe.
+		for (let attempt = 0; ; attempt++) {
+			try {
+				await sandbox.files.write(batch);
+				return;
+			} catch (err) {
+				if (
+					!(err instanceof CWSandboxUnavailableError) ||
+					attempt >= WRITE_RETRY_DELAYS_MS.length
+				) {
+					throw err;
+				}
+				await new Promise<void>((resolve) => {
+					setTimeout(resolve, WRITE_RETRY_DELAYS_MS[attempt]);
+				});
+			}
+		}
 	}
 
 	private writesUnderUserHome(files: readonly SandboxFileWrite[]): boolean {
@@ -659,13 +772,7 @@ class CoreWeaveSandboxInstance implements SandboxInstance {
 	}
 
 	async setEnvVars(vars: Record<string, string>, options?: SetEnvVarsOptions): Promise<void> {
-		// Stored and applied as a shell prefix by withEnv(); the SDK sets env only at
-		// create time, and the provisioner never calls this on the hot path.
-		if (options?.onlyIfUnset) {
-			this.envDefaults = { ...this.envDefaults, ...vars };
-		} else {
-			this.env = { ...this.env, ...vars };
-		}
+		this.environment.setEnvVars(vars, options);
 	}
 
 	async mountBucket(_options: MountBucketOptions): Promise<void> {
@@ -691,7 +798,7 @@ class CoreWeaveSandboxInstance implements SandboxInstance {
 		let proc: CommandProcess;
 		try {
 			const sandbox = await this.ensure();
-			proc = await sandbox.commands.start(['sh', '-lc', this.withEnv(built.command)], {
+			proc = await sandbox.commands.start(['sh', '-lc', await this.withEnv(built.command)], {
 				cwd: options.cwd,
 			});
 		} catch (error) {
@@ -753,12 +860,38 @@ class CoreWeaveSandboxInstance implements SandboxInstance {
 			}
 		});
 
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timedOutcome =
+			options.startupTimeout === 0
+				? outcome
+				: Promise.race([
+						outcome,
+						new Promise<never>((_resolve, reject) => {
+							timer = setTimeout(
+								() => reject(new DOMException('Launch timed out', 'TimeoutError')),
+								Math.max(0, options.startupTimeout - start) + LAUNCH_MARKER_GRACE_MS,
+							);
+						}),
+					]);
+
 		let terminal: LaunchProtocolOutcome;
 		try {
-			terminal = await outcome;
+			terminal = await timedOutcome;
 		} catch (error) {
-			await proc.cancel().catch(() => {});
+			settled = true;
+			const waitport = Math.max(0, Date.now() - waitStartedAt);
+			await cancelLaunchProcess(proc);
 			const parsed = logs();
+			if (error instanceof DOMException && error.name === 'TimeoutError') {
+				return launchTimeoutResult({
+					setup: Boolean(options.setup),
+					setupCompleted: tracker.setupCompleted,
+					startupTimeout: options.startupTimeout,
+					output: parsed,
+					start,
+					waitport,
+				});
+			}
 			return {
 				success: false,
 				reason: 'transport_failure',
@@ -767,9 +900,11 @@ class CoreWeaveSandboxInstance implements SandboxInstance {
 				timings: {
 					setup: 0,
 					start,
-					waitport: Math.max(0, Date.now() - waitStartedAt),
+					waitport,
 				},
 			};
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
 		}
 		if (terminal.kind !== 'ready') {
 			return launchOutcomeResult(terminal.kind, terminal, logs(), start);
@@ -801,9 +936,12 @@ class CoreWeaveSandboxInstance implements SandboxInstance {
 
 	async startProcess(cmd: string, options?: StartProcessOptions): Promise<SandboxProcess> {
 		const sandbox = await this.ensure();
-		const proc = await sandbox.commands.start(['sh', '-lc', this.withEnv(cmd)], {
-			cwd: options?.cwd,
-		});
+		const proc = await sandbox.commands.start(
+			['sh', '-lc', await this.withEnv(cmd, removeUndefined(options?.env ?? {}))],
+			{
+				cwd: options?.cwd,
+			},
+		);
 
 		// marimo runs as a streamed command (not the sandbox main process), so drain
 		// its output in the background to back getLogs() and to surface errors if the
@@ -871,19 +1009,26 @@ class CoreWeaveSandboxInstance implements SandboxInstance {
 
 	async exposePort(port: number, options: ExposePortOptions): Promise<ExposePortResult> {
 		const sandbox = await this.ensure();
-		if (this.config.resolveExposedUrl) {
-			return { url: await this.config.resolveExposedUrl(sandbox, port) };
-		}
 		// Without a resolver, construct the public URL from a template (the kernel
 		// port was declared `public` at create). Integration surface — the exact
 		// ingress hostname scheme is CoreWeave backend/profile specific.
 		const template = this.config.hostnameTemplate ?? 'https://{sandboxId}-{port}.{host}';
-		const url = template
-			.replaceAll('{sandboxId}', sandbox.sandboxId)
-			.replaceAll('{port}', String(port))
-			.replaceAll('{host}', options.hostname)
-			.replaceAll('{token}', options.token ?? '');
-		if (this.config.kernelIngress) {
+		const url = this.config.resolveExposedUrl
+			? await this.config.resolveExposedUrl(sandbox, port)
+			: template
+					.replaceAll('{sandboxId}', sandbox.sandboxId)
+					.replaceAll('{port}', String(port))
+					.replaceAll('{host}', options.hostname)
+					.replaceAll('{token}', options.token ?? '');
+		// Reconnected sandboxes retain their create-time service configuration.
+		// Reject incompatible URLs here so teardown can still recover notebook files.
+		if (this.config.kernelEndpoint?.kind === 'https' && new URL(url).protocol !== 'https:') {
+			throw new Error(
+				`CoreWeave sandbox ${sandbox.sandboxId} has an incompatible service URL for port ${port}: ` +
+					'expected HTTPS; save its files and recreate the sandbox',
+			);
+		}
+		if (!this.config.resolveExposedUrl && this.config.kernelIngress) {
 			await this.config.kernelIngress.publish({
 				sandboxId: sandbox.sandboxId,
 				host: new URL(url).hostname,
@@ -966,13 +1111,29 @@ export class CoreWeaveCompute implements SandboxProvider {
 			// controlled cast at the construction boundary avoids overload-variance
 			// friction between the SDK's broad signatures and our narrow seam.
 			// oxlint-disable-next-line anti-slop/no-chained-type-assertions
-			const sdk = createSandboxClient({ apiKey, baseUrl }) as unknown as CoreWeaveClient;
+			const sdk = createSandboxClient({
+				apiKey,
+				baseUrl,
+				dataPlaneMode: this.config.dataPlaneMode ?? 'auto',
+			}) as unknown as CoreWeaveClient;
 			this.client = instrumentCoreWeaveClient(sdk, baseUrl);
 		}
 		return this.client;
 	}
 
 	create(id: SandboxId, options?: CreateSandboxOptions): SandboxInstance {
+		return this.instance(id, options);
+	}
+
+	connectExisting(id: SandboxId, options?: CreateSandboxOptions): SandboxInstance {
+		return this.instance(id, { ...options, reuse: true }, true);
+	}
+
+	private instance(
+		id: SandboxId,
+		options?: CreateSandboxOptions,
+		existingOnly = false,
+	): SandboxInstance {
 		if (options?.userHome && !this.config.userHomeTemplateId) {
 			// Failing here beats provisioning an editor without its mount: the
 			// bootstrap would abort in-sandbox, after the boot wait.
@@ -996,6 +1157,7 @@ export class CoreWeaveCompute implements SandboxProvider {
 			this.getClient(),
 			options?.reuse ?? true,
 			options?.userHome,
+			existingOnly,
 		);
 	}
 

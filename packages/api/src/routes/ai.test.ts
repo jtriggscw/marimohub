@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MAX_REQUEST_BYTES, UnavailableError, mintAiSessionToken } from '@marimo-hub/core';
-import { MemoryBucket } from '@marimo-hub/core/testing';
-import type { ApiDeps } from '../context';
+import { MemoryBucket } from '@marimo-hub/core/testing/memory-bucket';
+import type { AiProxyConfig, ApiDeps } from '../context';
 import { createApi } from '../createApi';
 import { makeTestDeps } from '../testing';
 
@@ -56,6 +56,12 @@ async function expectOpenAiError(res: Response, message: string, type: string) {
 }
 
 describe('POST /api/ai/v1/chat/completions', () => {
+	it('returns an OpenAI-shaped error for an unknown authenticated proxy route', async () => {
+		const res = await post(await token(), {}, {}, '/api/ai/v1/unknown');
+		expect(res.status).toBe(404);
+		await expectOpenAiError(res, 'Route not found', 'invalid_request_error');
+	});
+
 	it('rejects a missing token', async () => {
 		const res = await post(null, { model: 'x', messages: [] });
 		expect(res.status).toBe(401);
@@ -109,6 +115,14 @@ describe('POST /api/ai/v1/chat/completions', () => {
 			`Request body exceeds the ${MAX_REQUEST_BYTES}-byte limit`,
 			'invalid_request_error',
 		);
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it.each([null, [], 'text', 1, true])('rejects a non-object JSON body: %j', async (body) => {
+		const fetchMock = vi.spyOn(globalThis, 'fetch');
+		const res = await post(await token(), body);
+		expect(res.status).toBe(400);
+		await expectOpenAiError(res, 'Expected a JSON object', 'invalid_request_error');
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
@@ -317,6 +331,140 @@ describe('POST /api/ai/v1/chat/completions', () => {
 		);
 		const req = fetchMock.mock.calls[0][0] as Request;
 		expect(((await req.json()) as { model: string }).model).toBe('gpt-4o-mini');
+	});
+});
+
+describe('Bedrock Converse dispatch', () => {
+	const CONVERSE_AI: ApiDeps['ai'] = {
+		...AI,
+		upstreamApiKey: undefined,
+		model: 'eu.anthropic.claude-opus-4-7',
+		allowedModels: ['eu.anthropic.claude-opus-4-7', 'openai.gpt-oss-120b-1:0'],
+	};
+
+	it.each([null, 'invalid-token'])(
+		'requires a valid session token before dispatch',
+		async (bearer) => {
+			const converse = vi.fn(async () => new Response('bridged'));
+			const res = await post(
+				bearer,
+				{ model: CONVERSE_AI.model, messages: [] },
+				{ ai: { ...CONVERSE_AI, converse } },
+			);
+			expect(res.status).toBe(401);
+			expect(converse).not.toHaveBeenCalled();
+		},
+	);
+
+	it('resolves off-list models before selecting the bridge', async () => {
+		const converse = vi.fn<NonNullable<AiProxyConfig['converse']>>(
+			async () => new Response('bridged'),
+		);
+		const res = await post(
+			await token(),
+			{ model: 'unapproved-model', messages: [] },
+			{ ai: { ...CONVERSE_AI, converse } },
+		);
+		expect(res.status).toBe(200);
+		expect(converse).toHaveBeenCalledWith(
+			expect.objectContaining({
+				model: CONVERSE_AI.model,
+				payload: { model: CONVERSE_AI.model, messages: [] },
+			}),
+		);
+	});
+
+	it('sanitizes provider failures before streaming starts', async () => {
+		const converse = vi.fn().mockRejectedValue(new Error('private provider detail'));
+		const res = await post(await token(), { messages: [] }, { ai: { ...CONVERSE_AI, converse } });
+		expect(res.status).toBe(502);
+		await expectOpenAiError(res, 'Upstream AI provider unreachable', 'api_error');
+	});
+
+	it('propagates client cancellation to the bridge', async () => {
+		const converse = vi.fn<NonNullable<AiProxyConfig['converse']>>(
+			({ signal }) =>
+				new Promise<Response>((_resolve, reject) => {
+					signal.addEventListener(
+						'abort',
+						() => reject(new DOMException('Aborted', 'AbortError')),
+						{
+							once: true,
+						},
+					);
+				}),
+		);
+		const controller = new AbortController();
+		const pending = app({ ai: { ...CONVERSE_AI, converse } }).request(
+			'/api/ai/v1/chat/completions',
+			{
+				method: 'POST',
+				headers: { 'content-type': 'application/json', authorization: `Bearer ${await token()}` },
+				body: JSON.stringify({ messages: [] }),
+				signal: controller.signal,
+			},
+		);
+		await vi.waitFor(() => expect(converse).toHaveBeenCalledOnce());
+		controller.abort();
+		const res = await pending;
+		expect(converse.mock.calls[0][0].signal.aborted).toBe(true);
+		expect(res.status).toBe(400);
+		await expectOpenAiError(res, 'Request cancelled by the client', 'cancelled');
+	});
+
+	it('routes an Anthropic chat completion to the Converse bridge, not the proxy', async () => {
+		const fetchMock = vi.spyOn(globalThis, 'fetch');
+		const converse = vi.fn(
+			async (_input: { payload: Record<string, unknown>; model: string; signal: AbortSignal }) =>
+				new Response('bridged', { status: 200 }),
+		);
+		const res = await post(
+			await token(),
+			{ model: 'marimohub/eu.anthropic.claude-opus-4-7', messages: [], stream: true },
+			{ ai: { ...CONVERSE_AI, converse } },
+		);
+
+		expect(res.status).toBe(200);
+		expect(await res.text()).toBe('bridged');
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(converse).toHaveBeenCalledOnce();
+		const arg = converse.mock.calls[0][0];
+		// The marimo provider prefix is stripped before dispatch.
+		expect(arg.model).toBe('eu.anthropic.claude-opus-4-7');
+		expect(arg.payload.model).toBe('eu.anthropic.claude-opus-4-7');
+	});
+
+	it('keeps a non-Anthropic Bedrock model on the raw proxy path', async () => {
+		const fetchMock = vi
+			.spyOn(globalThis, 'fetch')
+			.mockResolvedValue(new Response('ok', { status: 200 }));
+		const converse = vi.fn(async () => new Response('bridged', { status: 200 }));
+		await post(
+			await token(),
+			{ model: 'marimohub/openai.gpt-oss-120b-1:0', messages: [] },
+			{ ai: { ...CONVERSE_AI, converse } },
+		);
+
+		expect(converse).not.toHaveBeenCalled();
+		expect(fetchMock).toHaveBeenCalledOnce();
+		const req = fetchMock.mock.calls[0][0] as Request;
+		expect(((await req.json()) as { model: string }).model).toBe('openai.gpt-oss-120b-1:0');
+	});
+
+	it('never bridges the /responses endpoint, even for an Anthropic model', async () => {
+		const fetchMock = vi
+			.spyOn(globalThis, 'fetch')
+			.mockResolvedValue(new Response('{"id":"resp_1"}', { status: 200 }));
+		const converse = vi.fn(async () => new Response('bridged', { status: 200 }));
+		await post(
+			await token(),
+			{ model: 'marimohub/eu.anthropic.claude-opus-4-7', input: 'hi' },
+			{ ai: { ...CONVERSE_AI, converse } },
+			'/api/ai/v1/responses',
+		);
+
+		expect(converse).not.toHaveBeenCalled();
+		expect(fetchMock).toHaveBeenCalledOnce();
 	});
 });
 

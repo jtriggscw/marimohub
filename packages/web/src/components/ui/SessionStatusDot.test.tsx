@@ -1,8 +1,9 @@
 import type { ReactNode } from 'react';
-import { afterEach, describe, it, expect, vi } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { installMatchMedia } from '@/test/render';
 import type { Session } from '@/types';
 import { SessionStatusDot } from './SessionStatusDot';
 import type { ComputeProfile } from '@/components/Notebook/computeProfiles';
@@ -54,11 +55,35 @@ function dot(): Element | null {
 	return screen.getByRole('button').querySelector('span');
 }
 
+beforeEach(() => installMatchMedia());
+
 afterEach(() => {
 	vi.unstubAllGlobals();
 });
 
 describe('SessionStatusDot', () => {
+	it('shows the resolved session owner in the details popover', async () => {
+		renderDot(makeSession('running'));
+		vi.mocked(fetch).mockResolvedValueOnce(
+			new Response(
+				JSON.stringify({
+					success: true,
+					data: {
+						user_1: {
+							id: 'user_1',
+							name: 'Session Owner',
+							email: 'owner@example.com',
+							picture_url: null,
+						},
+					},
+				}),
+				{ headers: { 'content-type': 'application/json' } },
+			),
+		);
+		await userEvent.click(screen.getByRole('button'));
+		expect(await screen.findByText('Session Owner')).toBeVisible();
+	});
+
 	it('omits attribution and user lookup when the session starter is redacted', async () => {
 		renderDot({ ...makeSession('running'), user_id: undefined });
 		await userEvent.click(screen.getByRole('button'));
@@ -208,6 +233,11 @@ describe('SessionStatusDot', () => {
 
 	it('renders nothing when there is no session', () => {
 		const { container } = renderDot(undefined);
+		expect(container).toBeEmptyDOMElement();
+	});
+
+	it('renders nothing for an unrecognized status from the server', () => {
+		const { container } = renderDot(makeSession('restarting' as Session['status']));
 		expect(container).toBeEmptyDOMElement();
 	});
 });

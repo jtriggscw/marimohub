@@ -4,6 +4,23 @@
  */
 
 export interface paths {
+	'/api/v1/theme': {
+		parameters: {
+			query?: never;
+			header?: never;
+			path?: never;
+			cookie?: never;
+		};
+		/** Get public deployment branding */
+		get: operations['theme'];
+		put?: never;
+		post?: never;
+		delete?: never;
+		options?: never;
+		head?: never;
+		patch?: never;
+		trace?: never;
+	};
 	'/api/cli/v1/device-authorizations': {
 		parameters: {
 			query?: never;
@@ -1121,7 +1138,7 @@ export interface paths {
 		put?: never;
 		/**
 		 * Create a session and provision a sandbox
-		 * @description Create or reuse a notebook sandbox. Edit-session reuse follows the configured editor sandbox-sharing policy. App sessions use sticky account assignments in a version-aware pool.
+		 * @description Create or reuse a notebook sandbox. Edit-session reuse follows the configured editor sandbox-sharing policy. App sessions use sticky visit assignments in a version-aware pool.
 		 */
 		post: operations['sessions.create'];
 		delete?: never;
@@ -1833,7 +1850,7 @@ export interface paths {
 		};
 		/**
 		 * Resolve user ids to display identities
-		 * @description Batch-resolve opaque user ids (the auth `sub` stored as a notebook `author` or session `user_id`) into `{ id, email, name, picture_url }`. Ids with no recorded identity are omitted from the result map.
+		 * @description Batch-resolve opaque user ids (the auth `sub` stored as a notebook `author` or session `user_id`) into `{ id, email, name, picture_url }`. Ids with no recorded identity are omitted from the result map. Authenticated users may resolve display identities without project membership. Credential grants still restrict lookup of other users.
 		 */
 		get: operations['users.resolve'];
 		put?: never;
@@ -2447,6 +2464,7 @@ export interface components {
 					/** @enum {string} */
 					version_status: 'current' | 'old' | 'unknown';
 					legacy: boolean;
+					/** @description Occupied browser-session slots, including reconnect grace. */
 					users: number | null;
 					/** Format: date-time */
 					idle_since: string | null;
@@ -2484,6 +2502,7 @@ export interface components {
 			}[];
 			incomplete: boolean;
 			limits: {
+				/** @description Maximum browser-session slots per sandbox. */
 				max_users_per_session: number | null;
 				max_sessions_per_version: number | null;
 			};
@@ -3274,7 +3293,9 @@ export interface components {
 			app_pool?: {
 				/** @enum {string} */
 				state: 'starting' | 'ready' | 'draining' | 'retiring';
+				/** @description Occupied browser-session slots, including reconnect grace. */
 				users: number;
+				/** @description Maximum browser-session slots per sandbox. */
 				max_users: number | null;
 			};
 			session_id: string;
@@ -4009,6 +4030,43 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+	theme: {
+		parameters: {
+			query?: never;
+			header?: never;
+			path?: never;
+			cookie?: never;
+		};
+		requestBody?: never;
+		responses: {
+			/** @description Deployment branding, available before sign-in */
+			200: {
+				headers: {
+					[name: string]: unknown;
+				};
+				content: {
+					'application/json': {
+						/** @enum {boolean} */
+						success: true;
+						data: {
+							name: string;
+							favicon: string | null;
+							logo: string | null;
+							logo_dark: string | null;
+							primary_color: string | null;
+							secondary_color: string | null;
+							/** @default null */
+							pwa_icon_192: string | null;
+							/** @default null */
+							pwa_icon_512: string | null;
+							/** @default null */
+							apple_touch_icon: string | null;
+						};
+					};
+				};
+			};
+		};
+	};
 	'auth.cli.device.request': {
 		parameters: {
 			query?: never;
@@ -17387,7 +17445,7 @@ export interface operations {
 	'users.resolve': {
 		parameters: {
 			query?: {
-				/** @description Comma-separated user ids. */
+				/** @description Comma-separated user ids. At most 100 non-empty ids; whitespace and empty entries are ignored. */
 				ids?: string;
 			};
 			header?: never;
@@ -17413,6 +17471,33 @@ export interface operations {
 			};
 			/** @description Authentication required */
 			401: {
+				headers: {
+					[name: string]: unknown;
+				};
+				content: {
+					'application/json': components['schemas']['ErrorResponse'];
+				};
+			};
+			/** @description Access forbidden */
+			403: {
+				headers: {
+					[name: string]: unknown;
+				};
+				content: {
+					'application/json': components['schemas']['ErrorResponse'];
+				};
+			};
+			/** @description Not found */
+			404: {
+				headers: {
+					[name: string]: unknown;
+				};
+				content: {
+					'application/json': components['schemas']['ErrorResponse'];
+				};
+			};
+			/** @description Validation error */
+			422: {
 				headers: {
 					[name: string]: unknown;
 				};

@@ -21,6 +21,10 @@ function queryParameters(url: URL): QueryParameterBag {
 	return query;
 }
 
+export function awsDefaultCredentialProvider(): Provider<AwsCredentialIdentity> {
+	return defaultProvider();
+}
+
 export function createAwsSigV4Fetch(options: AwsSigV4FetchOptions): typeof globalThis.fetch {
 	const fetchImpl = options.fetch ?? globalThis.fetch;
 	const signer = new SignatureV4({

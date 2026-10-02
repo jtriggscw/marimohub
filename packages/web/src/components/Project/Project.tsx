@@ -1,7 +1,8 @@
+import { PageTitle } from '@/components/ui/PageTitle';
 import { useProjectThumbnails } from '@/api/thumbnails';
 import { Thumbnail } from '@/components/Notebook/Thumbnail';
 import { ThumbnailDialog } from '@/components/Notebook/ThumbnailDialog';
-import { lazy, Suspense, useMemo, useState } from 'react';
+import { lazy, Suspense, useMemo, useState, useTransition } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { FileTrigger } from 'react-aria-components';
 import { toast } from 'sonner';
@@ -63,14 +64,13 @@ import {
 	useSeedOnOpen,
 } from '@/components/form';
 import {
-	useNotebooksQuery,
+	useProjectContentQueries,
 	useCreateNotebook,
 	useDuplicateNotebook,
 	useDeleteNotebook,
 	useDownloadNotebookFile,
 	useDownloadOutputsHtml,
 	useDownloadWorkspace,
-	useProjectQuery,
 	useUpdateProject,
 	useDeleteProject,
 	useProjectSessionsQuery,
@@ -105,6 +105,7 @@ import { useDialogTarget } from '@/hooks/useDialogTarget';
 import { useDisclosure } from '@/hooks/useDisclosure';
 import { useListFilters } from '@/hooks/useListFilters';
 import { formatRelative } from '@/lib/time';
+import { cn } from '@/lib/utils';
 import { syncUrl } from '@/lib/links';
 import { sessionConnectionHint, sessionsByNotebook } from '@/lib/sessions';
 import { canEditProject, canManageProject } from '@/lib/roles';
@@ -242,7 +243,14 @@ const NEW_NOTEBOOK_CODE = (name: string) => {
 function useProjectContent() {
 	const { pid } = useParams<{ pid: string }>();
 	const navigate = useNavigate();
-	const { filters, setFilters, filtersActive } = useListFilters(NOTEBOOK_STATUS_FILTERS);
+	const {
+		filters,
+		setFilters: updateFilters,
+		filtersActive,
+	} = useListFilters(NOTEBOOK_STATUS_FILTERS);
+	const [filtersPending, startFilterTransition] = useTransition();
+	const setFilters: typeof updateFilters = (values) =>
+		startFilterTransition(() => updateFilters(values));
 
 	// Dialogs acting on a row use useDialogTarget; plain ones use useDisclosure.
 	const uploadModal = useDisclosure();
@@ -281,12 +289,11 @@ function useProjectContent() {
 	const membersModal = useDisclosure();
 	const alertsModal = useDisclosure();
 
-	const {
-		data: notebooks = [],
-		isPending: notebooksLoading,
-		isFetching: notebooksFetching,
-	} = useNotebooksQuery(pid!, filters);
-	const { data: project } = useProjectQuery(pid!);
+	const [{ data: project }, { data: notebooks, isFetching }] = useProjectContentQueries(
+		pid!,
+		filters,
+	);
+	const notebooksFetching = filtersPending || isFetching;
 	const { data: sessions, isLoading: sessionsLoading } = useProjectSessionsQuery(pid!);
 	const createNotebook = useCreateNotebook(pid!);
 	const duplicateNotebook = useDuplicateNotebook(pid!);
@@ -672,7 +679,7 @@ function useProjectContent() {
 
 	return (
 		<PageContainer>
-			<title>{`${project.name} · marimohub`}</title>
+			<PageTitle>{project.name}</PageTitle>
 			<PageHeader
 				actions={
 					<div className="flex items-center gap-1.5">
@@ -775,7 +782,7 @@ function useProjectContent() {
 				statuses={NOTEBOOK_STATUS_FILTERS}
 				resultCount={notebooks.length}
 				resultsId="notebook-results"
-				isLoading={notebooksLoading}
+				isLoading={false}
 				isFetching={notebooksFetching}
 				onChange={setFilters}
 				actions={
@@ -818,7 +825,7 @@ function useProjectContent() {
 				}
 				isFetching={notebooksFetching}
 				isFiltered={filtersActive}
-				isLoading={notebooksLoading}
+				isLoading={false}
 				itemName="notebook"
 				onReset={() => setFilters({})}
 				resultsId="notebook-results"
@@ -864,7 +871,12 @@ function useProjectContent() {
 										tags={nb.tags.filter((tag) => nb.status === 'active' || tag !== nb.status)}
 										title={nb.title}
 									/>
-									<div className="flex shrink-0 items-center gap-3">
+									<div
+										className={cn(
+											'flex items-center gap-3',
+											gallery ? 'min-w-0 w-full' : 'shrink-0',
+										)}
+									>
 										{live?.apps?.map((appSession) => (
 											<AppSessionIndicator
 												key={appSession.session_id}
@@ -890,19 +902,29 @@ function useProjectContent() {
 												canChooseComputeProfile ? nb.compute_profile : computeProfiles[0]?.name
 											}
 										/>
-										<span className="hidden w-32 items-center gap-1 text-xs text-muted-foreground sm:flex">
-											<span className="text-muted-foreground/70">by</span>
+										<span
+											className={cn(
+												'items-center gap-1 text-xs text-muted-foreground',
+												gallery ? 'flex min-w-0 flex-1 overflow-hidden' : 'hidden w-32 sm:flex',
+											)}
+										>
+											<span className="shrink-0 text-muted-foreground/70">by</span>
 											<UserLabel
 												user={users?.[nb.author]}
 												fallbackId={nb.author}
 												loading={usersLoading}
-												className="max-w-[8rem]"
+												className={gallery ? 'min-w-0' : 'max-w-[8rem]'}
 											/>
 										</span>
 										<time
 											dateTime={nb.updated_at}
 											title={new Date(nb.updated_at).toLocaleString()}
-											className="w-14 text-right text-xs tabular-nums text-muted-foreground"
+											className={cn(
+												'text-right text-xs tabular-nums text-muted-foreground',
+												gallery
+													? 'min-w-0 max-w-1/2 truncate'
+													: 'min-w-14 shrink-0 whitespace-nowrap',
+											)}
 										>
 											{formatRelative(nb.updated_at)}
 										</time>

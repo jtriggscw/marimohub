@@ -1,7 +1,9 @@
+import type { ThemeConfig } from '@marimo-hub/core/theme';
 import type { NotebookBridgeRuntime } from '@marimo-hub/core/ports/notebook-bridge';
 import type { Hono, MiddlewareHandler } from 'hono';
 import type {
 	AppPoolPolicy,
+	WarmPoolService,
 	ResourceSecurityPolicy,
 	AuthenticatedPrincipal,
 	Authenticator,
@@ -117,6 +119,8 @@ export interface SandboxUserHomeResolver {
 
 /** Everything about how a notebook sandbox is mounted, exposed, and persisted. */
 export interface SandboxConfig {
+	/** Ingress identity headers stripped before HTTP and WebSocket kernel forwarding. */
+	credentialHeaders?: readonly string[];
 	/** Bucket connection info the sandbox mounts for notebook files (was `c.env.R2_*`). */
 	bucket: BucketConfig;
 	/** Public hostname used when exposing kernel ports (was `c.env.SANDBOX_HOSTNAME`). */
@@ -244,6 +248,20 @@ export interface AiProxyConfig {
 		dialect: 'duckdb' | 'postgresql';
 		signal: AbortSignal;
 	}) => Promise<string>;
+	/**
+	 * Translate an OpenAI Chat Completions request to a backend that only speaks a
+	 * non-OpenAI API (Bedrock Converse for Anthropic Claude), returning an
+	 * OpenAI-shaped response. Present only for backends that need it; the proxy
+	 * uses it in place of the raw passthrough for models it covers. Streaming
+	 * failures are reported through `onStreamError` (the 200 headers are already
+	 * sent), while a rejected promise signals a pre-stream failure.
+	 */
+	converse?: (input: {
+		payload: Record<string, unknown>;
+		model: string;
+		signal: AbortSignal;
+		onStreamError?: (error: unknown) => void;
+	}) => Response | Promise<Response>;
 }
 
 /** Deployment-wide authorization / abuse-guard knobs. */
@@ -365,6 +383,8 @@ export interface McpConfig {
  * context (`c.get('deps')`) instead of instantiating adapters from `c.env`.
  */
 export interface ApiDeps {
+	warmPool?: WarmPoolService;
+	theme?: ThemeConfig;
 	services: Services;
 	/** Operational signals shared by domain services and API-owned resource guards. */
 	metrics?: Metrics;

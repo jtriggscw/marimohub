@@ -34,6 +34,8 @@ import type { NotebookService } from '../content/NotebookService';
 import { captureWorkspace, readSessionArtifacts, restoreWorkspace } from './sandboxFiles';
 import type { WorkspaceRestoreStats } from './sandboxFiles';
 import { restorePackedWorkspace } from './packedWorkspaceRestore';
+import { sandboxWorkspaceLayout } from './workspaceLayout';
+import type { SandboxWorkspaceLayout } from './workspaceLayout';
 
 /**
  * Default wait for marimo to bind its port (override per deployment via
@@ -44,6 +46,8 @@ import { restorePackedWorkspace } from './packedWorkspaceRestore';
  */
 export const DEFAULT_SANDBOX_STARTUP_TIMEOUT_MS = Millis.minutes(2);
 export const SLOW_SANDBOX_SETUP_MS = Millis.seconds(2);
+// Best-effort cosmetics; a hung checkout must not stall the `files` phase.
+const GIT_SPARSE_CHECKOUT_TIMEOUT_MS = Millis.minutes(1);
 const SETUP_OUTPUT_TAIL_BYTES = 4 * 1024;
 const SETUP_MARKER = '__MARIMOHUB_SETUP__';
 const SETUP_STEP_MARKER = /^__MARIMOHUB_SETUP__ step ([a-z0-9_]{1,64}) (\d{1,20})$/;
@@ -176,6 +180,7 @@ export interface SessionEnv {
 }
 
 export interface ProvisionOptions {
+	existingSandbox?: SandboxInstance;
 	/** Called when failure leaves no handle or sandbox destruction succeeds. */
 	onSandboxDestroyed?: () => void | Promise<void>;
 	sandboxId: SandboxId;
@@ -269,6 +274,13 @@ export interface ProvisionOptions {
 	workspaceOverlay?: { path: string; key: string }[];
 	/** Pull-source Git metadata restored into `<workdir>/.git`. */
 	gitPrefix?: string;
+	/**
+	 * Subtree of the repository a pull source mirrors. The workspace and kernel
+	 * then live at `<workdir>/<gitRootPath>` under a sparse checkout while
+	 * `.git` stays at `<workdir>`, where its repository-relative index resolves.
+	 * Ignored without `gitPrefix`.
+	 */
+	gitRootPath?: string;
 	/** Optional packed copy of a synced workspace and its Git metadata. */
 	workspaceArchive?: string;
 }
@@ -613,21 +625,28 @@ export class SandboxProvisioner {
 		const createStart = Date.now();
 		let sandbox: SandboxInstance | undefined;
 		try {
-			sandbox = createOrRestoreSandbox(
-				this.provider,
-				options.sandboxId,
-				options.restoreFilesystemSnapshotId,
-				{
-					image: options.image,
-					resources: options.resources,
-					userHome: options.userHome,
-					sessionIdleTimeoutMs: options.sessionIdleTimeoutMs,
-					owner: {
-						projectId: options.projectId,
-						...(options.userId ? { userId: options.userId } : {}),
+			sandbox =
+				options.existingSandbox ??
+				createOrRestoreSandbox(
+					this.provider,
+					options.sandboxId,
+					options.restoreFilesystemSnapshotId,
+					{
+						image: options.image,
+						resources: options.resources,
+						userHome: options.userHome,
+						sessionIdleTimeoutMs: options.sessionIdleTimeoutMs,
+						owner: {
+							projectId: options.projectId,
+							...(options.userId ? { userId: options.userId } : {}),
+						},
 					},
-				},
-			);
+				);
+			if (options.existingSandbox) {
+				// Claim-time probes belong to warm-pool telemetry, not provisioning.
+				sandbox.drainTimings?.();
+				sandbox.drainCounters?.();
+			}
 			const createMs = Date.now() - createStart;
 			const result = await this.provisionInto(sandbox, options);
 			// Constructing the (usually lazy) handle, NOT the backend's create — that
@@ -636,6 +655,8 @@ export class SandboxProvisioner {
 			result.timings.total = Date.now() - provisionStart;
 			return result;
 		} catch (err) {
+			// The caller retains cleanup ownership for a supplied sandbox.
+			if (options.existingSandbox) throw err;
 			// The saga does not compensate the step that throws. A failed handle
 			// constructor leaves nothing to destroy but still needs a cleanup marker.
 			try {
@@ -723,22 +744,26 @@ export class SandboxProvisioner {
 		mountPath: string;
 	}> {
 		const nb = paths.project(options.projectId).notebook(options.notebookId);
-		const workdir = options.workdir ?? DEFAULT_WORKDIR;
-		const mountPath = workdir;
+		const layout = sandboxWorkspaceLayout(
+			options.workdir ?? DEFAULT_WORKDIR,
+			options.gitPrefix ? (options.gitRootPath ?? '') : '',
+		);
+		const mountPath = layout.workdir;
 		const sw = new Stopwatch();
 
 		const ensureReachable = () => this.ensureReachable(sandbox, sw);
 		const loadWorkspace = () =>
 			withSandboxSpan(sw, 'files', async (time, span) => {
-				const loaded = await time(() =>
-					this.loadWorkspace(
+				const loaded = await time(async () => {
+					const loaded = await this.loadWorkspace(
 						sandbox,
 						options,
-						mountPath,
+						layout,
 						options.workspacePrefix ?? nb.workspacePrefix,
-					),
-				);
-				await time(() => this.applyWorkspaceOverlay(sandbox, options, mountPath));
+					);
+					await this.applyWorkspaceOverlay(sandbox, options, mountPath);
+					return loaded;
+				});
 				span.setAttributes({
 					objects: loaded.stats?.objectCount ?? 0,
 					bytes: loaded.stats?.bytes ?? 0,
@@ -749,10 +774,11 @@ export class SandboxProvisioner {
 		const injectSessionEnv = () =>
 			withSandboxSpan(sw, 'inject', (time) => this.injectSessionEnv(sandbox, options, time));
 		const setupEnvironment = () => this.setupEnvironment(sandbox, options, mountPath, sw);
+		const uploadBridge = () => this.uploadNotebookBridge(sandbox, options, sw);
 
-		// Setup reads only the loaded workspace, so credential resolution and injection
-		// can overlap it. The kernel (or a job's command) still waits for both.
-		const { load, setup } = await all({
+		// Setup reads only the loaded workspace. The kernel waits for credential
+		// injection and bridge upload as well.
+		const { load, setup, bridge } = await all({
 			async reachable() {
 				await ensureReachable();
 			},
@@ -764,20 +790,24 @@ export class SandboxProvisioner {
 				await this.$.reachable;
 				await injectSessionEnv();
 			},
+			async bridge() {
+				await this.$.reachable;
+				return uploadBridge();
+			},
 			async setup() {
 				await this.$.load;
 				return setupEnvironment();
 			},
 		});
-		await this.prepareNotebookBridge(sandbox, options, setup);
+		if (bridge) await this.configureNotebookBridge(sandbox, options, setup, bridge);
 		return { load, startup: setup, sw, mountPath };
 	}
 
-	private async prepareNotebookBridge(
+	private async uploadNotebookBridge(
 		sandbox: SandboxInstance,
 		options: ProvisionOptions,
-		startup: MarimoStartup,
-	): Promise<void> {
+		sw: Stopwatch,
+	): Promise<string | undefined> {
 		const payload = options.notebookBridge;
 		if (
 			!payload ||
@@ -786,21 +816,45 @@ export class SandboxProvisioner {
 			options.launchStrategy === 'uv-sandbox'
 		)
 			return;
-		const remaining = startup.deadline.timeoutMs === 0 ? 10_000 : remainingStartupMs(startup);
-		if (remaining <= 0) return;
 		const directory = `/tmp/marimohub-bridge/${options.sandboxId}`;
 		try {
-			await withDeadline(
-				sandbox.writeFiles(
-					payload.files.map(({ name, content }) => ({ path: `${directory}/${name}`, content })),
+			await withSandboxSpan(sw, 'bridge_prepare', (time) =>
+				time(() =>
+					withDeadline(
+						sandbox.writeFiles(
+							payload.files.map(({ name, content }) => ({ path: `${directory}/${name}`, content })),
+						),
+						{
+							timeoutMs: Math.min(10_000, options.startupTimeoutMs || 10_000),
+							timeoutError: () => new Error('Bridge preparation timed out'),
+						},
+					),
 				),
-				{
-					timeoutMs: Math.min(10_000, remaining),
-					timeoutError: () => new Error('Bridge preparation timed out'),
-				},
 			);
 			const path = `${directory}/${payload.launcher}`;
-			const launcher = sandbox.resolveProcessPath?.(path) ?? path;
+			return sandbox.resolveProcessPath?.(path) ?? path;
+		} catch {
+			logEvent(
+				{
+					level: 'warn',
+					event: 'notebook_bridge_unavailable',
+					reason: 'prepare_failed',
+					sandbox_id: options.sandboxId,
+				},
+				{ channel: 'warn' },
+			);
+			return;
+		}
+	}
+
+	private async configureNotebookBridge(
+		sandbox: SandboxInstance,
+		options: ProvisionOptions,
+		startup: MarimoStartup,
+		launcher: string,
+	): Promise<void> {
+		if (!options.bridgeParentOrigin) return;
+		try {
 			const budget = startup.deadline.timeoutMs === 0 ? 10_000 : remainingStartupMs(startup);
 			if (budget <= 0) return;
 			await withDeadline(
@@ -874,12 +928,13 @@ export class SandboxProvisioner {
 	private async loadWorkspace(
 		sandbox: SandboxInstance,
 		options: ProvisionOptions,
-		mountPath: string,
+		layout: SandboxWorkspaceLayout,
 		workspacePrefix: string,
 	): Promise<WorkspaceLoadResult> {
-		const loaded = await this.restoreWorkspaceFiles(sandbox, options, mountPath, workspacePrefix);
+		const loaded = await this.restoreWorkspaceFiles(sandbox, options, layout, workspacePrefix);
 		if (options.gitPrefix) {
-			await this.markGitWorkdirTrusted(sandbox, mountPath);
+			await this.markGitWorkdirTrusted(sandbox, layout.gitRoot);
+			if (layout.rootPath) await this.configureSparseCheckout(sandbox, options, layout);
 		}
 		return loaded;
 	}
@@ -887,7 +942,7 @@ export class SandboxProvisioner {
 	private async restoreWorkspaceFiles(
 		sandbox: SandboxInstance,
 		options: ProvisionOptions,
-		mountPath: string,
+		layout: SandboxWorkspaceLayout,
 		workspacePrefix: string,
 	): Promise<WorkspaceLoadResult> {
 		if (
@@ -899,8 +954,9 @@ export class SandboxProvisioner {
 				sandbox,
 				options.bucketHandle,
 				options.workspaceArchive,
-				mountPath,
+				layout.gitRoot,
 				Boolean(options.gitPrefix),
+				layout.rootPath,
 			);
 			if (packed.status === 'restored') {
 				return {
@@ -923,18 +979,13 @@ export class SandboxProvisioner {
 					packed.error,
 				);
 			}
-			const fallback = await this.loadWorkspaceObjects(
-				sandbox,
-				options,
-				mountPath,
-				workspacePrefix,
-			);
+			const fallback = await this.loadWorkspaceObjects(sandbox, options, layout, workspacePrefix);
 			return {
 				...fallback,
 				archiveStatus: packed.status === 'missing' ? 'missing' : 'failed',
 			};
 		}
-		return this.loadWorkspaceObjects(sandbox, options, mountPath, workspacePrefix);
+		return this.loadWorkspaceObjects(sandbox, options, layout, workspacePrefix);
 	}
 
 	private async markGitWorkdirTrusted(sandbox: SandboxInstance, workdir: string): Promise<void> {
@@ -944,12 +995,42 @@ export class SandboxProvisioner {
 		);
 	}
 
+	/**
+	 * Narrow the checkout to the mirrored subtree so `git status` in the session
+	 * is clean instead of reporting the rest of the repository as deleted.
+	 * Best-effort: proposal capture scopes its own diff to the subtree, so a
+	 * missing or old `git` only costs the cosmetic cleanliness.
+	 */
+	private async configureSparseCheckout(
+		sandbox: SandboxInstance,
+		options: ProvisionOptions,
+		layout: SandboxWorkspaceLayout,
+	): Promise<void> {
+		const result = await sandbox.exec(
+			`if command -v git >/dev/null 2>&1; then cd ${shellQuote(layout.gitRoot)} && git -c ${shellQuote(`safe.directory=${layout.gitRoot}`)} sparse-checkout set --cone -- ${shellQuote(layout.rootPath)}; fi`,
+			{ timeout: GIT_SPARSE_CHECKOUT_TIMEOUT_MS },
+		);
+		if (result.success) return;
+		logOperationalError(
+			'git_sparse_checkout_failed',
+			{
+				operation: 'session.git.sparse_checkout',
+				object: layout.workdir,
+				project_id: options.projectId,
+				notebook_id: options.notebookId,
+				recovered: true,
+			},
+			new Error(result.stderr.trim().slice(-500) || 'git sparse-checkout failed'),
+		);
+	}
+
 	private async loadWorkspaceObjects(
 		sandbox: SandboxInstance,
 		options: ProvisionOptions,
-		mountPath: string,
+		layout: SandboxWorkspaceLayout,
 		workspacePrefix: string,
 	): Promise<WorkspaceLoadResult> {
+		const mountPath = layout.workdir;
 		const strategy =
 			options.workspaceLoadMode === 'copy-only'
 				? this.workspaceLoadStrategies.copyOnly
@@ -975,8 +1056,8 @@ export class SandboxProvisioner {
 					sandbox,
 					options.bucketHandle,
 					gitPrefix,
-					`${mountPath}/.git`,
-					{ requireComplete: true },
+					`${layout.gitRoot}/.git`,
+					{ requireComplete: true, excludeRelativeRoots: ['hooks'] },
 				);
 				if (stats.objectCount === 0) throw new Error('the stored Git directory is empty');
 				return stats;
@@ -1280,7 +1361,8 @@ export class SandboxProvisioner {
 		// `captureSession` owns the persistence checks: false = an ephemeral session
 		// or a synced/remote source, whose edits (and filesystem snapshot) are never
 		// persisted from a session — destroy only.
-		let persisted = true;
+		// Failed captures must not replace the last good restore snapshot.
+		let persisted = false;
 		try {
 			persisted = await this.captureSession(
 				sandbox,

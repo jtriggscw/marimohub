@@ -6,6 +6,8 @@ import type { MemoryBucket } from '@marimo-hub/core/testing';
 import {
 	createSandboxId,
 	MaintenanceLock,
+	WarmPoolService,
+	WarmPoolStore,
 	Millis,
 	paths,
 	reapFilesystemSnapshots,
@@ -15,7 +17,7 @@ import {
 import { JobScheduler } from '@marimo-hub/core/jobs';
 import type { SweepResult } from '@marimo-hub/core';
 import { ACTOR, makeNotebookMeta, makeProject, makeSession } from '@marimo-hub/core/testing';
-import { startJobScheduler, startMaintenance, startSessionLifecycle } from './cron';
+import { startJobScheduler, startMaintenance, startSessionLifecycle, startWarmPools } from './cron';
 import { WideEventMetrics } from './metrics';
 
 vi.mock('@marimo-hub/core', async (importOriginal) => {
@@ -602,5 +604,159 @@ describe('startJobScheduler', () => {
 		logSpy.mockClear();
 		await vi.advanceTimersByTimeAsync(60_000);
 		expect(parseLoggedEvents(logSpy)).toEqual([]);
+	});
+});
+
+describe('startWarmPools', () => {
+	let handle: ReturnType<typeof startWarmPools>;
+
+	async function setup(enabled = true) {
+		vi.useFakeTimers();
+		const bucket = await createInitializedBucket();
+		const deps = makeTestDeps(bucket);
+		const service = new WarmPoolService(
+			new WarmPoolStore(bucket, 'kubernetes'),
+			deps.compute,
+			deps.services.sessions,
+			{ enabled, size: 1, profiles: [], creationTimeoutMs: 300_000, minimumRemainingMs: 60_000 },
+		);
+		deps.warmPool = service;
+		const sweep = vi.spyOn(service, 'sweep').mockResolvedValue(undefined);
+		return { bucket, deps, service, sweep };
+	}
+
+	afterEach(() => {
+		handle?.stop();
+		vi.restoreAllMocks();
+		vi.useRealTimers();
+	});
+
+	it('does not start a timer when no warm pool service is configured', async () => {
+		vi.useFakeTimers();
+		const deps = makeTestDeps(await createInitializedBucket());
+		expect(startWarmPools(deps)).toBeUndefined();
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it('checks disabled, empty pools for late cleanup without acquiring an idle lease', async () => {
+		const w = await setup(false);
+		const acquire = vi.spyOn(MaintenanceLock.prototype, 'acquire');
+		const owned = vi.spyOn(w.service.store, 'ownedSandboxIds').mockResolvedValue(new Set());
+		handle = startWarmPools(w.deps);
+		await flushRun();
+		expect(acquire).not.toHaveBeenCalled();
+		expect(w.sweep).not.toHaveBeenCalled();
+		await vi.advanceTimersByTimeAsync(FIVE_MINUTES_MS - 1);
+		expect(owned).toHaveBeenCalledOnce();
+		owned.mockResolvedValue(new Set(['late-cleanup']));
+		await vi.advanceTimersByTimeAsync(1);
+		expect(acquire).toHaveBeenCalledOnce();
+		expect(w.sweep).toHaveBeenCalledOnce();
+	});
+
+	it('keeps checking disabled cleanup after all ownership records are drained', async () => {
+		const w = await setup(false);
+		const owned = vi
+			.spyOn(w.service.store, 'ownedSandboxIds')
+			.mockResolvedValueOnce(new Set(['pending-cleanup']))
+			.mockResolvedValueOnce(new Set(['pending-cleanup']))
+			.mockResolvedValue(new Set());
+		handle = startWarmPools(w.deps);
+		await flushRun();
+		await vi.advanceTimersByTimeAsync(2 * FIVE_MINUTES_MS);
+		expect(w.sweep).toHaveBeenCalledTimes(2);
+		expect(owned).toHaveBeenCalledTimes(3);
+		owned.mockResolvedValue(new Set(['late-cleanup']));
+		await vi.advanceTimersByTimeAsync(FIVE_MINUTES_MS);
+		expect(w.sweep).toHaveBeenCalledTimes(3);
+	});
+
+	it('retries unreadable disabled ownership instead of treating it as empty', async () => {
+		const w = await setup(false);
+		vi.spyOn(console, 'log').mockImplementation(() => {});
+		const owned = vi
+			.spyOn(w.service.store, 'ownedSandboxIds')
+			.mockRejectedValueOnce(new Error('bucket unavailable'))
+			.mockResolvedValue(new Set(['pending-cleanup']));
+		handle = startWarmPools(w.deps);
+		await flushRun();
+		expect(w.sweep).not.toHaveBeenCalled();
+		await vi.advanceTimersByTimeAsync(FIVE_MINUTES_MS);
+		expect(owned).toHaveBeenCalledTimes(2);
+		expect(w.sweep).toHaveBeenCalledOnce();
+	});
+
+	it('skips work while another replica holds the lease and retries next tick', async () => {
+		const w = await setup();
+		vi.spyOn(MaintenanceLock.prototype, 'acquire').mockResolvedValueOnce(false);
+		handle = startWarmPools(w.deps);
+		await flushRun();
+		expect(w.sweep).not.toHaveBeenCalled();
+		await vi.advanceTimersByTimeAsync(5_000);
+		expect(w.sweep).toHaveBeenCalledOnce();
+		expect(await w.bucket.head(paths.warmPoolLock)).toBeNull();
+	});
+
+	it.each(['acquire', 'sweep', 'release'] as const)(
+		'recovers after a failed %s without keeping the overlap guard locked',
+		async (operation) => {
+			const w = await setup();
+			const logs = vi.spyOn(console, 'log').mockImplementation(() => {});
+			if (operation === 'sweep') w.sweep.mockRejectedValueOnce(new Error('temporary failure'));
+			else
+				vi.spyOn(MaintenanceLock.prototype, operation).mockRejectedValueOnce(
+					new Error('temporary failure'),
+				);
+			handle = startWarmPools(w.deps);
+			await flushRun();
+			expect(parseLoggedEvents(logs)).toContainEqual(
+				expect.objectContaining({
+					event: 'warm_pool_sweep_failed',
+					error: 'temporary failure',
+				}),
+			);
+			w.sweep.mockClear();
+			await vi.advanceTimersByTimeAsync(5_000);
+			expect(w.sweep).toHaveBeenCalledOnce();
+			expect(await w.bucket.head(paths.warmPoolLock)).toBeNull();
+		},
+	);
+
+	it('starts immediately, skips overlapping ticks, drains, and stops', async () => {
+		vi.useFakeTimers();
+		const bucket = await createInitializedBucket();
+		const deps = makeTestDeps(bucket);
+		deps.warmPool = new WarmPoolService(
+			new WarmPoolStore(bucket, 'kubernetes'),
+			deps.compute,
+			deps.services.sessions,
+			{
+				enabled: true,
+				size: 1,
+				profiles: [],
+				creationTimeoutMs: 300_000,
+				minimumRemainingMs: 60_000,
+			},
+		);
+		let finish!: () => void;
+		const sweep = vi.spyOn(deps.warmPool, 'sweep').mockImplementationOnce(
+			() =>
+				new Promise((resolve) => {
+					finish = resolve;
+				}),
+		);
+		const handle = startWarmPools(deps)!;
+		await flushRun();
+		expect(sweep).toHaveBeenCalledTimes(1);
+		await vi.advanceTimersByTimeAsync(5_000);
+		expect(sweep).toHaveBeenCalledTimes(1);
+		finish();
+		await handle.drain();
+		await vi.advanceTimersByTimeAsync(5_000);
+		expect(sweep).toHaveBeenCalledTimes(2);
+		handle.stop();
+		await handle.drain();
+		await vi.advanceTimersByTimeAsync(10_000);
+		expect(sweep).toHaveBeenCalledTimes(2);
 	});
 });

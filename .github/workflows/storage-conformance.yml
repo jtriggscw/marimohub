@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
-          version: 0.1.24
+          version: 0.3.0
           node-version-file: '.node-version'
           sfw: true
           cache: true
@@ -37,7 +37,7 @@ jobs:
         run: |
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+            ghcr.io/marimo-team/marimohub-minio@sha256:ddd7806175ccb64aee1cb8c821bbc1bb1b7d6d8ab6689b62e06ad390d943953d server /data
           docker run -d --name azurite -p 10000:10000 \
             mcr.microsoft.com/azure-storage/azurite:3.36.0 \
             azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck

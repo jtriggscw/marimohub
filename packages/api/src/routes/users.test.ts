@@ -1,6 +1,7 @@
-import { describe, it, expect, beforeEach } from 'vitest';
-import { ProjectId } from '@marimo-hub/core';
-import type { Authenticator } from '@marimo-hub/core';
+import { vi, describe, it, expect, beforeEach } from 'vitest';
+
+import { paths, ProjectId } from '@marimo-hub/core';
+import type { Authenticator, TokenGrant } from '@marimo-hub/core';
 import type { MemoryBucket } from '@marimo-hub/core/testing';
 import { ACTOR, uid } from '@marimo-hub/core/testing';
 import { createApi } from '../createApi';
@@ -69,6 +70,159 @@ describe('User routes', () => {
 		// A fresh app with the default deny-all authenticator.
 		const app = createApi(makeTestDeps(bucket));
 		await expectError(await app.request(`/api/v1/users?ids=${ACTOR}`), 401, 'UNAUTHORIZED');
+	});
+
+	it.each(['sso', 'external-access-token', 'development'] as const)(
+		'preserves display identities without project membership for %s users',
+		async (kind) => {
+			const authenticator: Authenticator = {
+				authenticate: async () => ({
+					id: uid('reader'),
+					email: 'reader@example.com',
+					credential: { kind },
+				}),
+			};
+			for (const id of ['author', 'member', 'session-owner']) {
+				await createTestApi({ bucket, userId: uid(id) }).request('GET', '/me');
+			}
+			const api = createTestApi({ bucket, deps: { authenticator } });
+			const catalog = vi.spyOn(api.deps.services.catalog, 'hasProjectInvolvement');
+			const data = await expectOk<Record<string, { name: string; email: string }>>(
+				await api.request('GET', '/users?ids=reader,author,member,session-owner,missing'),
+			);
+			for (const id of ['reader', 'author', 'member', 'session-owner']) {
+				expect(data[id]).toMatchObject({ name: id, email: `${id}@example.com` });
+			}
+			expect(data.missing).toBeUndefined();
+			expect(catalog).not.toHaveBeenCalled();
+			await expectError(await api.request('GET', '/users/search?q=author'), 403);
+		},
+	);
+
+	function withGrant(
+		grant: TokenGrant,
+		kind: 'personal-access-token' | 'service-account' = 'personal-access-token',
+	) {
+		const authenticator: Authenticator = {
+			authenticate: async () => ({
+				id: ACTOR,
+				email: `${ACTOR}@example.com`,
+				credential: { kind, grant },
+			}),
+		};
+		return createTestApi({ bucket, deps: { authenticator } }).request;
+	}
+
+	it.each(['lookup,other', 'other,lookup', ' lookup,, other,lookup '])(
+		'denies the entire mixed batch before reading directory records: %s',
+		async (ids) => {
+			const authenticator: Authenticator = {
+				authenticate: async () => ({
+					id: uid('lookup'),
+					email: 'lookup@example.com',
+					credential: {
+						kind: 'personal-access-token',
+						grant: { actions: ['org-integration.manage'], projects: '*' },
+					},
+				}),
+			};
+			const api = createTestApi({ bucket, deps: { authenticator } });
+			const lookup = vi.spyOn(api.deps.services.identities, 'getMany');
+			await expectError(await api.request('GET', `/users?ids=${encodeURIComponent(ids)}`), 403);
+			expect(lookup).not.toHaveBeenCalled();
+		},
+	);
+
+	it.each(['personal-access-token', 'service-account'] as const)(
+		'permits only self-resolution with a restricted %s',
+		async (kind) => {
+			const restricted = withGrant({ actions: ['org-integration.manage'], projects: '*' }, kind);
+			expect(
+				await expectOk(await restricted('GET', `/users?ids=${ACTOR},${ACTOR}`)),
+			).toHaveProperty(ACTOR);
+			expect(await expectOk(await restricted('GET', '/users?ids=,,%20'))).toEqual({});
+			await expectError(await restricted('GET', `/users?ids=${ACTOR},other`), 403);
+		},
+	);
+
+	it('reuses the current membership index for repeated denied searches', async () => {
+		const other = createTestApi({ bucket, userId: uid('outsider') }).request;
+		await other('GET', '/me');
+		const get = vi.spyOn(bucket, 'get');
+		for (let i = 0; i < 3; i++) {
+			await expectError(await other('GET', '/users/search?q=other'), 403);
+		}
+		expect(get.mock.calls.filter(([key]) => key === paths.catalog)).toHaveLength(3);
+		expect(get.mock.calls.filter(([key]) => key.startsWith('_system/snapshots/'))).toHaveLength(1);
+	});
+
+	it('retains display identities but revokes search after the only project membership is deleted', async () => {
+		const member = uid('member');
+		const other = createTestApi({ bucket, userId: member }).request;
+		await other('GET', '/me');
+		const project = await expectOk<{ id: string }>(
+			await request('POST', '/projects', { name: 'Standing', description: '' }),
+			201,
+		);
+		await expectOk(
+			await request('POST', `/projects/${project.id}/members`, { user_id: member, role: 'viewer' }),
+			201,
+		);
+		expect(await expectOk(await other('GET', `/users?ids=${ACTOR}`))).toHaveProperty(ACTOR);
+		await expectOk(await request('DELETE', `/projects/${project.id}`));
+		expect(await expectOk(await other('GET', `/users?ids=${ACTOR}`))).toHaveProperty(ACTOR);
+		await expectError(await other('GET', `/users/search?q=${ACTOR}`), 403);
+	});
+
+	it('revokes search when membership removal commits but catalog projection fails', async () => {
+		const member = uid('member');
+		const owner = createTestApi({ bucket, userId: ACTOR });
+		const other = createTestApi({ bucket, userId: member }).request;
+		const project = await expectOk<{ id: string }>(
+			await owner.request('POST', '/projects', { name: 'Standing', description: '' }),
+			201,
+		);
+		await expectOk(
+			await owner.request('POST', `/projects/${project.id}/members`, {
+				user_id: member,
+				role: 'viewer',
+			}),
+			201,
+		);
+		expect(await expectOk(await other('GET', `/users?ids=${ACTOR}`))).toHaveProperty(ACTOR);
+		const projection = vi
+			.spyOn(owner.deps.services.catalog, 'updateProjectEntry')
+			.mockRejectedValueOnce(new Error('projection failed'));
+		await expect(
+			owner.deps.services.projects.removeMember(ProjectId.parse(project.id), member, ACTOR),
+		).rejects.toThrow('projection failed');
+		projection.mockRestore();
+		expect(await expectOk(await other('GET', `/users?ids=${ACTOR}`))).toHaveProperty(ACTOR);
+		await expectError(await other('GET', `/users/search?q=${ACTOR}`), 403);
+	});
+
+	it.each(['personal-access-token', 'service-account'] as const)(
+		'denies arbitrary resolution with an integration-only %s',
+		async (kind) => {
+			await request('POST', '/projects', { name: 'Standing', description: '' });
+			const restricted = withGrant({ actions: ['org-integration.manage'], projects: '*' }, kind);
+			await expectError(await restricted('GET', '/users?ids=other'), 403);
+		},
+	);
+
+	it('masks arbitrary lookup with a selected-project token', async () => {
+		const project = await expectOk<{ id: string }>(
+			await request('POST', '/projects', { name: 'P', description: '' }),
+			201,
+		);
+		const restricted = withGrant({ actions: '*', projects: [ProjectId.parse(project.id)] });
+		await expectError(await restricted('GET', '/users?ids=unrelated'), 404);
+	});
+
+	it('permits a token explicitly granted directory access to resolve display identities', async () => {
+		const token = withGrant({ actions: ['directory.search'], projects: '*' });
+		await createTestApi({ bucket, userId: uid('author') }).request('GET', '/me');
+		expect(await expectOk(await token('GET', '/users?ids=author'))).toHaveProperty('author');
 	});
 
 	describe('GET /users/search', () => {
@@ -225,5 +379,33 @@ describe('User routes', () => {
 
 			expect(await expectOk(await god('GET', '/users/search?q=adam'))).toHaveLength(1);
 		});
+	});
+});
+
+describe('GET /users batch size', () => {
+	it.each([100, 101])('counts normalized ids at the batch boundary (%i ids)', async (count) => {
+		const { request } = createTestApi();
+		const ids = Array.from({ length: count }, (_, index) =>
+			index === 0 ? ACTOR : `user-${index}`,
+		);
+		const query = encodeURIComponent(` , ${ids.join(', , ')}, `);
+		const response = await request('GET', `/users?ids=${query}`);
+		if (count > 100) {
+			await expectError(response, 422, 'VALIDATION_ERROR');
+		} else {
+			const data = await expectOk<Record<string, unknown>>(response);
+			expect(Object.keys(data)).toEqual([ACTOR]);
+		}
+	});
+
+	it('rejects an unbounded ids list instead of fanning out to storage', async () => {
+		const { app, bucket } = createTestApi();
+		const reads = vi.spyOn(bucket, 'get');
+		const ids = Array.from({ length: 1000 }, (_, index) => `user-${index}`).join(',');
+
+		const res = await app.request(`/api/v1/users?ids=${ids}`);
+
+		expect(res.status).toBe(422);
+		expect(reads.mock.calls.length).toBeLessThan(200);
 	});
 });

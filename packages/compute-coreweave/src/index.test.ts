@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { context, trace } from '@opentelemetry/api';
 import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
 import { BasicTracerProvider } from '@opentelemetry/sdk-trace-base';
-import { CWSandboxNotFoundError } from '@coreweave/cwsandbox';
+import { CWSandboxNotFoundError, CWSandboxUnavailableError } from '@coreweave/cwsandbox';
 import type { SandboxInfo } from '@coreweave/cwsandbox';
 import { NOT_A_DIRECTORY_EXIT_CODE, NOT_A_DIRECTORY_MARKER } from '@marimo-hub/compute-commons';
 import type { SandboxId } from '@marimo-hub/core/ids';
@@ -57,7 +57,7 @@ describe('CoreWeaveCompute', () => {
 			await makeCompute(world).create(SANDBOX_ID).exec('true');
 			expect(world.created).toHaveLength(1);
 			const opts = world.created[0];
-			// No `endpoint`: v1 Create rejects a set product endpoint as unimplemented.
+			// No `endpoint` unless `kernelEndpoint` is configured.
 			expect(opts.services).toEqual([
 				{ name: 'kernel', port: 2718, protocol: 'tcp', visibility: 'public' },
 			]);
@@ -370,6 +370,56 @@ describe('CoreWeaveCompute', () => {
 	});
 
 	describe('re-resolved instance', () => {
+		const endpointConfig: CoreWeaveConfig = {
+			...baseConfig,
+			kernelEndpoint: { kind: 'https', auth: 'open' },
+			resolveExposedUrl: async (sandbox, port) =>
+				sandbox.serviceUrls!.find((s) => s.port === port)!.url,
+		};
+
+		it('rejects a legacy HTTP endpoint without blocking file recovery or teardown', async () => {
+			const world = makeWorld();
+			await makeCompute(world).create(SANDBOX_ID).ready!();
+			world.registry.get('cw-1')!.fake.reads['/workspace/notebook.py'] = 'unsaved edits';
+			const instance = makeCompute(world, endpointConfig).create(SANDBOX_ID);
+
+			await expect(instance.exposePort(2718, { hostname: 'unused' })).rejects.toThrow(
+				/expected HTTPS/,
+			);
+			await expect(instance.exposePort(2718, { hostname: 'unused' })).rejects.toThrow(
+				/expected HTTPS/,
+			);
+			expectFileResult(await instance.readFile('/workspace/notebook.py'), {
+				success: true,
+				content: 'unsaved edits',
+			});
+			expect(world.created).toHaveLength(1);
+			expect(world.deleted).toEqual([]);
+			await instance.destroy();
+			expect(world.deleted).toEqual(['cw-1']);
+		});
+
+		it('reuses an existing HTTPS endpoint', async () => {
+			const world = makeWorld();
+			await makeCompute(world, endpointConfig).create(SANDBOX_ID).ready!();
+			const instance = makeCompute(world, endpointConfig).connectExisting(SANDBOX_ID);
+			await expect(instance.exposePort(2718, { hostname: 'unused' })).resolves.toEqual({
+				url: 'https://cw-1-2718.sandbox.test',
+			});
+			expect(world.created).toHaveLength(1);
+		});
+
+		it('rejects an HTTP URL even when a fresh sandbox requested an HTTPS endpoint', async () => {
+			const world = makeWorld();
+			const instance = makeCompute(world, {
+				...endpointConfig,
+				resolveExposedUrl: async () => 'http://legacy.sandbox.test:2718',
+			}).create(SANDBOX_ID, { reuse: false });
+			await expect(instance.exposePort(2718, { hostname: 'unused' })).rejects.toThrow(
+				/expected HTTPS/,
+			);
+		});
+
 		it('reconnects to the existing sandbox by tag instead of creating a new one', async () => {
 			const world = makeWorld();
 			const compute = makeCompute(world);
@@ -425,6 +475,65 @@ describe('CoreWeaveCompute', () => {
 				{ path: '/w/data/a.csv', content: new Uint8Array([1, 2, 3]) },
 				{ path: '/w/data/b.csv', content: 'x,y' },
 			]);
+		});
+
+		it('retries a write the gateway answers with UNAVAILABLE', async () => {
+			vi.useFakeTimers();
+			try {
+				let failures = 2;
+				const world = makeWorld({
+					writeImpl: async () => {
+						if (failures-- > 0) throw new CWSandboxUnavailableError('W&B server error: 503');
+					},
+				});
+				const inst = makeCompute(world).create(SANDBOX_ID, { reuse: false });
+				const write = inst.writeFiles([{ path: '/tmp/token', content: 'x' }]);
+				await vi.runAllTimersAsync();
+				await write;
+				expect([...world.registry.values()][0].fake.batchWrites).toEqual([
+					[{ path: '/tmp/token', content: 'x' }],
+				]);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it('gives up on UNAVAILABLE once the backoff is exhausted', async () => {
+			vi.useFakeTimers();
+			try {
+				let attempts = 0;
+				const world = makeWorld({
+					writeImpl: async () => {
+						attempts++;
+						throw new CWSandboxUnavailableError('W&B server error: 503');
+					},
+				});
+				const write = makeCompute(world)
+					.create(SANDBOX_ID, { reuse: false })
+					.writeFiles([{ path: '/tmp/token', content: 'x' }]);
+				const rejected = expect(write).rejects.toBeInstanceOf(CWSandboxUnavailableError);
+				await vi.runAllTimersAsync();
+				await rejected;
+				expect(attempts).toBe(4);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it('does not retry other write failures', async () => {
+			let attempts = 0;
+			const world = makeWorld({
+				writeImpl: async () => {
+					attempts++;
+					throw new Error('permission denied');
+				},
+			});
+			await expect(
+				makeCompute(world)
+					.create(SANDBOX_ID, { reuse: false })
+					.writeFiles([{ path: '/tmp/token', content: 'x' }]),
+			).rejects.toThrow('permission denied');
+			expect(attempts).toBe(1);
 		});
 
 		it('is a no-op for an empty set', async () => {
@@ -602,6 +711,32 @@ describe('CoreWeaveCompute', () => {
 	});
 
 	describe('destroy()', () => {
+		it('prepares retained environment values at a new path when the same instance recreates its sandbox', async () => {
+			const world = makeWorld();
+			const inst = makeCompute(world).create(SANDBOX_ID);
+			await inst.setEnvVars({ TOKEN: 'secret' });
+			await inst.setEnvVars({ CACHE: '/tmp/cache' }, { onlyIfUnset: true });
+			await inst.exec('first');
+			await inst.exec('second');
+			const original = world.registry.get('cw-1')!.fake;
+			expect(original.stdinWrites).toHaveLength(1);
+			await inst.destroy();
+			expect(world.registry.size).toBe(0);
+			await inst.exec('first');
+			await inst.exec('second');
+			const recreated = world.registry.get('cw-2')!.fake;
+
+			expect(world.created).toHaveLength(2);
+			expect(recreated.stdinWrites).toEqual([
+				"export TOKEN='secret'; [ -n \"${CACHE+x}\" ] || export CACHE='/tmp/cache'; ",
+			]);
+			expect(recreated.stdinWrites).toEqual(original.stdinWrites);
+			const newPath = recreated.startCalls[0][2].match(/cat > '([^']+)'/)?.[1];
+			expect(newPath).toMatch(/^\/tmp\/marimohub-env-.+\/env.sh$/);
+			expect(original.runCalls.at(-1)![2]).not.toContain(newPath);
+			expect(recreated.runCalls.at(-1)![2]).toContain(`. '${newPath}'`);
+		});
+
 		it('deletes the cached sandbox handle', async () => {
 			const world = makeWorld();
 			const inst = makeCompute(world).create(SANDBOX_ID);
@@ -843,15 +978,18 @@ describe('CoreWeaveCompute', () => {
 	});
 
 	describe('setEnvVars() + withEnv', () => {
-		it('prefixes exec commands with shell-quoted exported env vars', async () => {
+		it('sends shell-quoted environment values over stdin', async () => {
 			const world = makeWorld();
 			const inst = makeCompute(world).create(SANDBOX_ID);
 			await inst.setEnvVars({ TOKEN: "a'b", DIR: '/x' });
 			await inst.exec('echo hi');
-			const cmd = [...world.registry.values()][0].fake.runCalls.at(-1)![2];
+			const fake = [...world.registry.values()][0].fake;
+			const cmd = fake.stdinWrites.at(-1)!;
+			expect(fake.runCalls.at(-1)![2]).toContain('/tmp/marimohub-env-');
+			expect(JSON.stringify([...fake.runCalls, ...fake.startCalls])).not.toContain('export ');
 			expect(cmd).toContain("export TOKEN='a'\\''b'; ");
 			expect(cmd).toContain("export DIR='/x'; ");
-			expect(cmd.endsWith('echo hi')).toBe(true);
+			expect(fake.runCalls.at(-1)![2].endsWith('echo hi')).toBe(true);
 		});
 
 		it('merges across multiple setEnvVars calls', async () => {
@@ -860,7 +998,10 @@ describe('CoreWeaveCompute', () => {
 			await inst.setEnvVars({ A: '1' });
 			await inst.setEnvVars({ B: '2' });
 			await inst.exec('run');
-			const cmd = [...world.registry.values()][0].fake.runCalls.at(-1)![2];
+			const fake = [...world.registry.values()][0].fake;
+			const cmd = fake.stdinWrites.at(-1)!;
+			expect(fake.runCalls.at(-1)![2]).toContain('/tmp/marimohub-env-');
+			expect(JSON.stringify([...fake.runCalls, ...fake.startCalls])).not.toContain('export ');
 			expect(cmd).toContain("export A='1'; ");
 			expect(cmd).toContain("export B='2'; ");
 		});
@@ -871,8 +1012,11 @@ describe('CoreWeaveCompute', () => {
 			await inst.setEnvVars({ A: '1' });
 			await inst.setEnvVars({ CACHE: '/tmp/c' }, { onlyIfUnset: true });
 			await inst.exec('run');
-			const cmd = [...world.registry.values()][0].fake.runCalls.at(-1)![2];
-			expect(cmd).toBe("export A='1'; [ -n \"${CACHE:-}\" ] || export CACHE='/tmp/c'; run");
+			const fake = [...world.registry.values()][0].fake;
+			const cmd = fake.stdinWrites.at(-1)!;
+			expect(fake.runCalls.at(-1)![2]).toContain('/tmp/marimohub-env-');
+			expect(JSON.stringify([...fake.runCalls, ...fake.startCalls])).not.toContain('export ');
+			expect(cmd).toBe("export A='1'; [ -n \"${CACHE+x}\" ] || export CACHE='/tmp/c'; ");
 		});
 	});
 
@@ -1177,3 +1321,110 @@ computeContract(
 		semantics: { failingCommand: 'mh-contract-fail', launch: {} },
 	},
 );
+
+describe('CoreWeaveCompute launchProcess', () => {
+	it.each(['completes', 'fails', 'stalls'] as const)(
+		'waits for bounded process cancellation when a launch times out and cancellation %s',
+		async (cancellation) => {
+			let releaseStreams!: () => void;
+			const released = new Promise<void>((resolve) => {
+				releaseStreams = resolve;
+			});
+			let streamsEnded = 0;
+			async function* stalled(): AsyncGenerator<string> {
+				await released;
+				streamsEnded++;
+				yield '';
+			}
+			const cancel = vi.fn(async () => {
+				if (cancellation === 'stalls') return released;
+				await new Promise((resolve) => setTimeout(resolve, 50));
+				if (cancellation === 'fails') throw new Error('Cancellation failed');
+				releaseStreams();
+			});
+			const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+			const world = makeWorld({
+				startImpl: async () => ({ ...fakeProcess(), stdout: stalled(), stderr: stalled(), cancel }),
+			});
+			const inst = makeCompute(world).create(SANDBOX_ID, { reuse: false });
+			vi.useFakeTimers();
+			try {
+				let resolved = false;
+				const pending = inst.launchProcess!('marimo edit', { port: 2718, startupTimeout: 200 });
+				void pending.then(() => {
+					resolved = true;
+				});
+				await vi.advanceTimersByTimeAsync(450);
+				expect(cancel).toHaveBeenCalledOnce();
+				expect(resolved).toBe(false);
+				await vi.advanceTimersByTimeAsync(1_000);
+				await expect(pending).resolves.toMatchObject({
+					success: false,
+					reason: 'readiness_timeout',
+					timings: { waitport: 450 },
+				});
+				if (cancellation === 'completes') {
+					expect(streamsEnded).toBe(2);
+					expect(log).not.toHaveBeenCalled();
+				} else {
+					expect(log).toHaveBeenCalledWith(
+						expect.stringContaining('"event":"sandbox_process_cancel_failed"'),
+					);
+				}
+			} finally {
+				releaseStreams();
+				log.mockRestore();
+				vi.useRealTimers();
+			}
+		},
+	);
+});
+
+describe('CoreWeave warm sandbox reconnect', () => {
+	it('reconnects from another provider without creating a sandbox', async () => {
+		const world = makeWorld();
+		await makeCompute(world).create(SANDBOX_ID, { reuse: false }).exec('true');
+		expectExecResult(await makeCompute(world).connectExisting(SANDBOX_ID).exec('true'), {
+			success: true,
+		});
+		expect(world.created).toHaveLength(1);
+	});
+
+	it('fails without creating when the sandbox is absent or deleted', async () => {
+		const world = makeWorld();
+		await expect(makeCompute(world).connectExisting(SANDBOX_ID).ready!()).rejects.toThrow(
+			'no longer available',
+		);
+		expect(world.created).toHaveLength(0);
+		await makeCompute(world).create(SANDBOX_ID).exec('true');
+		await makeCompute(world).create(SANDBOX_ID).destroy();
+		await expect(makeCompute(world).connectExisting(SANDBOX_ID).exec('true')).rejects.toThrow(
+			'no longer available',
+		);
+		expect(world.created).toHaveLength(1);
+	});
+});
+
+describe('bounded file transport', () => {
+	it('cancels the process when streamed output exceeds the limit', async () => {
+		const cancel = vi.fn(async () => {});
+		const world = makeWorld({
+			startImpl: async () => ({
+				...fakeProcess({ exitCode: 0 }),
+				stdout: (async function* () {
+					yield '12345';
+				})(),
+				cancel,
+			}),
+		});
+		expect(
+			(
+				await makeCompute(world).create(SANDBOX_ID).readFileBounded!('/workspace/file', {
+					maxBytes: 2,
+					timeoutMs: 100,
+				})
+			).success,
+		).toBe(false);
+		expect(cancel).toHaveBeenCalledOnce();
+	});
+});

@@ -1,51 +1,109 @@
+import { hostsOverlap, normalizeHostname } from '@marimo-hub/core/host-isolation';
 import type { Env } from './env';
 
 export interface SandboxHostIsolation {
-	/** False when the hosts share an origin/parent domain OR isolation can't be verified. */
 	isolated: boolean;
 	sandboxHost?: string;
 	appHost?: string;
-	/**
-	 * Present only when `isolated` is false, so the caller can word the error:
-	 * `shared-origin` (hosts overlap) vs `unverifiable-redirect` (the redirect is
-	 * set but yields no usable app host).
-	 */
-	reason?: 'shared-origin' | 'unverifiable-redirect';
+	/** Present only when isolation fails, so diagnostics distinguish overlap from invalid input. */
+	reason?:
+		| 'shared-origin'
+		| 'unverifiable-redirect'
+		| 'invalid-sandbox-host'
+		| 'unverifiable-origin'
+		| 'conflicting-origins';
 }
 
 /**
- * Pure check (no throw) reused by the wiring guard (index.ts) and the preflight
- * report. Returns `isolated: true` when there's nothing to compare (no sandbox
- * host, or no redirect at all to derive an app host from) — the wiring guard only
- * applies in `subdomain` mode, so a missing signal can't weaken `proxy` mode. But
- * a redirect that IS set yet unparseable fails closed (`isolated: false`): the app
- * host is then unknowable and isolation can't be verified.
- *
- * Why this matters: notebook kernels run untrusted user code. If they share an
- * origin/parent domain with the control plane, a malicious notebook can escape the
- * iframe sandbox into the app or set cookies on the shared domain.
+ * Sibling subdomains are supported; missing or invalid app origins fail closed.
  */
 export function checkSandboxHostIsolation(env: Env): SandboxHostIsolation {
 	const sandboxHost = env.MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME?.trim().toLowerCase();
 	if (!sandboxHost) return { isolated: true };
-	const redirect = env.MARIMOHUB_AUTH_OIDC_REDIRECT_URI;
-	if (!redirect) return { isolated: true, sandboxHost };
-	let appHost: string;
 	try {
-		appHost = new URL(redirect).hostname.toLowerCase();
+		const hostname = normalizeHostname(sandboxHost);
+		if (!hostname || /^\.+$/.test(hostname)) throw new Error('Invalid sandbox hostname');
 	} catch {
-		appHost = '';
+		return { isolated: false, sandboxHost, reason: 'invalid-sandbox-host' };
 	}
-	// A redirect WAS configured but yields no usable app host — either unparseable,
-	// or a hostless scheme like `mailto:` (empty hostname). Isolation can't be
-	// verified, so fail closed: a bad redirect must not silently green-light a
-	// potentially same-origin untrusted kernel.
-	if (!appHost) return { isolated: false, sandboxHost, reason: 'unverifiable-redirect' };
+	const appUrl = env.MARIMOHUB_APP_BASE_URL?.trim() || undefined;
+	const redirect = env.MARIMOHUB_AUTH_OIDC_REDIRECT_URI?.trim() || undefined;
+	if (!appUrl && !redirect) {
+		return { isolated: false, sandboxHost, reason: 'unverifiable-origin' };
+	}
+	const app = parseAppOrigin(appUrl);
+	if (appUrl !== undefined && !app) {
+		return { isolated: false, sandboxHost, reason: 'unverifiable-origin' };
+	}
+	const callback = parseAppOrigin(redirect);
+	if (redirect !== undefined && !callback) {
+		return { isolated: false, sandboxHost, reason: 'unverifiable-redirect' };
+	}
+	if (app && callback && app.origin !== callback.origin) {
+		return { isolated: false, sandboxHost, reason: 'conflicting-origins' };
+	}
+	const appHost = normalizeHostname((app ?? callback)!.hostname);
 
-	const sameOrigin = sandboxHost === appHost;
-	const sharesParent = sandboxHost.endsWith(`.${appHost}`) || appHost.endsWith(`.${sandboxHost}`);
-	if (sameOrigin || sharesParent) {
+	if (hostsOverlap(sandboxHost, appHost)) {
 		return { isolated: false, sandboxHost, appHost, reason: 'shared-origin' };
 	}
 	return { isolated: true, sandboxHost, appHost };
+}
+
+function parseAppOrigin(value: string | undefined): URL | undefined {
+	if (value === undefined || !/^https?:\/\/[^/\\]/i.test(value)) return undefined;
+	try {
+		const url = new URL(value);
+		if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password)
+			return undefined;
+		const hostname = normalizeHostname(url.hostname);
+		if (!hostname || /^\.+$/.test(hostname)) return undefined;
+		return url;
+	} catch {
+		return undefined;
+	}
+}
+
+export function sandboxHostIsolationMessage({
+	sandboxHost,
+	appHost,
+	reason,
+}: SandboxHostIsolation): string {
+	switch (reason) {
+		case 'unverifiable-origin':
+		case 'conflicting-origins':
+			return sandboxHostIsolationRemediation({ reason });
+		case 'unverifiable-redirect':
+			return (
+				'MARIMOHUB_AUTH_OIDC_REDIRECT_URI does not yield a usable app host, so isolation of ' +
+				`MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME (${sandboxHost}) cannot be verified. Set a valid ` +
+				'absolute http(s) redirect URI.'
+			);
+		case 'invalid-sandbox-host':
+			return `MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME (${sandboxHost}) is not a valid hostname, so isolation cannot be verified.`;
+		case 'shared-origin':
+		case undefined:
+			return (
+				`MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME (${sandboxHost}) shares an origin/parent domain with the ` +
+				`app host (${appHost}).`
+			);
+	}
+}
+
+export function sandboxHostIsolationRemediation({
+	reason,
+}: Pick<SandboxHostIsolation, 'reason'>): string {
+	switch (reason) {
+		case 'unverifiable-origin':
+			return 'Set MARIMOHUB_APP_BASE_URL or MARIMOHUB_AUTH_OIDC_REDIRECT_URI to a valid absolute http(s) URL. Both must have the same origin when present.';
+		case 'conflicting-origins':
+			return 'MARIMOHUB_APP_BASE_URL and MARIMOHUB_AUTH_OIDC_REDIRECT_URI must have the same origin.';
+		case 'unverifiable-redirect':
+			return 'Set MARIMOHUB_AUTH_OIDC_REDIRECT_URI to a valid absolute http(s) redirect URI.';
+		case 'invalid-sandbox-host':
+			return 'Set MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME to a hostname with an optional port, without a scheme or path.';
+		case 'shared-origin':
+		case undefined:
+			return 'Use a different sandbox hostname that is not a parent or subdomain of the app hostname.';
+	}
 }

@@ -3,7 +3,6 @@ import { toast } from 'sonner';
 import { z } from 'zod';
 import {
 	FormDialog,
-	optionalText,
 	requiredText,
 	schemaValidators,
 	useAppForm,
@@ -22,8 +21,11 @@ import { ServerSyncRow } from '@/components/Notebook/SyncNow';
 import {
 	ENTRY_NOTEBOOK_HINT,
 	ENTRY_NOTEBOOK_PATTERN,
+	gitEntryPath,
 	isRepoInput,
+	normalizeRootPathInput,
 	REPO_INPUT_HINT,
+	rootPathText,
 } from '@/lib/git';
 import { DOCS_SYNCING_URL } from '@/lib/links';
 import { formatRelative } from '@/lib/time';
@@ -43,7 +45,7 @@ interface SyncSettingsDialogProps {
 const settingsSchema = z.object({
 	repo: requiredText('Repository').refine(isRepoInput, REPO_INPUT_HINT),
 	branch: requiredText('Branch'),
-	rootPath: optionalText(),
+	rootPath: rootPathText(),
 	entryNotebook: requiredText('Notebook file').regex(ENTRY_NOTEBOOK_PATTERN, ENTRY_NOTEBOOK_HINT),
 });
 
@@ -57,10 +59,7 @@ function activeSourceLabel(source: {
 	commit: string | null;
 }) {
 	const commit = source.commit ? ` at ${source.commit.slice(0, 12)}` : '';
-	const file = source.root_path
-		? `${source.root_path}/${source.entry_notebook}`
-		: source.entry_notebook;
-	return `${source.repo} · ${source.branch} · ${file}${commit}`;
+	return `${source.repo} · ${source.branch} · ${gitEntryPath(source)}${commit}`;
 }
 
 export function SyncSettingsDialog({
@@ -101,7 +100,7 @@ export function SyncSettingsDialog({
 					notebookId,
 					repo: value.repo.trim(),
 					branch: value.branch.trim(),
-					root_path: value.rootPath.trim(),
+					root_path: normalizeRootPathInput(value.rootPath),
 					entry_notebook: value.entryNotebook.trim(),
 				});
 				toast.success(
@@ -135,7 +134,7 @@ export function SyncSettingsDialog({
 						.
 					</p>
 				</div>
-				{canOperate && (
+				{canManage && (
 					<Button type="button" size="sm" onPress={() => setConfirmRotate(true)}>
 						Rotate token
 					</Button>
@@ -150,7 +149,7 @@ export function SyncSettingsDialog({
 			) : (
 				<p className="rounded-md border border-input bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
 					The token is shown only when the notebook is created or its token is rotated.
-					{canOperate ? ' Rotate it to mint a new one.' : ''}
+					{canManage ? ' Rotate it to mint a new one.' : ''}
 				</p>
 			)}
 		</div>
@@ -213,17 +212,15 @@ export function SyncSettingsDialog({
 				<form.AppField name="branch">
 					{(f) => <f.TextField label="Branch" placeholder="main" isDisabled={!source} />}
 				</form.AppField>
-				{!isPull && (
-					<form.AppField name="rootPath">
-						{(f) => (
-							<f.TextField
-								label="Folder in repo (optional)"
-								placeholder="apps"
-								isDisabled={!source}
-							/>
-						)}
-					</form.AppField>
-				)}
+				<form.AppField name="rootPath">
+					{(f) => (
+						<f.TextField
+							label="Folder in repo (optional)"
+							placeholder="apps"
+							isDisabled={!source}
+						/>
+					)}
+				</form.AppField>
 				<form.AppField name="entryNotebook">
 					{(f) => (
 						<f.TextField label="Notebook file" placeholder="dashboard.py" isDisabled={!source} />
@@ -240,7 +237,7 @@ export function SyncSettingsDialog({
 				<div className="grid gap-4 sm:grid-cols-2">
 					<TextField label="Repository" value={values.repo} isReadOnly />
 					<TextField label="Branch" value={values.branch} isReadOnly />
-					{!isPull && <TextField label="Folder in repo" value={values.rootPath} isReadOnly />}
+					<TextField label="Folder in repo" value={values.rootPath} isReadOnly />
 					<TextField label="Notebook file" value={values.entryNotebook} isReadOnly />
 				</div>
 				{sourceStatus}
@@ -258,7 +255,7 @@ export function SyncSettingsDialog({
 	return (
 		<>
 			{dialog}
-			{canOperate && source?.sync_mode === 'push' && (
+			{canManage && source?.sync_mode === 'push' && (
 				<ConfirmDialog
 					isOpen={confirmRotate}
 					onClose={() => setConfirmRotate(false)}

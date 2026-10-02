@@ -16,24 +16,23 @@ of the compute backend. The modes trade origin isolation against authentication.
 ### `subdomain` (default): isolated kernel domain
 
 Kernels run arbitrary Python in an `<iframe sandbox="allow-scripts allow-same-origin …">`.
-`allow-same-origin` is required for the kernel to work, so a kernel on the **same
-registrable domain** as the app could escape the iframe into the app's origin or
-set cookies on the shared parent domain.
+Browsers connect **directly** to kernels. Sibling hostnames such as `hub.example.com` and `sandboxes.example.com` are supported.
+The server rejects identical or parent/child app and sandbox hostnames.
+It uses `MARIMOHUB_APP_BASE_URL`, with the OIDC redirect URI as a fallback when the app URL is unset or blank.
+Surrounding whitespace is ignored. A nonblank invalid value blocks startup instead of using the fallback.
+Both URLs must have the same origin when both are present.
+A configured kernel host without a valid app origin prevents startup for every authentication backend.
+The Cloudflare Worker example also compares against the request hostname.
 
-The browser connects **directly** to the kernel, so marimohub **refuses to
-start** if `MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME` shares an origin or parent domain
-with the app (taken from the OIDC redirect URI):
+Sibling subdomains share cookie scope. Separate registrable domains provide stronger isolation from cookies set by notebooks.
 
 ```bash
 # app:      https://hub.example.com
-# kernels:  https://sandboxes.example.net   ✅ separate registrable domain
+# kernels:  https://sandboxes.example.com
+MARIMOHUB_APP_BASE_URL=https://hub.example.com
 MARIMOHUB_SANDBOX_EXPOSURE=subdomain   # default
-MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME=sandboxes.example.net
+MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME=sandboxes.example.com
 ```
-
-::: danger Don't host kernels under the app domain
-`sandboxes.hub.example.com` or `hub.example.com` for kernels is rejected at boot.
-:::
 
 The hub does not authenticate direct kernel traffic. Protect the kernel endpoint
 at the ingress. [Native kernel authentication](#native-kernel-authentication)
@@ -77,6 +76,10 @@ whoever opens the kernel. App-user assignments and either
 `MARIMOHUB_VIEWER_MODE=applications` or `MARIMOHUB_VIEWER_MODE=ephemeral-sandbox`
 extend this risk to people who use apps that other authors wrote.
 If you combine proxy mode with app access, trust every notebook author in the deployment.
+
+HTTP and WebSocket proxies remove hub credentials before they forward requests to kernels or secondary editor surfaces.
+The filter includes cookies, Authorization, Cloudflare Access headers, the IAP assertion, and configured `MARIMOHUB_AUTH_PROXY_HEADER` names.
+Library deployments must supply custom identity headers through `sandbox.credentialHeaders`.
 
 ## Native kernel authentication
 
@@ -153,6 +156,9 @@ API key. Project configuration and bring-your-own-key providers can override it.
   `sub` values, so an issuer change requires an identity migration.
 - The session cookie is signed with `MARIMOHUB_AUTH_SESSION_SECRET` (HS256, ≥32
   bytes). Generate it with `openssl rand -base64 32` and treat it as a secret.
+
+Cloudflare Access requires a valid team name and a nonblank application audience.
+Tokens must use RS256 and match both the audience and team issuer.
 
 See [Auth](/auth) for provider setup.
 
@@ -246,6 +252,31 @@ is evaluated in addition to the project labels, so it can only add
 restrictions. The responses carry an `ETag`; send it back as `If-Match` to
 reject a concurrent change with `412`.
 
+Notebook duplication preserves the source notebook's security labels in the initial metadata and catalog entry.
+The copy requires the same resource clearance as the original.
+
+## Identity lookup
+
+`GET /api/v1/users` resolves known IDs to display profiles, including email and profile picture.
+Authenticated users can resolve display identities without project membership, preserving author, member, and session-owner displays on internal deployments.
+Directory search still requires directory authority or project involvement.
+Credential grants apply to both endpoints: restricted PATs and service accounts cannot resolve arbitrary identities, and selected-project tokens cannot access the deployment directory.
+Authenticated callers can always resolve their own profile.
+
+## Sandbox artifact reads
+
+Artifact capture accepts regular files only and rejects symlinks in every path component.
+Each read has a 25 MiB limit and a 10-second command deadline.
+The transport stops on overflow or timeout. Earlier file sizes do not replace the transport limit.
+Workspace capture also enforces its total byte limit against the captured bytes.
+A refused workspace read preserves the last stored copy.
+
+External compute adapters need `SandboxInstance.readFileBounded` to support artifact and workspace capture.
+The method must enforce byte limits during transport and cancel the transport on overflow or timeout.
+An adapter without this method can still run sessions. Capture logs a warning once per sandbox instance and skips artifact reads, workspace uploads, and workspace cleanup.
+Existing stored content is preserved, but new sandbox changes are not captured until the adapter supports bounded reads.
+Capture never falls back to an unbounded read.
+
 ## Request safety
 
 - **CSRF:** state-changing requests are same-origin by default; add trusted
@@ -254,6 +285,14 @@ reject a concurrent change with `412`.
   kernels per user; `0` disables the cap.
 - **Security headers** (anti-clickjacking, nosniff, HSTS, referrer policy) wrap
   the SPA/static responses.
+- **SPA Content Security Policy:** the Node server sends a report-only policy.
+  Connections are limited to the app origin. Proxy-mode frames also use only the app origin.
+  Direct sandbox exposure permits HTTP(S) frames because providers assign their origins at runtime.
+  This frame allowance is intentional and does not protect against iframe exfiltration.
+  The policy also permits local scripts, Google Fonts, image sources, and workers.
+  Browsers report violations in the developer console. The policy does not block resources yet.
+  Before enforcement, review violations from the deployment's integrations and narrow the permitted origins.
+  Kernel proxy and HTML snapshot policies remain separate.
 
 ## Storage integrity
 
@@ -270,3 +309,36 @@ manager and inject via `envFrom` — see [Operations](/operations#secrets) and
 [Deploying with Helm](/deploying/helm). The published image and Helm chart run
 **non-root with a read-only root filesystem and all capabilities dropped** by
 default.
+
+Kubernetes, Docker, Podman, and CoreWeave send session environment values through
+stdin to private files outside the workspace. Exec arguments contain no
+injected values. Files use mode `0600` in directories with mode `0700` and remain
+until sandbox destruction. Notebook code can read its own credentials.
+
+Environment preparation adds one remote command per new set of values, including
+process overrides. Commands reuse the file while values stay unchanged.
+Workspace file transfers are unchanged.
+
+Cloudflare endpoint bucket mounts use the SDK credential proxy to keep mount
+credentials outside the container filesystem.
+
+With `MARIMOHUB_PERSIST_WORKSPACE=workspace`, session teardown persists hidden
+files such as `.env` and `.git/` to the bucket. Any project member with read
+access can read them through the workspace files API. Every later session
+restores them into the sandbox. Keep credentials in
+[integration secrets](integration-secrets.md), not in workspace files.
+
+## Shared deployment credentials
+
+[AWS](integration-secrets.md#aws-project-policies) and
+[GitHub](syncing.md#github-project-policies) project policies are optional. Unset
+or blank policies keep existing access with a startup warning. The hub enforces
+configured rules before it uses shared credentials.
+
+Ambient object browsing excludes the configured hub bucket or Azure container,
+even with server ambient access enabled. The exclusion matches names within each
+provider, across endpoints and accounts. Explicit integration credentials remain
+available.
+
+Use a separate data bucket for ambient browsing. Restrict hub storage credentials
+to hub storage.

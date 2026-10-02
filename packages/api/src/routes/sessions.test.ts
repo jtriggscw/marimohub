@@ -3,6 +3,7 @@ import {
 	BadRequestError,
 	createNotebookId,
 	createProjectId,
+	createSandboxId,
 	createServices,
 	KERNEL_AUTH_TOKEN_FILE,
 	KERNEL_AUTH_TOKEN_PATTERN,
@@ -203,6 +204,7 @@ describe('Session routes', () => {
 		async function createSyncedNotebook(
 			entryCode: string,
 			syncMode: 'push' | 'pull' = 'push',
+			rootPath = '',
 		): Promise<NotebookId> {
 			const services = createServices(bucket);
 			const { meta } = await services.notebooks.synced.create(
@@ -212,6 +214,7 @@ describe('Session routes', () => {
 					description: 'd',
 					repo: 'org/repo',
 					branch: 'main',
+					root_path: rootPath,
 					entry_notebook: ENTRY,
 					sync_mode: syncMode,
 				},
@@ -220,7 +223,7 @@ describe('Session routes', () => {
 			await services.notebooks.synced.sync(pid, meta.id, {
 				repo: 'org/repo',
 				branch: 'main',
-				root_path: '',
+				root_path: rootPath,
 				commit: 'commit-aaaa',
 				files: [{ path: ENTRY, bytes: enc(entryCode) }],
 				...(syncMode === 'pull'
@@ -269,7 +272,7 @@ describe('Session routes', () => {
 					command.startsWith('python3 ') &&
 					command.includes('/workspace/.marimohub-packed-restore/extract.py'),
 			)!;
-			expect(extract).toMatch(/ 1$/);
+			expect(extract).toMatch(/ 1 ''$/);
 			expect(archiveReads(get)).toBe(1);
 			// Launch-strategy detection reads the entry once; a canonical fallback would read it again.
 			expect(entryReads(get)).toBe(1);
@@ -277,7 +280,60 @@ describe('Session routes', () => {
 			expect(setup).not.toContain('uv export');
 		});
 
-		it('ignores inline metadata in a local notebook (deps live in pyproject.toml)', async () => {
+		it('runs a subtree pull source from the subtree under a sparse checkout', async () => {
+			const synced = await createSyncedNotebook('import marimo', 'pull', 'python');
+			const { sb, post } = await startSessionApi(synced);
+			await expectOk<ApiSession>(await post());
+			const extract = sb.calls.exec.find(
+				(command) =>
+					command.startsWith('python3 ') &&
+					command.includes('/workspace/.marimohub-packed-restore/extract.py'),
+			)!;
+			expect(extract).toMatch(/ '\/workspace' 1 'python'$/);
+			expect(sb.calls.exec).toContainEqual(
+				expect.stringContaining(
+					"cd '/workspace' && git -c 'safe.directory=/workspace' sparse-checkout set --cone -- 'python'",
+				),
+			);
+			const setup = sb.calls.exec.find((command) => command.includes('uv sync --inexact'))!;
+			expect(setup).toContain("cd '/workspace/python'");
+			expect(sb.calls.startProcess[0].options?.cwd).toBe('/workspace/python');
+		});
+
+		it('starts secondary surfaces in a subtree pull source', async () => {
+			const synced = await createSyncedNotebook('import marimo', 'pull', 'python');
+			const sb = makeFakeSandbox();
+			const request = createTestApi({
+				bucket,
+				userId: ACTOR,
+				compute: fakeComputeFrom(sb.instance, { capabilities: { multiPort: true } }),
+				deps: {
+					sandbox: sandboxConfig({
+						surfaces: {
+							vscode: {
+								flavor: 'code-server',
+								start: 'eager',
+								port: 8443,
+								settings: {},
+								extensionGallery: 'openvsx',
+								embed: 'tab',
+							},
+						},
+					}),
+				},
+			}).request;
+
+			await expectOk<ApiSession>(
+				await request('POST', `/projects/${pid}/notebooks/${synced}/sessions`),
+			);
+
+			await vi.waitFor(() => {
+				const surface = sb.calls.startProcess.find(({ cmd }) => cmd.includes('code-server'));
+				expect(surface?.options?.cwd).toBe('/workspace/python');
+			});
+		});
+
+		it('installs inline dependencies for a local edit session', async () => {
 			const services = createServices(bucket);
 			const local = await services.notebooks.createNotebook(
 				pid,
@@ -287,7 +343,76 @@ describe('Session routes', () => {
 			const { sb, post } = await startSessionApi(local.id as NotebookId);
 			await expectOk<ApiSession>(await post());
 			const setup = sb.calls.exec.find((command) => command.includes('uv sync --inexact'))!;
+			expect(setup).toContain("uv export --script 'notebook.py'");
+			expect(setup).toContain('uv pip install');
+			expect(setup.indexOf('uv sync --inexact')).toBeLessThan(setup.indexOf('uv export'));
+		});
+
+		it('uses the project-managed environment for a local notebook without inline metadata', async () => {
+			const { sb, post } = await startSessionApi(nid);
+			await expectOk<ApiSession>(await post());
+			const setup = sb.calls.exec.find((command) => command.includes('uv sync --inexact'))!;
 			expect(setup).not.toContain('uv export');
+			expect(setup).not.toContain('uv pip install');
+		});
+
+		it.each([
+			{ saved: INLINE_CODE, workspace: 'import marimo', inline: true },
+			{ saved: 'import marimo', workspace: INLINE_CODE, inline: false },
+		])(
+			'uses the saved app source to detect inline dependencies ($inline)',
+			async ({ saved, workspace, inline }) => {
+				const services = createServices(bucket);
+				await services.notebooks.updateNotebook(pid, nid, { code: saved }, ACTOR);
+				// The live editor mirror may differ from the version selected for the app.
+				await bucket.put(paths.project(pid).notebook(nid).code, workspace);
+				const sb = makeFakeSandbox();
+				const api = createTestApi({
+					bucket,
+					userId: ACTOR,
+					compute: fakeComputeFrom(sb.instance),
+				}).request;
+				await expectOk<ApiSession>(await api('POST', sessionsPath(), { mode: 'app' }));
+				const setup = sb.calls.exec.find((command) => command.includes('uv sync --inexact'))!;
+				expect(setup.includes("uv export --script 'notebook.py'")).toBe(inline);
+				const writes = sb.calls.writeFile.filter((file) => file.path === '/workspace/notebook.py');
+				expect(writes.at(-1)?.content).toEqual(enc(saved));
+			},
+		);
+
+		it('propagates an inline setup failure and cleans up before starting the kernel', async () => {
+			const services = createServices(bucket);
+			await services.notebooks.updateNotebook(pid, nid, { code: INLINE_CODE }, ACTOR);
+			const { instance, calls } = makeFakeSandbox();
+			const baseExec = instance.exec.bind(instance);
+			vi.spyOn(instance, 'exec').mockImplementation(async (command, options) => {
+				if (!command.includes('uv export --script')) return baseExec(command, options);
+				return {
+					success: false,
+					stdout: '',
+					stderr: 'No solution found when resolving dependencies',
+					error: { code: 'COMMAND_FAILED' },
+				};
+			});
+			const api = createTestApi({
+				bucket,
+				userId: ACTOR,
+				compute: fakeComputeFrom(instance),
+			}).request;
+			const error = await expectError(
+				await api('POST', sessionsPath()),
+				503,
+				'PYTHON_ENV_SETUP_FAILED',
+			);
+			expect(error.message).toContain('the notebook dependency constraints could not be resolved');
+			expect(await services.sessions.listSessions(nid)).toEqual([
+				expect.objectContaining({
+					status: 'failed',
+					error: { code: 'PYTHON_ENV_SETUP_FAILED', message: error.message },
+				}),
+			]);
+			expect(calls.startProcess).toHaveLength(0);
+			expect(calls.destroy).toBeGreaterThanOrEqual(1);
 		});
 
 		it('does not re-read the entry file when reusing an existing session', async () => {
@@ -784,6 +909,22 @@ describe('Session routes', () => {
 		await expectOk<ApiSession>(await exclusiveOwner('POST', sessionsPath()));
 		await expectOk<EditorState>(await exclusiveOther('GET', editorSessionPath()));
 		expect(otherCompute.lastCreateOptions?.owner).toEqual({ projectId: pid, userId: ACTOR });
+	});
+
+	it('returns the owner’s editor claim without contacting compute', async () => {
+		const { instance } = makeFakeSandbox();
+		const compute = fakeComputeFrom(instance);
+		const exclusiveOwner = exclusiveApi(ACTOR, compute);
+		const session = await expectOk<ApiSession>(await exclusiveOwner('POST', sessionsPath()));
+		const create = vi.spyOn(compute, 'create').mockImplementation(() => {
+			throw new Error('Compute unavailable');
+		});
+		const state = await expectOk<EditorState>(await exclusiveOwner('GET', editorSessionPath()));
+		expect(state).toMatchObject({
+			holder: { session_id: session.session_id, activity: { state: 'unknown' } },
+			can_take_over: false,
+		});
+		expect(create).not.toHaveBeenCalled();
 	});
 
 	it('does not fail a takeover when notification delivery fails', async () => {
@@ -2051,7 +2192,7 @@ describe('Session routes', () => {
 			notebook_id: nid,
 			user_id: ACTOR,
 			status: 'running',
-			sandbox_url: undefined,
+			sandbox_url: 'http://winner.test',
 		});
 		await bucket.put(paths.session(pid, winner.session_id), JSON.stringify(winner));
 		await bucket.put(
@@ -2063,7 +2204,7 @@ describe('Session routes', () => {
 			}),
 		);
 		const deadline = new Date(Date.now() + Millis.minutes(15)).toISOString();
-		const groupEditor = createTestApi({
+		const groupApi = createTestApi({
 			bucket,
 			userId: STRANGER,
 			compute: makeFakeCompute(),
@@ -2078,7 +2219,12 @@ describe('Session routes', () => {
 					}),
 				},
 			},
-		}).request;
+		});
+		// Miss the winner at lookup so the start loses the claim race to it.
+		vi.spyOn(groupApi.deps.services.sessions, 'findReusableEditor').mockResolvedValueOnce({
+			sharing: 'shared',
+		});
+		const groupEditor = groupApi.request;
 
 		const attached = await expectOk<ApiSession>(await groupEditor('POST', sessionsPath()));
 
@@ -2088,6 +2234,183 @@ describe('Session routes', () => {
 			(await createServices(bucket).sessions.getSession(pid, winner.session_id))
 				.authorization_expires_at,
 		).toBe(deadline);
+	});
+
+	it.each(['normal', 'claim-lost'] as const)(
+		'revalidates %s editor reuse after a concurrent stop',
+		async (reusePath) => {
+			const kernelProbe = vi.fn<NonNullable<ApiDeps['kernelProbe']>>();
+			const api = createTestApi({
+				bucket,
+				userId: ACTOR,
+				compute: makeFakeCompute(),
+				deps: { kernelProbe },
+			});
+			const first = await expectOk<ApiSession>(await api.request('POST', sessionsPath()));
+			const { sessions } = api.deps.services;
+			const stop = () => sessions.beginTerminating(pid, first.session_id);
+
+			if (reusePath === 'normal') {
+				kernelProbe.mockImplementationOnce(async () => {
+					await stop();
+					return 'alive';
+				});
+			} else {
+				vi.spyOn(sessions, 'findReusableEditor').mockResolvedValueOnce({ sharing: 'shared' });
+				const claimEditor = sessions.claimEditor.bind(sessions);
+				let lostClaim = false;
+				vi.spyOn(sessions, 'claimEditor').mockImplementation(async (...args) => {
+					const result = await claimEditor(...args);
+					lostClaim = !result.claimed;
+					return result;
+				});
+				const getSession = sessions.getSession.bind(sessions);
+				vi.spyOn(sessions, 'getSession').mockImplementation(async (...args) => {
+					const snapshot = await getSession(...args);
+					if (lostClaim && snapshot.session_id === first.session_id) {
+						lostClaim = false;
+						await stop();
+					}
+					return snapshot;
+				});
+			}
+
+			await expectError(await api.request('POST', sessionsPath()), 409, 'CONFLICT');
+			expect((await sessions.getSession(pid, first.session_id)).status).toBe('terminating');
+			expect((await sessions.getEditorClaim(pid, nid))?.session_id).toBe(first.session_id);
+		},
+	);
+
+	const seedEditorHolder = async (overrides: Partial<Session>) => {
+		const holder = makeSession({
+			project_id: pid,
+			notebook_id: nid,
+			sandbox_id: createSandboxId(),
+			sandbox_url: 'http://holder.test',
+			started_at: new Date().toISOString(),
+			last_heartbeat: new Date().toISOString(),
+			...overrides,
+		});
+		await bucket.put(paths.session(pid, holder.session_id), JSON.stringify(holder));
+		await bucket.put(
+			paths.editorClaim(pid, nid),
+			JSON.stringify({
+				session_id: holder.session_id,
+				sharing: overrides.editor_sandbox_sharing ?? 'shared',
+				claimed_at: holder.started_at,
+			}),
+		);
+		return holder;
+	};
+
+	it('does not reuse a wedged starting holder after losing the editor claim', async () => {
+		const startedAt = new Date(Date.now() - Millis.minutes(6)).toISOString();
+		const holder = await seedEditorHolder({
+			user_id: ACTOR,
+			status: 'starting',
+			sandbox_url: undefined,
+			started_at: startedAt,
+			last_heartbeat: startedAt,
+		});
+		const api = createTestApi({ bucket, userId: ACTOR, compute: makeFakeCompute() });
+		vi.spyOn(api.deps.services.sessions, 'claimEditor').mockResolvedValueOnce({
+			claimed: false,
+			claim: { session_id: holder.session_id, sharing: 'shared', claimed_at: startedAt },
+		});
+
+		const res = await api.request('POST', sessionsPath());
+
+		await expectError(res, 409, 'CONFLICT');
+	});
+
+	describe('exclusive claim-lost path', () => {
+		const exclusive = () => {
+			const api = createTestApi({
+				bucket,
+				userId: ACTOR,
+				compute: makeFakeCompute(),
+				deps: { policy: { editorSandboxSharing: 'exclusive', defaultRole: 'editor' } },
+			});
+			vi.spyOn(api.deps.services.sessions, 'findReusableEditor').mockResolvedValueOnce({
+				sharing: 'exclusive',
+			});
+			return api.request;
+		};
+
+		it("answers a retryable conflict while another user's holder shuts down", async () => {
+			await seedEditorHolder({
+				user_id: STRANGER,
+				status: 'terminated',
+				editor_sandbox_sharing: 'exclusive',
+			});
+
+			await expectError(await exclusive()('POST', sessionsPath()), 409, 'CONFLICT');
+		});
+
+		it("reports ownership when another user's holder is live", async () => {
+			await seedEditorHolder({
+				user_id: STRANGER,
+				status: 'running',
+				editor_sandbox_sharing: 'exclusive',
+			});
+
+			await expectError(await exclusive()('POST', sessionsPath()), 409, 'EDIT_SESSION_OWNED');
+		});
+	});
+
+	it('rejects editor reuse when authorization expires during the kernel probe', async () => {
+		const services = createServices(bucket);
+		const kernelProbe = vi.fn<NonNullable<ApiDeps['kernelProbe']>>();
+		const api = createTestApi({
+			bucket,
+			userId: ACTOR,
+			compute: makeFakeCompute(),
+			deps: { services, kernelProbe },
+		});
+		const first = await expectOk<ApiSession>(await api.request('POST', sessionsPath()));
+		kernelProbe.mockImplementationOnce(async () => {
+			await services.sessions.tightenAuthorizationDeadline(
+				pid,
+				first.session_id,
+				new Date(Date.now() - Millis.seconds(1)).toISOString(),
+			);
+			return 'alive';
+		});
+
+		await expectError(await api.request('POST', sessionsPath()), 409, 'CONFLICT');
+	});
+
+	it('refuses to reuse an expired editor until the sweep reclaims its sandbox', async () => {
+		const startedAt = new Date(Date.now() - Millis.minutes(7)).toISOString();
+		const stale = makeSession({
+			project_id: pid,
+			notebook_id: nid,
+			user_id: ACTOR,
+			status: 'expired',
+			sandbox_id: createSandboxId(),
+			started_at: startedAt,
+			last_heartbeat: startedAt,
+			surfaces: { marimo: { status: 'ready', port: 2718, started_at: startedAt } },
+		});
+		await bucket.put(paths.session(pid, stale.session_id), JSON.stringify(stale));
+		await bucket.put(
+			paths.editorClaim(pid, nid),
+			JSON.stringify({ session_id: stale.session_id, sharing: 'shared', claimed_at: startedAt }),
+		);
+		const post = createTestApi({ bucket, userId: ACTOR, compute: makeFakeCompute() }).request;
+		const services = createServices(bucket);
+
+		await expectError(await post('POST', sessionsPath()), 409, 'CONFLICT');
+		expect((await services.sessions.getEditorClaim(pid, nid))?.session_id).toBe(stale.session_id);
+
+		// What the lifecycle sweep's reclaim leaves behind.
+		await services.sessions.markSandboxReclaimed(pid, stale.session_id, new Date().toISOString());
+		await services.sessions.releaseEditorFor(stale);
+
+		const started = await expectOk<ApiSession>(await post('POST', sessionsPath()));
+		expect(started.session_id).not.toBe(stale.session_id);
+		expect(started.reused).not.toBe(true);
+		expect((await services.sessions.getEditorClaim(pid, nid))?.session_id).toBe(started.session_id);
 	});
 
 	it('POST /sessions hammered for one notebook reuses one record and never trips the cap', async () => {

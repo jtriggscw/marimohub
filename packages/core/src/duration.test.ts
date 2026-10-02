@@ -1,3 +1,4 @@
+import { MAX_TIMER_DELAY_MS } from './async';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Millis, Seconds, sleep } from './duration';
 
@@ -50,4 +51,48 @@ describe('sleep', () => {
 		await vi.advanceTimersByTimeAsync(1);
 		expect(done).toBe(true);
 	});
+
+	it('clears the timer and abort listener when cancelled', async () => {
+		const controller = new AbortController();
+		const removeListener = vi.spyOn(controller.signal, 'removeEventListener');
+		const reason = new Error('cancelled');
+		const pending = sleep(1000, controller.signal);
+		const rejected = expect(pending).rejects.toBe(reason);
+		controller.abort(reason);
+		await rejected;
+		expect(vi.getTimerCount()).toBe(0);
+		expect(removeListener).toHaveBeenCalledWith('abort', expect.any(Function));
+	});
+
+	it('does not create a timer when already aborted', async () => {
+		const reason = new Error('cancelled');
+		await expect(sleep(1000, AbortSignal.abort(reason))).rejects.toBe(reason);
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it('removes its abort listener after completing', async () => {
+		const controller = new AbortController();
+		const removeListener = vi.spyOn(controller.signal, 'removeEventListener');
+		const pending = sleep(1000, controller.signal);
+		await vi.advanceTimersByTimeAsync(1000);
+		await pending;
+		expect(vi.getTimerCount()).toBe(0);
+		expect(removeListener).toHaveBeenCalledWith('abort', expect.any(Function));
+	});
+	it.each([0, MAX_TIMER_DELAY_MS])('accepts the timer boundary %s ms', async (delay) => {
+		const pending = sleep(delay);
+		await vi.advanceTimersByTimeAsync(delay);
+		await expect(pending).resolves.toBeUndefined();
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it.each([-1, 0.5, MAX_TIMER_DELAY_MS + 1, Infinity, -Infinity, Number.NaN])(
+		'rejects an unsupported delay of %s ms',
+		async (delay) => {
+			await expect(sleep(delay)).rejects.toThrow(
+				new RangeError(`Timer delay must be an integer between 0 and ${MAX_TIMER_DELAY_MS} ms`),
+			);
+			expect(vi.getTimerCount()).toBe(0);
+		},
+	);
 });

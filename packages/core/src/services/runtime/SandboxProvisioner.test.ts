@@ -8,6 +8,7 @@ import {
 	UserId,
 } from '../../ids';
 import { paths } from '../../paths';
+import { readFileFailure } from '../../ports/sandbox';
 import {
 	ACTOR,
 	EXPOSED_URL,
@@ -87,6 +88,30 @@ describe('SandboxProvisioner', () => {
 	const notebookId = createNotebookId();
 	const sandboxId = createSandboxId();
 
+	it.each([false, true])(
+		'cleans up a failed provision only when it owns the sandbox (existing: %s)',
+		async (existing) => {
+			const { instance, calls } = makeFakeSandbox({ failExec: 'true' });
+			const provider = fakeComputeFrom(instance);
+			const create = vi.spyOn(provider, 'create');
+			const onSandboxDestroyed = vi.fn();
+			await expect(
+				new SandboxProvisioner(provider).provision({
+					sandboxId,
+					projectId,
+					notebookId,
+					hostname: 'localhost',
+					bucket: bucketConfig,
+					existingSandbox: existing ? instance : undefined,
+					onSandboxDestroyed,
+				}),
+			).rejects.toThrow('Sandbox compute backend is not available');
+			expect(create).toHaveBeenCalledTimes(existing ? 0 : 1);
+			expect(calls.destroy).toBe(existing ? 0 : 1);
+			expect(onSandboxDestroyed).toHaveBeenCalledTimes(existing ? 0 : 1);
+		},
+	);
+
 	describe.each(['provision', 'prepare'] as const)('%s handle creation', (operation) => {
 		it.each([
 			{ restore: false, markerFails: false },
@@ -138,7 +163,7 @@ describe('SandboxProvisioner', () => {
 			bridgeParentOrigin: 'https://hub.example',
 		};
 		it.each(['uv-sync-edit', 'uv-script-pins'] as const)(
-			'launches the extension in the actual %s runtime after setup and injection',
+			'uploads the bridge while injection is pending and waits before launching %s',
 			async (launchStrategy) => {
 				const { instance, calls } = makeFakeSandbox();
 				const pending = deferred<{ vars: Record<string, string> }>();
@@ -152,7 +177,11 @@ describe('SandboxProvisioner', () => {
 					expect(calls.exec.some((command) => command.includes('uv sync'))).toBe(true),
 				);
 				expect(calls.writeFiles.flat().some((file) => file.path.endsWith('marimo-bridge.py'))).toBe(
-					false,
+					true,
+				);
+				expect(calls.startProcess).toHaveLength(0);
+				expect(calls.setEnvVars).not.toContainEqual(
+					expect.objectContaining({ MARIMOHUB_BRIDGE_PARENT_ORIGIN: expect.any(String) }),
 				);
 				pending.resolve({ vars: { EXISTING: 'kept' } });
 				await provision;
@@ -620,6 +649,41 @@ describe('SandboxProvisioner', () => {
 			expect(result.timings.reachable_find).toBe(7);
 		});
 
+		it('excludes warm claim telemetry while retaining provisioning telemetry', async () => {
+			const { instance, calls } = makeFakeSandbox();
+			let timings: Record<string, number> = { find: 42 };
+			let drainedExecs = 0;
+			instance.drainTimings = () => {
+				const recorded = timings;
+				timings = {};
+				return recorded;
+			};
+			instance.drainCounters = () => {
+				const execs = calls.exec.length - drainedExecs;
+				drainedExecs = calls.exec.length;
+				return { execs };
+			};
+			instance.ready = async () => {
+				timings.boot = 7;
+			};
+			await instance.exec('true');
+			const claimExecs = calls.exec.length;
+
+			const result = await new SandboxProvisioner(fakeComputeFrom(instance)).provision({
+				sandboxId,
+				projectId,
+				notebookId,
+				hostname: 'localhost',
+				bucket: bucketConfig,
+				existingSandbox: instance,
+			});
+
+			expect(result.timings).not.toHaveProperty('reachable_find');
+			expect(result.timings.reachable_boot).toBe(7);
+			expect(result.counters.execs).toBeGreaterThan(0);
+			expect(result.counters.execs).toBe(calls.exec.length - claimExecs);
+		});
+
 		it('passes --asset-url when assetUrl is set', async () => {
 			const { instance, calls } = makeFakeSandbox();
 			const provisioner = new SandboxProvisioner(fakeComputeFrom(instance));
@@ -634,7 +698,7 @@ describe('SandboxProvisioner', () => {
 				assetUrl,
 			});
 
-			expect(calls.startProcess[0].cmd).toContain(`--asset-url="${assetUrl}"`);
+			expect(calls.startProcess[0].cmd).toContain(`--asset-url='${assetUrl}'`);
 		});
 
 		it('gives the remaining startup timeout to the kernel port wait', async () => {
@@ -1459,7 +1523,7 @@ describe('SandboxProvisioner', () => {
 			).toBe(true);
 			expect(calls.writeFile.some((file) => file.path.endsWith('app.py'))).toBe(false);
 			expect(calls.exec.some((command) => command.startsWith('python3 '))).toBe(true);
-			expect(calls.exec.find((command) => command.startsWith('python3 '))).toMatch(/ 1$/);
+			expect(calls.exec.find((command) => command.startsWith('python3 '))).toMatch(/ 1 ''$/);
 			expect(
 				calls.exec.some((command) =>
 					command.includes("git config --global --add safe.directory '/workspace'"),
@@ -1647,6 +1711,7 @@ describe('SandboxProvisioner', () => {
 			await bucketHandle.put(version.workspaceFile('app.py'), 'import marimo as mo');
 			await bucketHandle.put(version.gitFile('HEAD'), 'ref: refs/heads/main\n');
 			await bucketHandle.put(version.gitFile('objects/pack/pack-a.pack'), 'pack');
+			await bucketHandle.put(version.gitFile('hooks/post-checkout'), '#!/bin/sh\n');
 
 			const result = await provisioner.provision({
 				sandboxId,
@@ -1665,12 +1730,229 @@ describe('SandboxProvisioner', () => {
 			expect(restored).toContain(`${MOUNT_PATH}/app.py`);
 			expect(restored).toContain(`${MOUNT_PATH}/.git/HEAD`);
 			expect(restored).toContain(`${MOUNT_PATH}/.git/objects/pack/pack-a.pack`);
+			expect(restored.some((path) => path.includes('/.git/hooks'))).toBe(false);
 			expect(result.counters).toMatchObject({ files_objects: 3 });
 			expect(
 				calls.exec.some((command) =>
 					command.includes("git config --global --add safe.directory '/workspace'"),
 				),
 			).toBe(true);
+		});
+
+		it('restores a subtree pull source beside the repository Git directory', async () => {
+			const { instance, calls } = makeFakeSandbox();
+			const provisioner = new SandboxProvisioner(fakeComputeFrom(instance));
+			const bucketHandle = new MemoryBucket();
+			const version = paths.project(projectId).notebook(notebookId).version(createVersionId());
+			await bucketHandle.put(version.workspaceFile('app.py'), 'import marimo as mo');
+			await bucketHandle.put(version.gitFile('HEAD'), 'ref: refs/heads/main\n');
+
+			const result = await provisioner.provision({
+				sandboxId,
+				projectId,
+				notebookId,
+				hostname: 'localhost',
+				bucket: bucketConfig,
+				bucketHandle,
+				entryNotebook: 'app.py',
+				workspaceLoadMode: 'copy-only',
+				workspacePrefix: version.workspacePrefix,
+				gitPrefix: version.gitPrefix,
+				gitRootPath: 'python/apps',
+			});
+
+			const restored = calls.writeFiles.flat().map((file) => file.path);
+			expect(restored).toContain(`${MOUNT_PATH}/python/apps/app.py`);
+			expect(restored).toContain(`${MOUNT_PATH}/.git/HEAD`);
+			expect(result.counters).toMatchObject({ files_objects: 2 });
+			expect(calls.exec).toContainEqual(
+				expect.stringContaining("git config --global --add safe.directory '/workspace'"),
+			);
+			expect(calls.exec).toContainEqual(
+				expect.stringContaining(
+					"cd '/workspace' && git -c 'safe.directory=/workspace' sparse-checkout set --cone -- 'python/apps'",
+				),
+			);
+			const sparseCheckout = calls.exec.findIndex((command) => command.includes('sparse-checkout'));
+			expect(calls.execOptions[sparseCheckout]?.timeout).toBe(60_000);
+			expect(calls.startProcess[0].options?.cwd).toBe(`${MOUNT_PATH}/python/apps`);
+			expect(calls.startProcess[0].cmd).toContain("marimo --quiet edit 'app.py'");
+		});
+
+		it('unpacks a subtree pull source archive with Git metadata at the repository root', async () => {
+			const { instance, calls } = makeFakeSandbox();
+			const bucketHandle = new MemoryBucket();
+			const version = paths.project(projectId).notebook(notebookId).version(createVersionId());
+			await bucketHandle.put(version.workspaceArchive, new Uint8Array([80, 75, 3, 4]));
+
+			await new SandboxProvisioner(fakeComputeFrom(instance)).provision({
+				sandboxId,
+				projectId,
+				notebookId,
+				hostname: 'localhost',
+				bucket: bucketConfig,
+				bucketHandle,
+				workspaceLoadMode: 'copy-only',
+				workspacePrefix: version.workspacePrefix,
+				gitPrefix: version.gitPrefix,
+				gitRootPath: 'python',
+				workspaceArchive: version.workspaceArchive,
+			});
+
+			const extract = calls.exec.find((command) => command.startsWith('python3 '));
+			expect(extract).toMatch(/ '\/workspace' 1 'python'$/);
+			expect(
+				calls.writeFiles[0].every(({ path }) =>
+					path.startsWith(`${MOUNT_PATH}/.marimohub-packed-restore/`),
+				),
+			).toBe(true);
+			expect(calls.exec).toContainEqual(
+				expect.stringContaining("sparse-checkout set --cone -- 'python'"),
+			);
+		});
+
+		it('ignores a root path without pull-source Git metadata', async () => {
+			const { instance, calls } = makeFakeSandbox();
+			const bucketHandle = new MemoryBucket();
+			const version = paths.project(projectId).notebook(notebookId).version(createVersionId());
+			await bucketHandle.put(version.workspaceFile('app.py'), 'import marimo as mo');
+
+			await new SandboxProvisioner(fakeComputeFrom(instance)).provision({
+				sandboxId,
+				projectId,
+				notebookId,
+				hostname: 'localhost',
+				bucket: bucketConfig,
+				bucketHandle,
+				entryNotebook: 'app.py',
+				workspaceLoadMode: 'copy-only',
+				workspacePrefix: version.workspacePrefix,
+				gitRootPath: 'python',
+			});
+
+			expect(calls.writeFiles.flat().map((file) => file.path)).toContain(`${MOUNT_PATH}/app.py`);
+			expect(calls.exec.some((command) => command.includes('sparse-checkout'))).toBe(false);
+			expect(calls.startProcess[0].options?.cwd).toBe(MOUNT_PATH);
+		});
+
+		it('keeps provisioning when the sparse checkout cannot be configured', async () => {
+			const { instance, calls } = makeFakeSandbox();
+			const exec = instance.exec.bind(instance);
+			instance.exec = async (command, options) => {
+				const result = await exec(command, options);
+				return command.includes('sparse-checkout set')
+					? {
+							success: false,
+							stdout: '',
+							stderr: 'git: sparse-checkout is not a git command',
+							error: { code: 'COMMAND_FAILED' },
+						}
+					: result;
+			};
+			const bucketHandle = new MemoryBucket();
+			const version = paths.project(projectId).notebook(notebookId).version(createVersionId());
+			await bucketHandle.put(version.workspaceFile('app.py'), 'import marimo as mo');
+			await bucketHandle.put(version.gitFile('HEAD'), 'ref: refs/heads/main\n');
+			const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+			try {
+				const result = await new SandboxProvisioner(fakeComputeFrom(instance)).provision({
+					sandboxId,
+					projectId,
+					notebookId,
+					hostname: 'localhost',
+					bucket: bucketConfig,
+					bucketHandle,
+					entryNotebook: 'app.py',
+					workspaceLoadMode: 'copy-only',
+					workspacePrefix: version.workspacePrefix,
+					gitPrefix: version.gitPrefix,
+					gitRootPath: 'python',
+				});
+
+				expect(result.url).toBeTruthy();
+				expect(calls.destroy).toBe(0);
+				expect(calls.startProcess[0].options?.cwd).toBe(`${MOUNT_PATH}/python`);
+				expect(log).toHaveBeenCalledWith(expect.stringContaining('git_sparse_checkout_failed'));
+			} finally {
+				log.mockRestore();
+			}
+		});
+
+		it('falls back to the subtree layout when packed extraction fails', async () => {
+			const { instance, calls } = makeFakeSandbox();
+			const exec = instance.exec.bind(instance);
+			instance.exec = async (command, options) => {
+				const result = await exec(command, options);
+				return command.startsWith('python3 ')
+					? {
+							success: false,
+							stdout: '',
+							stderr: 'invalid archive',
+							error: { code: 'COMMAND_FAILED' },
+						}
+					: result;
+			};
+			const bucketHandle = new MemoryBucket();
+			const version = paths.project(projectId).notebook(notebookId).version(createVersionId());
+			await bucketHandle.put(version.workspaceArchive, new Uint8Array([1, 2, 3]));
+			await bucketHandle.put(version.workspaceFile('app.py'), 'canonical');
+			await bucketHandle.put(version.gitFile('HEAD'), 'ref: refs/heads/main\n');
+			const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+			try {
+				const result = await new SandboxProvisioner(fakeComputeFrom(instance)).provision({
+					sandboxId,
+					projectId,
+					notebookId,
+					hostname: 'localhost',
+					bucket: bucketConfig,
+					bucketHandle,
+					workspaceLoadMode: 'copy-only',
+					workspacePrefix: version.workspacePrefix,
+					gitPrefix: version.gitPrefix,
+					gitRootPath: 'python',
+					workspaceArchive: version.workspaceArchive,
+				});
+
+				const restored = calls.writeFiles.flat().map((file) => file.path);
+				expect(restored).toContain(`${MOUNT_PATH}/python/app.py`);
+				expect(restored).toContain(`${MOUNT_PATH}/.git/HEAD`);
+				expect(restored).not.toContain(`${MOUNT_PATH}/app.py`);
+				expect(result.counters).toMatchObject({ files_archive_failed: 1 });
+				expect(calls.exec).toContainEqual(
+					expect.stringContaining("sparse-checkout set --cone -- 'python'"),
+				);
+			} finally {
+				log.mockRestore();
+			}
+		});
+
+		it('rejects an unsafe root path before touching the sandbox', async () => {
+			const { instance, calls } = makeFakeSandbox();
+			const bucketHandle = new MemoryBucket();
+			const version = paths.project(projectId).notebook(notebookId).version(createVersionId());
+			await bucketHandle.put(version.workspaceFile('app.py'), 'import marimo as mo');
+			await bucketHandle.put(version.gitFile('HEAD'), 'ref: refs/heads/main\n');
+
+			await expect(
+				new SandboxProvisioner(fakeComputeFrom(instance)).provision({
+					sandboxId,
+					projectId,
+					notebookId,
+					hostname: 'localhost',
+					bucket: bucketConfig,
+					bucketHandle,
+					workspaceLoadMode: 'copy-only',
+					workspacePrefix: version.workspacePrefix,
+					gitPrefix: version.gitPrefix,
+					gitRootPath: '../escape',
+				}),
+			).rejects.toThrow('Unsafe workspace root path');
+
+			expect(calls.writeFiles).toHaveLength(0);
+			expect(calls.writeFile).toHaveLength(0);
+			expect(calls.destroy).toBe(1);
 		});
 
 		it('preserves Git metadata stored in an ordinary copied workspace', async () => {
@@ -2115,12 +2397,19 @@ describe('SandboxProvisioner', () => {
 			);
 			const nb = paths.project(project.id).notebook(created.id);
 
-			// A working dir with source files plus a generated runtime file.
+			const runtimeFiles = {
+				'data/cars.csv': 'a,b\n1,2\n',
+				'__marimo__/notebook.html': '<html>output</html>',
+				'__marimo__/session/notebook.py.json': '{"version":"1"}',
+				'.git/HEAD': 'ref: refs/heads/main\n',
+				'.env': 'EXAMPLE=value\n',
+				'.gitignore': '*.csv\n',
+			};
 			const { instance, calls } = makeFsSandbox({
 				files: {
 					'notebook.py': 'print(2)',
 					'pyproject.toml': '[project]',
-					'data/cars.csv': 'a,b\n1,2\n',
+					...runtimeFiles,
 				},
 			});
 			const provisioner = new SandboxProvisioner(fakeComputeFrom(instance));
@@ -2135,21 +2424,17 @@ describe('SandboxProvisioner', () => {
 				'workspace',
 			);
 
-			// Runtime file persisted under workspace/; source stays out of it (commitSession owns it).
-			expect(await (await env.bucket.get(nb.workspaceFile('data/cars.csv')))?.text()).toBe(
-				'a,b\n1,2\n',
-			);
+			for (const [path, content] of Object.entries(runtimeFiles)) {
+				expect(await (await env.bucket.get(nb.workspaceFile(path)))?.text()).toBe(content);
+			}
 			expect(calls.destroy).toBe(1);
 		});
 
 		it('still destroys the sandbox when captureWorkspace throws (best-effort)', async () => {
 			const { instance: base, calls } = makeFakeSandbox();
-			// Fail only the capture listing (no includeHidden); readSessionArtifacts passes
-			// includeHidden:true and is left to succeed.
 			const instance = {
 				...base,
-				listFiles: async (path: string, options?: { includeHidden?: boolean }) => {
-					if (options?.includeHidden) return { success: true, files: [] };
+				listFiles: async () => {
 					throw new Error('list boom');
 				},
 			} as unknown as SandboxInstance;
@@ -2243,6 +2528,44 @@ describe('SandboxProvisioner', () => {
 	});
 
 	describe('captureSession', () => {
+		it.each(['READ_FAILED', 'BACKEND_ERROR'] as const)(
+			'rejects unreadable notebook code while still capturing workspace files (%s)',
+			async (code) => {
+				const env = await setupTestEnv();
+				const project = await env.projects.createProject({ name: 'P', description: 'd' }, ACTOR);
+				const created = await env.notebooks.createNotebook(
+					project.id,
+					{ title: 'NB', description: 'd', code: 'print(1)' },
+					ACTOR,
+				);
+				const { instance, calls } = makeFsSandbox({
+					files: { 'notebook.py': 'print(2)', 'data.csv': '1,2' },
+				});
+				const read = instance.readFileBounded!.bind(instance);
+				instance.readFileBounded = async (path, options) =>
+					path === `${MOUNT_PATH}/notebook.py` ? readFileFailure(code) : read(path, options);
+				const provisioner = new SandboxProvisioner(fakeComputeFrom(instance));
+
+				await expect(
+					provisioner.captureSession(
+						instance,
+						env.notebooks,
+						env.bucket,
+						project.id,
+						created.id,
+						ACTOR,
+						'workspace',
+					),
+				).rejects.toMatchObject({ code, object: 'notebook.py' });
+
+				expect(await env.notebooks.getNotebookContent(project.id, created.id)).toBe('print(1)');
+				expect(await env.notebooks.listVersions(project.id, created.id)).toHaveLength(1);
+				const nb = paths.project(project.id).notebook(created.id);
+				expect(await (await env.bucket.get(nb.workspaceFile('data.csv')))!.text()).toBe('1,2');
+				expect(calls.destroy).toBe(0);
+			},
+		);
+
 		it('saves the session edits as a version WITHOUT destroying the sandbox', async () => {
 			const env = await setupTestEnv();
 			const project = await env.projects.createProject({ name: 'P', description: 'd' }, ACTOR);
@@ -2410,12 +2733,9 @@ describe('SandboxProvisioner', () => {
 
 		it('throws the workspace error and logs the commit error when both reject', async () => {
 			const { instance: base, calls } = makeFakeSandbox();
-			// Fail the workspace capture (listFiles without includeHidden); the commit
-			// (readSessionArtifacts passes includeHidden:true) is failed via commitSession.
 			const instance = {
 				...base,
-				listFiles: async (_path: string, options?: { includeHidden?: boolean }) => {
-					if (options?.includeHidden) return { success: true, files: [] };
+				listFiles: async () => {
 					throw new Error('workspace list boom');
 				},
 			} as unknown as SandboxInstance;
@@ -2492,6 +2812,60 @@ describe('SandboxProvisioner', () => {
 	// Integration: the provisioner delegates to the filesystemSnapshots module at the
 	// two lifecycle moments (the module's own logic is unit-tested separately).
 	describe('filesystem snapshots (delegation)', () => {
+		it.each(['read', 'commit'] as const)(
+			'preserves the last good snapshot and destroys after a %s failure',
+			async (failure) => {
+				const env = await setupTestEnv();
+				const project = await env.projects.createProject({ name: 'P', description: 'd' }, ACTOR);
+				const created = await env.notebooks.createNotebook(
+					project.id,
+					{ title: 'NB', description: 'd', code: 'print(1)' },
+					ACTOR,
+				);
+				await env.notebooks.setFsSnapshot(project.id, created.id, {
+					snapshot_id: 'known-good',
+					captured_at: '2020-01-01T00:00:00.000Z',
+				});
+				const { instance, calls } = makeFakeSandbox({
+					files: { [`${MOUNT_PATH}/notebook.py`]: 'print(2)' },
+				});
+				if (failure === 'read') {
+					instance.readFileBounded = async () => readFileFailure('BACKEND_ERROR');
+				} else {
+					vi.spyOn(env.notebooks, 'commitSession').mockRejectedValue(new Error('bucket down'));
+				}
+				const compute = makeSnapshotCompute(instance);
+				const captureSnapshot = vi.spyOn(compute, 'captureSnapshot');
+				const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+				try {
+					await new SandboxProvisioner(compute).teardown(
+						instance,
+						env.notebooks,
+						env.bucket,
+						project.id,
+						created.id,
+						ACTOR,
+						'source',
+					);
+
+					expect(captureSnapshot).not.toHaveBeenCalled();
+					expect(compute.deleted).toEqual([]);
+					expect(await env.notebooks.getFsSnapshot(project.id, created.id)).toMatchObject({
+						snapshot_id: 'known-good',
+					});
+					expect(calls.destroy).toBe(1);
+					expect(JSON.parse(error.mock.calls[0][0])).toMatchObject({
+						event: 'session_capture_failed',
+						...(failure === 'read'
+							? { error: { code: 'BACKEND_ERROR', object: 'notebook.py' } }
+							: {}),
+					});
+				} finally {
+					error.mockRestore();
+				}
+			},
+		);
+
 		it('teardown captures a snapshot, writes the pointer, and GCs the previous one', async () => {
 			const env = await setupTestEnv();
 			const project = await env.projects.createProject({ name: 'P', description: 'd' }, ACTOR);

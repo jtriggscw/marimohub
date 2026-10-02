@@ -1,3 +1,4 @@
+import { parseTheme } from './theme';
 /**
  * Configuration composition root.
  *
@@ -12,10 +13,24 @@
  * need platform bindings, not env credentials) and are wired by hand in
  * examples/cloudflare-worker rather than here.
  */
+import {
+	aliasDeprecatedEnv,
+	parseBool,
+	parseEnum,
+	parseEnumOr,
+	parseIntEnv,
+	parseList,
+	parseOnOff,
+	parseSecondsEnv,
+	warnLegacyEnv,
+} from './env';
 import { notebookBridgeRuntime } from '@marimo-hub/notebook-bridge/runtime';
 import {
 	composeAuthenticators,
 	createServices,
+	WarmPoolStore,
+	AppPoolStore,
+	WarmPoolService,
 	Millis,
 	normalizeBaseUrl,
 	parseHttpUrl,
@@ -83,11 +98,16 @@ import { parseSessionIdleTimeouts, DEFAULT_SESSION_MAX_LIFETIME_S } from './sess
 import { parseAppPoolPolicy } from './appPool';
 import { makeWif } from './wif';
 import { makeSandboxUserHome } from './userHome';
-import { parseEnum, parseEnumOr, parseIntEnv, parseList, parseOnOff, parseSecondsEnv } from './env';
+import { parseWarmPoolConfig } from './warmPool';
+
 import type { Env } from './env';
 import { parseSandboxAuth } from './sandboxAuth';
 import { ConfigError } from './errors';
-import { checkSandboxHostIsolation } from './hostIsolation';
+import {
+	checkSandboxHostIsolation,
+	sandboxHostIsolationMessage,
+	sandboxHostIsolationRemediation,
+} from './hostIsolation';
 import { buildPreflightChecks } from './preflightChecks';
 import { parseExperiments } from './experiments';
 import { postgresDataAccessFeatures } from './postgresFeatures';
@@ -217,7 +237,7 @@ function dataPreviewFromEnv(
 		),
 		{
 			memoryLimitMb: parsePositiveIntEnv(
-				legacyDuckDBFallback(
+				aliasDeprecatedEnv(
 					env,
 					'MARIMOHUB_DATA_PREVIEW_EMBEDDED_MEMORY_LIMIT_MB',
 					'MARIMOHUB_DUCKDB_WASM_MEMORY_LIMIT_MB',
@@ -229,7 +249,7 @@ function dataPreviewFromEnv(
 			executionTimeoutMs,
 			maxPoolSize: maxConcurrent,
 			idleTimeoutMs: parseSecondsEnv(
-				legacyDuckDBFallback(
+				aliasDeprecatedEnv(
 					env,
 					'MARIMOHUB_DATA_PREVIEW_EMBEDDED_IDLE_TIMEOUT_SECONDS',
 					'MARIMOHUB_DUCKDB_WASM_IDLE_TIMEOUT_SECONDS',
@@ -266,16 +286,6 @@ function embeddedPreviewRuntimeMode(env: Env): DuckDBWasmRuntimeMode {
 		'auto',
 	);
 	return mode === 'inline' ? 'worker' : mode;
-}
-
-function legacyDuckDBFallback(env: Env, key: string, legacyKey: string): Env {
-	if (env[key]?.trim() || !env[legacyKey]?.trim()) return env;
-	warnLegacyEnv(legacyKey, key);
-	return { ...env, [key]: env[legacyKey] };
-}
-
-function warnLegacyEnv(legacyKey: string, key: string): void {
-	console.warn(`[marimohub] ${legacyKey} is deprecated; use ${key}.`);
 }
 
 function dataQueryFromEnv(
@@ -421,6 +431,19 @@ function parseMcpConfig(env: Env, externalIssuer?: string): McpConfig | undefine
 			docs: 'docs/mcp.md',
 		});
 	}
+	// Mirrors @hono/mcp's checkIssuerUrl
+	if (
+		parsed.url.protocol !== 'https:' &&
+		parsed.url.hostname !== 'localhost' &&
+		parsed.url.hostname !== '127.0.0.1'
+	) {
+		throw new ConfigError('MARIMOHUB_APP_BASE_URL must use HTTPS when MARIMOHUB_MCP=on', {
+			variable: 'MARIMOHUB_APP_BASE_URL',
+			remediation:
+				'set MARIMOHUB_APP_BASE_URL to a https:// URL. Plain http:// is accepted only for localhost and 127.0.0.1.',
+			docs: 'docs/mcp.md',
+		});
+	}
 	const publicBaseUrl = normalizeBaseUrl(parsed.url);
 	if (
 		externalIssuer &&
@@ -466,7 +489,7 @@ function parseSessionLifetime(env: Env): SessionLifetimeConfig {
 			'MARIMOHUB_SESSION_LIFETIME_EXTENSION_SECONDS',
 			DEFAULT_SESSION_LIFETIME_EXTENSION_S,
 		),
-		connectionAware: env.MARIMOHUB_SESSION_CONNECTION_AWARE !== 'false',
+		connectionAware: parseBool(env, 'MARIMOHUB_SESSION_CONNECTION_AWARE', true),
 		sweepIntervalMs: seconds(
 			'MARIMOHUB_SESSION_SWEEP_INTERVAL_SECONDS',
 			DEFAULT_SESSION_SWEEP_INTERVAL_S,
@@ -525,41 +548,15 @@ function parsePersistWorkspace(env: Env): 'source' | 'workspace' {
 	);
 }
 
-/**
- * Reject a sandbox hostname that shares an origin or parent domain with the app.
- * Notebook kernels run untrusted user code; if they are served same-origin (or on
- * the same registrable domain) as the control plane, a malicious notebook can
- * escape the iframe sandbox (`allow-scripts allow-same-origin`) into the app's
- * origin, or set cookies on the shared parent domain. Sandboxes must live on a
- * separate domain (e.g. `sandboxes.example.net`).
- *
- * The app's public host is derived from the OIDC redirect URI when present (the
- * only public-origin signal in env); skipped for other auth backends. The
- * suffix check catches the common same-eTLD+1 cases (app ⊃ sandbox or vice
- * versa) without a public-suffix list — it errs toward rejecting; if it ever
- * blocks a legitimate cross-eTLD setup that merely shares a label suffix, set
- * the hosts so neither is a dotted suffix of the other.
- */
 function assertSandboxHostIsolated(env: Env): void {
-	const { isolated, sandboxHost, appHost, reason } = checkSandboxHostIsolation(env);
-	if (isolated) return;
-	const detail =
-		reason === 'unverifiable-redirect'
-			? `MARIMOHUB_AUTH_OIDC_REDIRECT_URI does not yield a usable app host, so isolation of ` +
-				`MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME (${sandboxHost}) cannot be verified. Set a valid ` +
-				`absolute http(s) redirect URI.`
-			: `MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME (${sandboxHost}) shares an origin/parent domain with the ` +
-				`app host (${appHost}).`;
-	throw new ConfigError(
-		`${detail} Notebook kernels run untrusted code and must be isolated on a separate domain ` +
-			`(e.g. sandboxes.example.net) so a malicious notebook cannot escape the iframe sandbox into ` +
-			`the control plane or set cookies on the shared domain.`,
-		{
-			variable: 'MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME',
-			remediation: 'Serve kernels from a separate domain (e.g. sandboxes.example.net).',
-			docs: 'docs/security.md',
-		},
-	);
+	const isolation = checkSandboxHostIsolation(env);
+	if (isolation.isolated) return;
+	const detail = sandboxHostIsolationMessage(isolation);
+	throw new ConfigError(detail, {
+		variable: 'MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME',
+		remediation: sandboxHostIsolationRemediation(isolation),
+		docs: 'docs/security.md',
+	});
 }
 
 /**
@@ -616,6 +613,7 @@ export function createFromEnv(
 ): ApiDeps {
 	// Warns on unknown experiment IDs; no experiment currently gates behavior.
 	parseExperiments(env);
+	const theme = parseTheme(env);
 	const serviceAccounts = serviceAccountsFromEnv(env);
 	const bucket = makeStorage(env, options?.libraries);
 	const exposure = parseSandboxExposure(env);
@@ -636,8 +634,13 @@ export function createFromEnv(
 	const sandboxImages = resolveSandboxImages(env);
 	const computeProfiles = parseComputeProfiles(env.MARIMOHUB_COMPUTE_PROFILES);
 	const computeBackendValue = computeBackend(env) ?? 'unset';
-	const profilesSupported = supportsComputeProfiles(computeBackendValue);
-	const appliedComputeProfiles = profilesForBackend(computeBackendValue, computeProfiles);
+	const computeCapabilities = options?.libraries?.compute?.capabilities;
+	const profilesSupported = supportsComputeProfiles(computeBackendValue, computeCapabilities);
+	const appliedComputeProfiles = profilesForBackend(
+		computeBackendValue,
+		computeProfiles,
+		computeCapabilities,
+	);
 	const computeResources = profilesSupported ? resolveResources(appliedComputeProfiles) : {};
 	const computeProfileOverride = parseComputeProfileOverride(
 		env.MARIMOHUB_COMPUTE_PROFILE_OVERRIDE,
@@ -648,6 +651,7 @@ export function createFromEnv(
 		computeBackendValue,
 		computeProfiles,
 		computeProfileOverride,
+		computeCapabilities,
 	);
 	if (profileNotice && !warnedUnsupportedProfileBackends.has(computeBackendValue)) {
 		console.warn(profileNotice);
@@ -674,6 +678,14 @@ export function createFromEnv(
 			{ variable: 'MARIMOHUB_SURFACES' },
 		);
 	}
+	const warmPool = parseWarmPoolConfig(env, {
+		backend: computeBackendValue,
+		compute,
+		images: sandboxImages,
+		profiles: profilesSupported ? appliedComputeProfiles : parseComputeProfiles(undefined),
+		sessionMaxLifetimeMs: sessionLifetime.maxLifetimeMs,
+		startupTimeoutMs: parseSecondsEnv(env, 'MARIMOHUB_SANDBOX_STARTUP_TIMEOUT_SECONDS'),
+	});
 	const brokerPolicy =
 		integrationsEnabled(env) && env.MARIMOHUB_DATA_BROWSER?.trim().toLowerCase() === 'full'
 			? integrationProbePolicy(env)
@@ -694,6 +706,18 @@ export function createFromEnv(
 	);
 	const dataQuery = dataQueryFromEnv(env, duckdbHttpSessionFactory, metrics);
 	const deps: ApiDeps = {
+		warmPool: warmPool
+			? new WarmPoolService(
+					new WarmPoolStore(bucket, warmPool.backend),
+					compute,
+					services.sessions,
+					warmPool.config,
+					metrics,
+					undefined,
+					new AppPoolStore(bucket),
+				)
+			: undefined,
+		theme,
 		services,
 		metrics,
 		bucket,
@@ -708,6 +732,7 @@ export function createFromEnv(
 		}),
 		authRoutes,
 		sandbox: {
+			credentialHeaders: env.MARIMOHUB_AUTH_PROXY_HEADER?.split(',').map((header) => header.trim()),
 			bucket: makeSandboxBucketConfig(env),
 			hostname: env.MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME ?? '',
 			workdir: env.MARIMOHUB_COMPUTE_WORKDIR ?? '/workspace',
@@ -719,7 +744,7 @@ export function createFromEnv(
 			auth: parseSandboxAuth(env.MARIMOHUB_SANDBOX_AUTH),
 			appBaseUrl: env.MARIMOHUB_APP_BASE_URL,
 			persistWorkspace: parsePersistWorkspace(env),
-			automaticThumbnails: env.MARIMOHUB_AUTOMATIC_THUMBNAILS !== 'false',
+			automaticThumbnails: parseBool(env, 'MARIMOHUB_AUTOMATIC_THUMBNAILS', true),
 			sessionLifetime,
 			images: sandboxImages,
 			resources: computeResources,

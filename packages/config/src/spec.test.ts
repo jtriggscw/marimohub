@@ -7,7 +7,9 @@ import type { ConfigVar } from './spec';
 
 // Files that read the env surface; scanned for MARIMOHUB_*/PORT literals.
 const WIRING_SOURCES = [
+	fileURLToPath(new URL('./theme.ts', import.meta.url)),
 	fileURLToPath(new URL('./appPool.ts', import.meta.url)),
+	fileURLToPath(new URL('./warmPool.ts', import.meta.url)),
 	fileURLToPath(new URL('./sessionDefaults.ts', import.meta.url)),
 	fileURLToPath(new URL('./index.ts', import.meta.url)),
 	fileURLToPath(new URL('./library.ts', import.meta.url)),
@@ -31,7 +33,8 @@ const WIRING_SOURCES = [
 
 // Literals that appear in the wiring sources but aren't config vars.
 const IGNORED = new Set([
-	// Compatibility-only fallbacks. Keep the engine-specific names out of the public config surface.
+	// Deprecated aliases stay out of the public config surface.
+	'MARIMOHUB_APP_MAX_USERS_PER_SESSION',
 	'MARIMOHUB_DUCKDB_WASM_IDLE_TIMEOUT_SECONDS',
 	'MARIMOHUB_DUCKDB_WASM_MEMORY_LIMIT_MB',
 	'MARIMOHUB_DUCKDB_WASM_RUNTIME',
@@ -46,7 +49,8 @@ function scanReferencedIds(): Set<string> {
 	const found = new Set<string>();
 	for (const path of WIRING_SOURCES) {
 		const src = readFileSync(path, 'utf8');
-		for (const m of src.matchAll(/MARIMOHUB_[A-Z0-9_]+/g)) found.add(m[0]);
+		// Prefix selectors ending in an underscore are not variable names.
+		for (const m of src.matchAll(/MARIMOHUB_[A-Z0-9_]*[A-Z0-9]\b/g)) found.add(m[0]);
 		// `PORT` is read as `process.env.PORT` and does not carry the prefix.
 		if (/process\.env\.PORT\b/.test(src)) found.add('PORT');
 	}

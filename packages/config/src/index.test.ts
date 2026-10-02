@@ -1,10 +1,16 @@
 import { describe, it, expect, vi } from 'vitest';
 import { fileURLToPath } from 'node:url';
-import { BadRequestError, createProjectId, createSessionId } from '@marimo-hub/core';
-import type { ProxyExposure, SandboxProvider } from '@marimo-hub/core';
-import { ACTOR } from '@marimo-hub/core/testing';
+import {
+	BadRequestError,
+	createNotebookId,
+	createProjectId,
+	createSessionId,
+} from '@marimo-hub/core';
+import type { CreateSandboxOptions, ProxyExposure, SandboxProvider } from '@marimo-hub/core';
+import { ACTOR, makeFakeSandbox } from '@marimo-hub/core/testing';
 import { MemoryBucket } from '@marimo-hub/core/testing/memory-bucket';
 import { createFromEnv, createFromEnvAsync } from './index';
+import { libraryProfileCases } from './testdata/computeProfileCapabilities';
 
 const validStorageFixture = fileURLToPath(
 	new URL('./testdata/adapters/valid-storage.mjs', import.meta.url),
@@ -588,6 +594,152 @@ describe('createFromEnv external adapter libraries', () => {
 		expect(deps.version?.backends?.compute).toBe('library');
 	});
 
+	it.each(libraryProfileCases)(
+		'wires library profiles for %s',
+		(_name, capabilities, supported, gpu) => {
+			const compute: SandboxProvider = {
+				capabilities,
+				create: () => makeFakeSandbox().instance,
+				proxy: async () => null,
+			};
+			const deps = createFromEnv(
+				{
+					...env,
+					MARIMOHUB_COMPUTE_BACKEND: 'library',
+					MARIMOHUB_COMPUTE_PROFILES: 'gpu:cpu=8;mem=32Gi;gpu=A100:2,small:cpu=1',
+					MARIMOHUB_COMPUTE_PROFILE_OVERRIDE: 'editors',
+				},
+				undefined,
+				{ libraries: { bucket: new MemoryBucket(), compute } },
+			);
+			const resources = { cpu: 8, memoryBytes: 32 * 1024 ** 3, ...(gpu ? { gpu: 'A100:2' } : {}) };
+			expect(deps.sandbox.resources).toEqual(supported ? resources : {});
+			expect(deps.sandbox.computeProfile).toBe(supported ? 'gpu' : undefined);
+			expect(deps.sandbox.computeProfiles).toEqual(
+				supported
+					? [
+							{ name: 'gpu', resources },
+							{ name: 'small', resources: { cpu: 1 } },
+						]
+					: [],
+			);
+			expect(deps.sandbox.computeProfileOverride).toBe(supported ? 'editors' : 'none');
+		},
+	);
+
+	it('loads library profile capabilities and passes resources to pooled sandboxes', async () => {
+		const deps = await createFromEnvAsync({
+			...env,
+			MARIMOHUB_STORAGE_LIBRARY: validStorageFixture,
+			MARIMOHUB_COMPUTE_BACKEND: 'library',
+			MARIMOHUB_COMPUTE_LIBRARY: fileURLToPath(
+				new URL('./testdata/adapters/compute-profiles.mjs', import.meta.url),
+			),
+			MARIMOHUB_COMPUTE_PROFILES: 'small:cpu=1;mem=2Gi,gpu:cpu=8;mem=32Gi;gpu=A100:2',
+			MARIMOHUB_COMPUTE_PROFILE_OVERRIDE: 'editors',
+			MARIMOHUB_COMPUTE_WARM_POOL_ENABLED: 'true',
+			MARIMOHUB_COMPUTE_WARM_POOL_PROFILES: 'all',
+		});
+		expect(deps.sandbox.computeProfiles).toEqual([
+			{ name: 'small', resources: { cpu: 1, memoryBytes: 2 * 1024 ** 3 } },
+			{ name: 'gpu', resources: { cpu: 8, memoryBytes: 32 * 1024 ** 3, gpu: 'A100:2' } },
+		]);
+		expect(deps.sandbox.computeProfileOverride).toBe('editors');
+		await deps.warmPool!.sweep();
+		const compute = deps.compute as SandboxProvider & { createdOptions: CreateSandboxOptions[] };
+		expect(compute.createdOptions).toHaveLength(2);
+		for (const profile of deps.sandbox.computeProfiles!) {
+			expect(compute.createdOptions).toContainEqual(
+				expect.objectContaining({ resources: profile.resources }),
+			);
+		}
+	});
+
+	it.each([
+		{ profiles: undefined, selection: 'default' },
+		{ profiles: 'small:cpu=1;mem=2Gi,large:cpu=4;mem=8Gi', selection: 'default' },
+		{ profiles: 'small:cpu=1;mem=2Gi,large:cpu=4;mem=8Gi', selection: 'all' },
+	])(
+		'uses adapter defaults for external pools despite unsupported $profiles profiles and $selection selection',
+		async ({ profiles, selection }) => {
+			const sandbox = makeFakeSandbox().instance;
+			const compute: SandboxProvider = {
+				create: vi.fn(() => sandbox),
+				connectExisting: vi.fn(() => sandbox),
+				proxy: async () => null,
+				warmPool: { maxLifetimeMs: null, configuration: { deployment: 'external-test' } },
+			};
+			const deps = createFromEnv(
+				{
+					...env,
+					MARIMOHUB_COMPUTE_BACKEND: 'library',
+					MARIMOHUB_COMPUTE_WARM_POOL_ENABLED: 'true',
+					MARIMOHUB_COMPUTE_PROFILES: profiles,
+					MARIMOHUB_COMPUTE_WARM_POOL_PROFILES: selection,
+				},
+				undefined,
+				{ libraries: { bucket: new MemoryBucket(), compute } },
+			);
+			const pool = deps.warmPool!;
+			expect(pool.store.backend).toBe('library');
+			await pool.sweep();
+			const stored = await pool.store.read();
+			expect(stored.pools).toHaveLength(1);
+			const ready = stored.pools[0].members[0];
+			expect(deps.sandbox?.computeProfile).toBeUndefined();
+			expect(deps.sandbox?.computeProfiles).toEqual([]);
+			const claim = await pool.claim({
+				profile: deps.sandbox?.computeProfile,
+				destination: {
+					project_id: createProjectId(),
+					notebook_id: createNotebookId(),
+					session_id: createSessionId(),
+				},
+			});
+			expect(claim?.member.sandbox_id).toBe(ready.sandbox_id);
+			expect(compute.create).toHaveBeenCalledOnce();
+			expect(compute.create).toHaveBeenCalledWith(ready.sandbox_id, {
+				image: undefined,
+				resources: {},
+				reuse: false,
+			});
+			expect(compute.connectExisting).toHaveBeenCalledOnce();
+		},
+	);
+
+	it('drains a disabled external pool despite invalid unused pool settings', async () => {
+		const sandbox = makeFakeSandbox();
+		const compute: SandboxProvider = {
+			create: vi.fn(() => sandbox.instance),
+			connectExisting: () => sandbox.instance,
+			proxy: async () => null,
+			warmPool: { maxLifetimeMs: null },
+		};
+		const libraries = { bucket: new MemoryBucket(), compute };
+		const poolEnv = { ...env, MARIMOHUB_COMPUTE_BACKEND: 'library' };
+		const active = createFromEnv(
+			{ ...poolEnv, MARIMOHUB_COMPUTE_WARM_POOL_ENABLED: 'true' },
+			undefined,
+			{ libraries },
+		).warmPool!;
+		await active.sweep();
+		expect((await active.store.read()).pools[0].members).toHaveLength(1);
+		const disabled = createFromEnv(
+			{
+				...poolEnv,
+				MARIMOHUB_COMPUTE_WARM_POOL_ENABLED: 'false',
+				MARIMOHUB_COMPUTE_WARM_POOL_SIZE: '0',
+				MARIMOHUB_COMPUTE_WARM_POOL_PROFILES: 'unknown',
+			},
+			undefined,
+			{ libraries },
+		).warmPool!;
+		await disabled.sweep();
+		expect((await disabled.store.read()).pools[0].members).toEqual([]);
+		expect(sandbox.calls.destroy).toBe(1);
+		expect(sandbox.calls.exec).toEqual(['true']);
+	});
+
 	it('loads and wires an adapter end to end through the async API', async () => {
 		const deps = await createFromEnvAsync({
 			...env,
@@ -759,6 +911,28 @@ describe('createFromEnv sandbox-host isolation guard', () => {
 		MARIMOHUB_AUTH_ALLOWED_EMAIL_DOMAINS: 'example.com',
 	};
 
+	it('requires an isolated app URL for proxy-header auth without OIDC settings', () => {
+		const proxy = {
+			MARIMOHUB_AUTH_ALLOWED_EMAIL_DOMAINS: 'example.com',
+			MARIMOHUB_STORAGE_BACKEND: 'memory',
+			MARIMOHUB_ALLOW_EPHEMERAL_STORAGE: 'true',
+			MARIMOHUB_COMPUTE_BACKEND: 'none',
+			MARIMOHUB_AUTH_BACKEND: 'proxy-header',
+			MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME: 'kernels.example.net',
+		};
+		expect(() => createFromEnv(proxy)).toThrow(/MARIMOHUB_APP_BASE_URL/);
+		expect(() =>
+			createFromEnv({ ...proxy, MARIMOHUB_APP_BASE_URL: 'https://kernels.example.net' }),
+		).toThrow(/shares an origin/);
+		const deps = createFromEnv({
+			...proxy,
+			MARIMOHUB_APP_BASE_URL: 'https://hub.example.net',
+			MARIMOHUB_AUTH_PROXY_HEADER: 'X-Custom-Email, X-Custom-User',
+		});
+		expect(deps.sandbox.hostname).toBe('kernels.example.net');
+		expect(deps.sandbox.credentialHeaders).toEqual(['X-Custom-Email', 'X-Custom-User']);
+	});
+
 	it('throws when the sandbox host equals the app host', () => {
 		expect(() =>
 			createFromEnv({ ...env, MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME: 'hub.example.com' }),
@@ -777,6 +951,16 @@ describe('createFromEnv sandbox-host isolation guard', () => {
 			MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME: 'sandboxes.example.net',
 		});
 		expect(deps.sandbox.hostname).toBe('sandboxes.example.net');
+	});
+
+	it('allows the CKS app and sandbox sibling subdomains', () => {
+		const deps = createFromEnv({
+			...env,
+			MARIMOHUB_AUTH_OIDC_REDIRECT_URI:
+				'https://app.cwf663-marimohub.coreweave.app/api/auth/callback',
+			MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME: 'sandbox.cwf663-marimohub.coreweave.app',
+		});
+		expect(deps.sandbox.hostname).toBe('sandbox.cwf663-marimohub.coreweave.app');
 	});
 
 	it('is a no-op when no sandbox host is configured', () => {
@@ -1618,6 +1802,32 @@ describe('createFromEnv MCP config', () => {
 			}),
 		).toThrow(/credential-free HTTP\(S\) URL/);
 	});
+
+	it.each(['http://192.168.0.10:3901', 'http://hub.example.com', 'http://[::1]:3901'])(
+		'rejects plain HTTP outside localhost: %s',
+		(baseUrl) => {
+			expect(() =>
+				createFromEnv({
+					...baseEnv,
+					MARIMOHUB_MCP: 'on',
+					MARIMOHUB_APP_BASE_URL: baseUrl,
+				}),
+			).toThrow(/must use HTTPS when MARIMOHUB_MCP=on/);
+		},
+	);
+	it.each([
+		['http://localhost:3901', 'http://localhost:3901'],
+		['http://127.0.0.1:3901', 'http://127.0.0.1:3901'],
+		['http://LOCALHOST:3901', 'http://localhost:3901'],
+	])('accepts loopback HTTP: %s → %s', (baseUrl, expected) => {
+		expect(
+			createFromEnv({
+				...baseEnv,
+				MARIMOHUB_MCP: 'on',
+				MARIMOHUB_APP_BASE_URL: baseUrl,
+			}).mcp,
+		).toEqual({ publicBaseUrl: expected });
+	});
 });
 
 describe('external issuer MCP composition', () => {
@@ -1667,5 +1877,34 @@ describe('external issuer MCP composition', () => {
 				MARIMOHUB_AUTH_OIDC_ACCESS_TOKEN_AUDIENCE: 'hub-api',
 			}).mcp,
 		).toBeUndefined();
+	});
+	it('rejects plain HTTP even with an external issuer', () => {
+		expect(() =>
+			createFromEnv({
+				...env,
+				MARIMOHUB_APP_BASE_URL: 'http://hub.example.com/hub/',
+				MARIMOHUB_AUTH_OIDC_ACCESS_TOKEN_AUDIENCE: 'http://hub.example.com/hub/mcp',
+			}),
+		).toThrow(/must use HTTPS when MARIMOHUB_MCP=on/);
+	});
+});
+
+describe('createFromEnv boolean knobs', () => {
+	// Storage `memory` + compute `none` keep these tests free of S3/Modal config.
+	const baseEnv = {
+		MARIMOHUB_STORAGE_BACKEND: 'memory',
+		MARIMOHUB_ALLOW_EPHEMERAL_STORAGE: 'true',
+		MARIMOHUB_COMPUTE_BACKEND: 'none',
+		MARIMOHUB_AUTH_BACKEND: 'dev',
+	};
+
+	it('treats a case-variant "False" for MARIMOHUB_SESSION_CONNECTION_AWARE as off', () => {
+		const deps = createFromEnv({ ...baseEnv, MARIMOHUB_SESSION_CONNECTION_AWARE: 'False' });
+		expect(deps.sandbox.sessionLifetime?.connectionAware).toBe(false);
+	});
+
+	it('treats a case-variant "FALSE" for MARIMOHUB_AUTOMATIC_THUMBNAILS as off', () => {
+		const deps = createFromEnv({ ...baseEnv, MARIMOHUB_AUTOMATIC_THUMBNAILS: 'FALSE' });
+		expect(deps.sandbox.automaticThumbnails).toBe(false);
 	});
 });

@@ -40,6 +40,7 @@
  * `python3` is on the image PATH (see `portWaitCommand`).
  */
 import {
+	readBoundedFile,
 	buildFindFilesCommand,
 	buildGitCloneCommand,
 	classifyListFilesFailure,
@@ -50,18 +51,29 @@ import {
 	portWaitCommand,
 	removeUndefined,
 	shellQuote,
-	withEnvPrefix,
+	ShellEnvironment,
+	privateEnvironmentWriteCommand,
 	WRITE_CONCURRENCY,
 } from '@marimo-hub/compute-commons';
 import { Millis } from '@marimo-hub/core/duration';
 import type { SandboxId } from '@marimo-hub/core/ids';
 import type { Timings } from '@marimo-hub/core/timing';
 import { createK8sClient } from './client';
-import { resolveIngressTlsMode, validateIngressHostnameTemplate } from './shared';
-import type { K8sClient, K8sExecResult, K8sPodPhaseInfo, KubernetesConfig } from './shared';
+import { validatePodTemplate } from './podTemplate';
+import { MANAGED_BY_VALUE, resolveIngressTlsMode, validateIngressHostnameTemplate } from './shared';
+import type {
+	EnsureSandboxOptions,
+	K8sClient,
+	K8sExecResult,
+	K8sPodPhaseInfo,
+	KubernetesConfig,
+} from './shared';
 import { execResult, listFilesFailure, readFileFailure } from '@marimo-hub/core/ports/sandbox';
 export * from './shared';
+export { loadPodTemplateFile, parsePodTemplate, validatePodTemplate } from './podTemplate';
+export type { KubernetesPodTemplate } from './podTemplate';
 import type {
+	BoundedReadOptions,
 	ActiveSandbox,
 	ComputeResources,
 	CreateSandboxOptions,
@@ -252,8 +264,6 @@ class KubernetesSandboxInstance implements SandboxInstance {
 	private readonly surfacePorts: readonly number[];
 	private readonly subdomainExposure: boolean;
 	private resolved = false;
-	private env: Record<string, string> = {};
-	private envDefaults: Record<string, string> = {};
 	private execCount = 0;
 	private lastEnsureTimings?: Timings;
 	/** Latest Pod snapshot from the boot poll (uid + condition timestamps). */
@@ -263,6 +273,7 @@ class KubernetesSandboxInstance implements SandboxInstance {
 		private readonly id: SandboxId,
 		private readonly config: KubernetesConfig,
 		private readonly client: K8sClient,
+		private readonly existingOnly = false,
 	) {
 		this.name = resourceName(id);
 		this.namespace = config.namespace ?? 'default';
@@ -308,8 +319,9 @@ class KubernetesSandboxInstance implements SandboxInstance {
 	 */
 	private async ensure(): Promise<void> {
 		if (this.resolved) return;
-		const t0 = Date.now();
-		const { createdPod } = await this.client.ensure({
+		this.environment.invalidate();
+		const options: EnsureSandboxOptions = {
+			podTemplate: this.config.podTemplate,
 			name: this.name,
 			sandboxId: this.id,
 			ports: this.portSpecs(),
@@ -323,11 +335,36 @@ class KubernetesSandboxInstance implements SandboxInstance {
 			imagePullSecret: this.config.imagePullSecret,
 			imagePullPolicy: this.config.imagePullPolicy,
 			resources: this.config.resources,
-		});
+			extraLabels: this.config.extraLabels,
+			runAsUser: this.config.runAsUser,
+		};
+		if (this.existingOnly) {
+			const pod = await this.existingPod();
+			await this.client.reconcileRoutes(options);
+			const confirmed = await this.existingPod();
+			if (pod.uid !== confirmed.uid) {
+				throw new Error(`Kubernetes sandbox ${this.id} was replaced during reconnect`);
+			}
+			this.resolved = true;
+			return;
+		}
+		const t0 = Date.now();
+		const { createdPod } = await this.client.ensure(options);
 		const t1 = Date.now();
 		await this.waitForRunning();
 		this.resolved = true;
 		await this.recordEnsure(createdPod, t1 - t0, Date.now() - t1);
+	}
+
+	private async existingPod(): Promise<K8sPodPhaseInfo> {
+		const pod = await this.client.getPhase(this.name);
+		if (pod?.phase !== 'Running') {
+			throw new Error(`Kubernetes sandbox ${this.id} is no longer running`);
+		}
+		if (pod.managedBy !== MANAGED_BY_VALUE || pod.sandboxId !== this.id) {
+			throw new Error(`Kubernetes Pod ${this.name} does not belong to sandbox ${this.id}`);
+		}
+		return pod;
 	}
 
 	/**
@@ -445,10 +482,14 @@ class KubernetesSandboxInstance implements SandboxInstance {
 		);
 	}
 
-	/** Prefix accumulated env vars onto a shell command (exec carries no env). */
-	private withEnv(cmd: string): string {
-		return withEnvPrefix(cmd, this.env, this.envDefaults);
-	}
+	private readonly environment = new ShellEnvironment(async (path, content) => {
+		const result = await this.execInPod(privateEnvironmentWriteCommand(path), {
+			stdin: content,
+			timeout: 10_000,
+			maxOutputBytes: 64 * 1024,
+		});
+		if (result.exitCode !== 0) throw new Error('Could not prepare sandbox environment');
+	});
 
 	/**
 	 * Run a shell command in the Pod, counting the round-trip.
@@ -463,7 +504,12 @@ class KubernetesSandboxInstance implements SandboxInstance {
 	 */
 	private execInPod(
 		cmd: string,
-		opts?: { login?: boolean; stdin?: string | Uint8Array; timeout?: number },
+		opts?: {
+			login?: boolean;
+			stdin?: string | Uint8Array;
+			timeout?: number;
+			maxOutputBytes?: number;
+		},
 	): Promise<K8sExecResult> {
 		this.execCount++;
 		return this.client.exec(
@@ -472,15 +518,17 @@ class KubernetesSandboxInstance implements SandboxInstance {
 			opts?.stdin,
 			{
 				timeout: opts?.timeout,
+				maxOutputBytes: opts?.maxOutputBytes,
 			},
 		);
 	}
 
 	async exec(cmd: string, options?: ExecOptions): Promise<ExecResult> {
 		await this.ensure();
-		const res = await this.execInPod(this.withEnv(cmd), {
+		const res = await this.execInPod(await this.environment.command(cmd), {
 			login: true,
 			timeout: options?.timeout,
+			maxOutputBytes: options?.maxOutputBytes,
 		});
 		return execResult(res.exitCode === 0, res.stdout, res.stderr);
 	}
@@ -496,6 +544,10 @@ class KubernetesSandboxInstance implements SandboxInstance {
 				controller.close();
 			},
 		});
+	}
+
+	async readFileBounded(path: string, options: BoundedReadOptions): Promise<ReadFileResult> {
+		return readBoundedFile(path, options, (command, limits) => this.exec(command, limits));
 	}
 
 	async readFile(path: string): Promise<ReadFileResult> {
@@ -546,13 +598,7 @@ class KubernetesSandboxInstance implements SandboxInstance {
 	}
 
 	async setEnvVars(vars: Record<string, string>, options?: SetEnvVarsOptions): Promise<void> {
-		// Stored and applied as a shell prefix by withEnv(); the Pod env is fixed at
-		// create time and the provisioner never calls this on the hot path.
-		if (options?.onlyIfUnset) {
-			this.envDefaults = { ...this.envDefaults, ...vars };
-		} else {
-			this.env = { ...this.env, ...vars };
-		}
+		this.environment.setEnvVars(vars, options);
 	}
 
 	async mountBucket(_options: MountBucketOptions): Promise<void> {
@@ -571,13 +617,13 @@ class KubernetesSandboxInstance implements SandboxInstance {
 		await this.ensure();
 		const logFile = `/tmp/mh-proc-${++PROC_SEQ}.log`;
 		const cwd = options?.cwd ? `cd ${shellQuote(options.cwd)}; ` : '';
-		const processCommand = withEnvPrefix(cmd, removeUndefined(options?.env ?? {}));
+		const processCommand = await this.environment.command(cmd, removeUndefined(options?.env ?? {}));
 		// Launch marimo detached so it outlives this exec session (the kernel must keep
 		// serving after startProcess returns). setsid + redirect + background; echo PID.
 		// The OUTER shell is non-login (its stdout is the PID we parse); the inner
 		// detached shell is a login shell so profile-provided env reaches the kernel
 		// (its output goes to the log file, where profile noise is harmless).
-		const launch = `${cwd}setsid sh -lc ${shellQuote(this.withEnv(processCommand))} >${logFile} 2>&1 </dev/null & echo $!`;
+		const launch = `${cwd}setsid sh -lc ${shellQuote(processCommand)} >${logFile} 2>&1 </dev/null & echo $!`;
 		const started = await this.execInPod(launch);
 		const pid = started.stdout.trim();
 
@@ -663,7 +709,7 @@ class KubernetesSandboxInstance implements SandboxInstance {
 	async destroy(): Promise<void> {
 		// A removed hostname can leave an Ingress from earlier subdomain config.
 		// Proxy mode remains free of Ingress API access.
-		await this.client.delete(this.name, { ingress: this.subdomainExposure });
+		await this.client.delete(this.name, { ingress: this.subdomainExposure, sandboxId: this.id });
 		this.resolved = false;
 	}
 }
@@ -676,6 +722,9 @@ export class KubernetesCompute implements SandboxProvider {
 		private readonly config: KubernetesConfig,
 		client?: K8sClient,
 	) {
+		if (config.podTemplate !== undefined) {
+			this.config = { ...config, podTemplate: validatePodTemplate(config.podTemplate) };
+		}
 		const surfaced = (config.surfacePorts?.length ?? 0) > 0;
 		if ((config.exposureMode ?? 'subdomain') === 'subdomain' && config.hostname) {
 			const tlsMode = resolveIngressTlsMode(config.ingressTlsMode, config.tlsSecretName);
@@ -694,6 +743,18 @@ export class KubernetesCompute implements SandboxProvider {
 	}
 
 	create(id: SandboxId, options?: CreateSandboxOptions): SandboxInstance {
+		return this.instance(id, options);
+	}
+
+	connectExisting(id: SandboxId, options?: CreateSandboxOptions): SandboxInstance {
+		return this.instance(id, options, true);
+	}
+
+	private instance(
+		id: SandboxId,
+		options?: CreateSandboxOptions,
+		existingOnly = false,
+	): SandboxInstance {
 		const profileResources = kubernetesProfileResources(options?.resources);
 		const config =
 			options?.image || profileResources
@@ -714,7 +775,7 @@ export class KubernetesCompute implements SandboxProvider {
 							: {}),
 					}
 				: this.config;
-		return new KubernetesSandboxInstance(id, config, this.getClient());
+		return new KubernetesSandboxInstance(id, config, this.getClient(), existingOnly);
 	}
 
 	async proxy(_request: Request): Promise<Response | null> {

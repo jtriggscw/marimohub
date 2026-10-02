@@ -1,6 +1,8 @@
 import { Suspense } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { toast } from 'sonner';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { ThemeProvider } from '@/context/ThemeContext';
@@ -101,6 +103,18 @@ function setup(
 }
 
 describe('stakeholder apps', () => {
+	it('shares the app URL without exposing notebook actions', async () => {
+		const user = userEvent.setup();
+		const writeText = vi.spyOn(navigator.clipboard, 'writeText');
+		const success = vi.spyOn(toast, 'success');
+		setup(`${app.url}?id=123&access_token=evil&session_id=evil`);
+		await user.click(await screen.findByRole('button', { name: 'Share app' }));
+		expect(screen.getAllByRole('menuitem')).toHaveLength(1);
+		await user.click(screen.getByRole('menuitem', { name: 'Copy URL' }));
+		expect(writeText).toHaveBeenCalledWith(`${window.location.origin}${app.url}?id=123`);
+		expect(success).toHaveBeenCalledWith('App URL copied');
+	});
+
 	it('retries an initial gallery failure without navigating away', async () => {
 		const appsResponse = vi
 			.fn()
@@ -143,7 +157,7 @@ describe('stakeholder apps', () => {
 		fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
 		expect(await screen.findByRole('alert')).toHaveTextContent('Unable to load more apps');
 		expect(screen.getByRole('link', { name: /Forecast/ })).toBeVisible();
-		expect(screen.getByRole('textbox', { name: 'Search apps' })).toBeVisible();
+		expect(screen.getByRole('searchbox', { name: 'Search apps' })).toBeVisible();
 		fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
 		expect(await screen.findByRole('link', { name: /Revenue/ })).toBeVisible();
 		expect(screen.getByRole('link', { name: /Forecast/ })).toBeVisible();
@@ -186,9 +200,9 @@ describe('stakeholder apps', () => {
 		]);
 	});
 
-	it('groups apps by project and debounces searches while preserving the gallery', async () => {
+	it('labels apps by project and debounces searches while preserving the gallery', async () => {
 		const { fetch } = setup();
-		expect(await screen.findByRole('heading', { name: 'Analytics' })).toBeVisible();
+		expect(await screen.findByText('Analytics')).toBeVisible();
 		expect(screen.getByRole('link', { name: /Forecast/ })).toHaveAttribute('href', app.url);
 		const queries = () =>
 			fetch.mock.calls
@@ -197,7 +211,7 @@ describe('stakeholder apps', () => {
 				.map((url) => url.searchParams.get('q'));
 		vi.useFakeTimers();
 		try {
-			const input = screen.getByRole('textbox', { name: 'Search apps' });
+			const input = screen.getByRole('searchbox', { name: 'Search apps' });
 			fireEvent.change(input, { target: { value: 'miss' } });
 			await act(() => vi.advanceTimersByTimeAsync(100));
 			fireEvent.change(input, { target: { value: 'missing' } });

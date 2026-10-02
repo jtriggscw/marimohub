@@ -1,16 +1,15 @@
+import { PageTitle } from '@/components/ui/PageTitle';
 import { useQuery } from '@tanstack/react-query';
 import { Link, Navigate, useLocation, useParams } from 'react-router-dom';
 import { useAppQuery } from '@/api/apps';
 import { projectQueryOptions, useCapabilitiesQuery, useUserQuery } from '@/api/hooks';
 import { NotebookPage } from '@/components/NotebookPage/NotebookPage';
 import { NotebookFrame } from '@/components/NotebookPage/NotebookFrame';
+import { ShareUrlMenu } from '@/components/NotebookPage/ShareMenu';
 import { Button } from '@/components/ui';
 import { useTheme } from '@/context/ThemeContext';
-import { useCopyToClipboard } from '@/hooks/useCopyToClipboard';
 import { useNotebookSession } from '@/hooks/useNotebookSession';
 import { useNotebookFrameLocation } from '@/hooks/useNotebookFrameLocation';
-import { notebookQueryParams } from '@/lib/notebookUrls';
-import { withBasePath } from '@/lib/basePath';
 import { AppAccessError } from './AppsPage';
 
 export function AppEntryPage({
@@ -94,8 +93,6 @@ function StakeholderApp({
 		appHeartbeatIntervalSeconds: capabilities?.app_pool?.heartbeat_interval_seconds,
 	});
 	const { theme } = useTheme();
-	const location = useLocation();
-	const { copy } = useCopyToClipboard();
 	const {
 		iframeSrc: src,
 		frameKey,
@@ -104,21 +101,13 @@ function StakeholderApp({
 	} = useNotebookFrameLocation(sandboxUrl, theme, true);
 	return (
 		<div className="flex h-dvh flex-col">
-			<title>{title} · marimohub</title>
+			<PageTitle>{title}</PageTitle>
 			<header className="flex min-h-12 items-center gap-4 border-b px-4">
 				<Link to="/apps" className="text-sm text-muted-foreground hover:text-foreground">
 					Back to apps
 				</Link>
 				<h1 className="min-w-0 flex-1 truncate text-sm font-medium">{title}</h1>
-				<Button
-					onPress={() => {
-						const url = new URL(withBasePath(location.pathname), window.location.origin);
-						url.search = notebookQueryParams(location.search).toString();
-						void copy(url.toString());
-					}}
-				>
-					Copy link
-				</Button>
+				<ShareUrlMenu label="Share app" successMessage="App URL copied" />
 			</header>
 			{!canRun ? (
 				<p className="p-6">You cannot run this app.</p>

@@ -1,5 +1,7 @@
 import { createRoute, z } from '@hono/zod-openapi';
 import { ForbiddenError, NotFoundError, UserId } from '@marimo-hub/core';
+import type { AuthenticatedPrincipal } from '@marimo-hub/core';
+import { MAX_RESOLVED_USERS } from '@marimo-hub/core/constants';
 import {
 	authorizationService,
 	createApp,
@@ -7,6 +9,14 @@ import {
 	jsonContent,
 	UserResponseSchema,
 } from '../shared';
+import type { ApiDeps } from '../context';
+
+function parseUserIds(value = ''): string[] {
+	return value
+		.split(',')
+		.map((id) => id.trim())
+		.filter(Boolean);
+}
 
 // --- Route definitions ---
 
@@ -19,15 +29,20 @@ const resolveUsers = createRoute({
 	description:
 		'Batch-resolve opaque user ids (the auth `sub` stored as a notebook `author` ' +
 		'or session `user_id`) into `{ id, email, name, picture_url }`. Ids with no recorded ' +
-		'identity are omitted from the result map.',
+		'identity are omitted from the result map. Authenticated users may resolve display ' +
+		'identities without project membership. Credential grants still restrict lookup of other users.',
 	request: {
 		query: z.object({
 			ids: z
 				.string()
+				.refine(
+					(value) => parseUserIds(value).length <= MAX_RESOLVED_USERS,
+					`At most ${MAX_RESOLVED_USERS} user ids may be resolved at once`,
+				)
 				.optional()
 				.openapi({
 					param: { name: 'ids', in: 'query' },
-					description: 'Comma-separated user ids.',
+					description: `Comma-separated user ids. At most ${MAX_RESOLVED_USERS} non-empty ids; whitespace and empty entries are ignored.`,
 					example: 'user,sub-abc123',
 				}),
 		}),
@@ -37,7 +52,7 @@ const resolveUsers = createRoute({
 			z.object({ success: z.literal(true), data: z.record(z.string(), UserResponseSchema) }),
 			'Map of user id → resolved identity (unknown ids omitted)',
 		),
-		...errorResponses(401),
+		...errorResponses(401, 403, 404, 422),
 	},
 });
 
@@ -72,49 +87,44 @@ const searchUsers = createRoute({
 	},
 });
 
-// --- App ---
-
-const app = createApp();
-
-app.openapi(searchUsers, async (c) => {
-	const deps = c.get('deps');
-	const { identities, catalog } = deps.services;
-	const user = c.get('user');
-	const { q, limit } = c.req.valid('query');
+function authorizeDirectoryCredential(deps: ApiDeps, user: AuthenticatedPrincipal): void {
 	const authz = authorizationService(deps);
 	const credentialDecision = authz.credentialDecision(user, 'directory.search', {
 		kind: 'deployment',
 	});
 	if (!credentialDecision.allowed) {
 		if (credentialDecision.category === 'credential-resource') {
-			throw new NotFoundError('Directory search is not available');
+			throw new NotFoundError('Directory access is not available');
 		}
-		throw new ForbiddenError('Token grant does not permit user search');
+		throw new ForbiddenError('Token grant does not permit directory access');
 	}
+}
 
-	// The directory holds emails and names, so searching needs some standing.
-	// With a default role every authenticated user is already a collaborator on
-	// every project; under members-only, require at least one project involvement
-	// (decided from the catalog snapshot — no per-project loads) so a drive-by
-	// account cannot harvest the directory by substring.
+async function authorizeDirectory(deps: ApiDeps, user: AuthenticatedPrincipal): Promise<void> {
+	authorizeDirectoryCredential(deps, user);
+	const { catalog } = deps.services;
+	const authz = authorizationService(deps);
+
+	// Check the grant separately: project involvement must never broaden a token's authority.
 	const { credential: _credential, ...directorySubject } = user;
 	const directoryDecision = await authz.authorize(directorySubject, 'directory.search', {
 		kind: 'deployment',
 	});
-	if (!directoryDecision.allowed) {
-		const snapshot = await catalog.getCurrentSnapshot();
-		const email = user.email.toLowerCase();
-		const involved = snapshot.projects.some(
-			(p) =>
-				p.status !== 'deleted' &&
-				(p.owner === user.id ||
-					(p.member_ids ?? []).includes(user.id) ||
-					(p.member_emails ?? []).includes(email)),
-		);
-		if (!involved) {
-			throw new ForbiddenError('User search requires membership in at least one project');
-		}
+	if (!directoryDecision.allowed && !(await catalog.hasProjectInvolvement(user))) {
+		throw new ForbiddenError('User search requires membership in at least one project');
 	}
+}
+
+// --- App ---
+
+const app = createApp();
+
+app.openapi(searchUsers, async (c) => {
+	const deps = c.get('deps');
+	const { identities } = deps.services;
+	const user = c.get('user');
+	const { q, limit } = c.req.valid('query');
+	await authorizeDirectory(deps, user);
 
 	const matches = await identities.search(q, limit);
 	const data = matches.map(({ id, email, name, picture_url }) => ({
@@ -127,14 +137,14 @@ app.openapi(searchUsers, async (c) => {
 });
 
 app.openapi(resolveUsers, async (c) => {
-	const { identities } = c.get('deps').services;
+	const deps = c.get('deps');
+	const { identities } = deps.services;
+	const user = c.get('user');
 	const { ids } = c.req.valid('query');
 
-	const requested = (ids ?? '')
-		.split(',')
-		.map((s) => s.trim())
-		.filter(Boolean)
-		.map((s) => UserId.parse(s));
+	const requested = parseUserIds(ids).map((id) => UserId.parse(id));
+
+	if (requested.some((id) => id !== user.id)) authorizeDirectoryCredential(deps, user);
 
 	const resolved = requested.length > 0 ? await identities.getMany(requested) : [];
 

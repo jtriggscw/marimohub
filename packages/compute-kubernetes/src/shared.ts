@@ -6,12 +6,15 @@
 import type { Millis } from '@marimo-hub/core/duration';
 import type { SandboxExposureMode } from '@marimo-hub/core/ports/sandbox-exposure';
 import type { SandboxId } from '@marimo-hub/core/ids';
+import type { KubernetesPodTemplate } from './podTemplate';
 
 /** Label marking resources THIS deployment owns (selection + discovery/cleanup). */
 export const MANAGED_BY_LABEL = 'app.kubernetes.io/managed-by';
 export const MANAGED_BY_VALUE = 'marimohub';
 /** Annotation that carries the verbatim `SandboxId` for `listActive()` mapping. */
 export const SANDBOX_ID_ANNOTATION = 'marimohub.io/sandbox-id';
+export const SANDBOX_NAME_LABEL = 'marimohub.io/sandbox-name';
+export const KERNEL_CONTAINER_NAME = 'marimo';
 
 /** `imagePullPolicy` for the kernel container. See `defaultImagePullPolicy`. */
 export type ImagePullPolicy = 'Always' | 'IfNotPresent' | 'Never';
@@ -56,6 +59,21 @@ export function validateIngressAnnotations(value: unknown): Record<string, strin
 		throw new Error('annotations exceed the Kubernetes 256 KiB limit');
 	}
 	return entries.length === 0 ? undefined : Object.fromEntries(entries);
+}
+
+// Label values share the annotation name grammar (63 chars max) but may be empty.
+export function validateLabels(labels: Record<string, string>): void {
+	for (const [key, value] of Object.entries(labels)) {
+		try {
+			validateAnnotationKey(key);
+		} catch (cause) {
+			const detail = cause instanceof Error ? cause.message : String(cause);
+			throw new Error(detail.replaceAll('annotation', 'label'));
+		}
+		if (value !== '' && (value.length > 63 || !ANNOTATION_NAME.test(value))) {
+			throw new Error(`invalid label value "${value}" for key "${key}"`);
+		}
+	}
 }
 
 export function parseIngressAnnotations(
@@ -149,6 +167,7 @@ export interface KubernetesResources {
 }
 
 export interface KubernetesConfig {
+	podTemplate?: KubernetesPodTemplate;
 	/** How the kernel is exposed. Proxy mode routes through the internal Service. */
 	exposureMode?: SandboxExposureMode;
 	/** Namespace the kernel Pod/Service and optional Ingress are created in. Default `default`. */
@@ -191,6 +210,18 @@ export interface KubernetesConfig {
 	imagePullPolicy?: ImagePullPolicy;
 	/** CPU/memory/GPU requested for each kernel Pod. */
 	resources?: KubernetesResources;
+	/**
+	 * Extra labels applied to the kernel Pod/Service/Ingress. Clusters with
+	 * admission policies often require ownership labels on every object.
+	 */
+	extraLabels?: Record<string, string>;
+	/**
+	 * `runAsUser` for the kernel Pod's securityContext (with `runAsNonRoot` and a
+	 * matching `fsGroup`). Required by clusters whose admission policy rejects Pods
+	 * that do not pin a uid. `fsGroup` only affects mounted volumes; the image
+	 * must already grant this uid write access to its workdir.
+	 */
+	runAsUser?: number;
 	/** How long to wait for the Pod to reach `Running`. Default 2 minutes. */
 	podReadyTimeout?: Millis;
 }
@@ -204,6 +235,7 @@ export interface K8sExecResult {
 
 /** Everything `ensure()` needs to materialise a session's Pod/Service and optional Ingress. */
 export interface EnsureSandboxOptions {
+	podTemplate?: KubernetesPodTemplate;
 	/** Deterministic resource name (`mh-<sanitized id>`); also the Pod name for exec. */
 	name: string;
 	/** Verbatim `SandboxId`, stored in an annotation for `listActive()` mapping. */
@@ -224,6 +256,10 @@ export interface EnsureSandboxOptions {
 	imagePullSecret?: string;
 	imagePullPolicy?: ImagePullPolicy;
 	resources?: KubernetesResources;
+	/** Extra labels for the Pod/Service/Ingress (admission-policy ownership tags). */
+	extraLabels?: Record<string, string>;
+	/** `runAsUser` for the Pod securityContext; omit to leave it unset. */
+	runAsUser?: number;
 }
 
 /**
@@ -234,6 +270,8 @@ export interface EnsureSandboxOptions {
  * `Ready=False` must not be reported as readiness.
  */
 export interface K8sPodPhaseInfo {
+	managedBy?: string;
+	sandboxId?: string;
 	/** Pod phase (`Pending` | `Running` | `Succeeded` | `Failed` | `Unknown`). */
 	phase?: string;
 	/** UID of this Pod incarnation (a recreated Pod reuses the name, not the UID). */
@@ -257,6 +295,7 @@ export interface K8sSandboxInfo {
 
 export interface K8sExecOptions {
 	timeout?: number;
+	maxOutputBytes?: number;
 }
 
 /**
@@ -271,6 +310,8 @@ export interface K8sClient {
 	 * reconnect).
 	 */
 	ensure(options: EnsureSandboxOptions): Promise<{ createdPod: boolean }>;
+	/** Repair Service/Ingress routing without creating or replacing the Pod. */
+	reconcileRoutes(options: EnsureSandboxOptions): Promise<void>;
 	/** Pod phase + boot timestamps, or `undefined` if the Pod does not exist. */
 	getPhase(name: string): Promise<K8sPodPhaseInfo | undefined>;
 	/** Latest scheduler rejection for the Pod, when one exists. */
@@ -289,7 +330,7 @@ export interface K8sClient {
 		options?: K8sExecOptions,
 	): Promise<K8sExecResult>;
 	/** Delete the managed resources for a session. Idempotent (tolerates 404). */
-	delete(name: string, options: { ingress: boolean }): Promise<void>;
+	delete(name: string, options: { ingress: boolean; sandboxId: SandboxId }): Promise<void>;
 	/** List sandboxes THIS deployment owns (label-scoped), for the reconciler. */
 	list(): Promise<K8sSandboxInfo[]>;
 }

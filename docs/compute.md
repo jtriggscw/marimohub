@@ -104,6 +104,10 @@ MARIMOHUB_COMPUTE_PROFILE_OVERRIDE="editors"
 - Docker, Podman, Kubernetes, Modal, CoreWeave, and W&B apply profiles. Fargate
   applies CPU and memory profiles and rejects GPU values before launch. E2B,
   Cloudflare, local, and none ignore profiles and hide the feature from the UI.
+- An external library adapter applies CPU and memory profiles when it declares
+  `capabilities.computeProfiles`, and GPU profiles when it declares
+  `capabilities.gpuProfiles`. Otherwise it ignores profiles. See
+  [external adapter libraries](https://github.com/marimo-team/marimohub/blob/main/development_docs/ports.md#external-adapter-libraries).
 
 Docker and Podman enforce each container's limits but have no admission control.
 Ensure the host can accommodate the expected concurrency; N concurrent
@@ -177,3 +181,7 @@ After deploy:
 
 See [Troubleshooting -> Kernels won't start](./troubleshooting.md#kernels-wont-start)
 and [Sandbox image](./sandbox-image.md).
+
+## Warm sandbox pools
+
+CoreWeave and Kubernetes support opt-in [warm sandbox pools](./warm-pools.md). Pools keep the default image running for faster editor and app startup.

@@ -96,17 +96,18 @@ export default defineConfig({
 			{
 				text: 'Start',
 				link: '/getting-started',
-				activeMatch: '^/(getting-started|deployment-options|testing-locally)',
+				activeMatch: '^/(getting-started|feature-gallery|deployment-options|testing-locally)',
 			},
 			{
 				text: 'Configure',
 				activeMatch:
-					'^/(auth|service-accounts|storage|compute|editor-sessions|surfaces|sandbox-image|apps|thumbnails|jobs|ai|environment-and-access|integration-secrets|integrations|notifications|project-alerts|syncing|workload-identity-federation)',
+					'^/(auth|service-accounts|storage|compute|editor-sessions|surfaces|theming|sandbox-image|apps|thumbnails|jobs|ai|environment-and-access|integration-secrets|integrations|notifications|project-alerts|syncing|workload-identity-federation)',
 				items: [
 					{ text: 'Storage', link: '/storage' },
 					{ text: 'Compute', link: '/compute' },
 					{ text: 'Editor sessions', link: '/editor-sessions' },
 					{ text: 'Session surfaces', link: '/surfaces' },
+					{ text: 'Theming', link: '/theming' },
 					{ text: 'Auth', link: '/auth' },
 					{ text: 'Service accounts', link: '/service-accounts' },
 					{ text: 'Sandbox image', link: '/sandbox-image' },
@@ -126,11 +127,12 @@ export default defineConfig({
 			{ text: 'Deploy', link: '/deploying/', activeMatch: '^/deploying/' },
 			{
 				text: 'Operate',
-				activeMatch: '^/(security|operations|app-pools|troubleshooting)',
+				activeMatch: '^/(security|operations|app-pools|warm-pools|troubleshooting)',
 				items: [
 					{ text: 'Security', link: '/security' },
 					{ text: 'Operations', link: '/operations' },
 					{ text: 'App pools', link: '/app-pools' },
+					{ text: 'Warm sandbox pools', link: '/warm-pools' },
 					{ text: 'Troubleshooting', link: '/troubleshooting' },
 				],
 			},
@@ -155,6 +157,7 @@ export default defineConfig({
 				text: 'Start',
 				items: [
 					{ text: 'Overview', link: '/' },
+					{ text: 'Feature gallery', link: '/feature-gallery' },
 					{ text: 'Getting started', link: '/getting-started' },
 					{ text: 'Testing locally', link: '/testing-locally' },
 					{ text: 'Deployment options', link: '/deployment-options' },
@@ -167,6 +170,7 @@ export default defineConfig({
 					{ text: 'Compute', link: '/compute' },
 					{ text: 'Editor sessions', link: '/editor-sessions' },
 					{ text: 'Session surfaces', link: '/surfaces' },
+					{ text: 'Theming', link: '/theming' },
 					{ text: 'Auth', link: '/auth' },
 					{ text: 'Service accounts', link: '/service-accounts' },
 					{ text: 'Sandbox image', link: '/sandbox-image' },
@@ -204,6 +208,7 @@ export default defineConfig({
 					{ text: 'Security', link: '/security' },
 					{ text: 'Operations', link: '/operations' },
 					{ text: 'App pools', link: '/app-pools' },
+					{ text: 'Warm sandbox pools', link: '/warm-pools' },
 					{ text: 'Troubleshooting', link: '/troubleshooting' },
 				],
 			},

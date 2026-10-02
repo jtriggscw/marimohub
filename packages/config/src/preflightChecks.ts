@@ -15,11 +15,16 @@
  *   - `skipped` — not applicable to this backend.
  */
 import type { ApiDeps } from '@marimo-hub/api';
+import { isAnthropicBedrockModel } from '@marimo-hub/core';
 import type { CheckOutcome, PreflightCheck } from '@marimo-hub/core';
 import { authBackend, oidcLoginPolicySelected } from './auth';
 import { computeBackend } from './compute';
 import type { Env } from './env';
-import { checkSandboxHostIsolation } from './hostIsolation';
+import {
+	checkSandboxHostIsolation,
+	sandboxHostIsolationMessage,
+	sandboxHostIsolationRemediation,
+} from './hostIsolation';
 import { storageBackend } from './storage';
 
 const errMsg = (err: unknown) => (err instanceof Error ? err.message : String(err));
@@ -136,7 +141,8 @@ function checkIsolation(env: Env, deps: ApiDeps): CheckOutcome {
 	if (deps.sandbox.exposure?.mode !== 'subdomain') {
 		return { status: 'skipped', message: 'proxy mode is same-origin by design' };
 	}
-	const { isolated, sandboxHost, appHost } = checkSandboxHostIsolation(env);
+	const isolation = checkSandboxHostIsolation(env);
+	const { isolated, sandboxHost } = isolation;
 	if (isolated) {
 		return {
 			status: 'ok',
@@ -148,8 +154,8 @@ function checkIsolation(env: Env, deps: ApiDeps): CheckOutcome {
 	return {
 		status: 'fail',
 		fatal: true,
-		message: `kernel host ${sandboxHost} shares a domain with the app host ${appHost}`,
-		remediation: 'Serve kernels from a separate domain (e.g. sandboxes.example.net).',
+		message: sandboxHostIsolationMessage(isolation),
+		remediation: sandboxHostIsolationRemediation(isolation),
 	};
 }
 
@@ -314,6 +320,17 @@ async function checkObjectStorageWif(env: Env): Promise<CheckOutcome> {
  */
 async function checkAi(deps: ApiDeps): Promise<CheckOutcome> {
 	if (!deps.ai) return { status: 'skipped', message: 'managed AI disabled' };
+	if (
+		deps.ai.converse &&
+		isAnthropicBedrockModel(deps.ai.model) &&
+		deps.ai.allowedModels?.every(isAnthropicBedrockModel)
+	) {
+		// /models belongs to the separate OpenAI surface; a Converse probe requires billed inference.
+		return {
+			status: 'skipped',
+			message: 'Bedrock Converse inference access is checked on the first AI request',
+		};
+	}
 	const { upstreamBaseUrl, upstreamFetch } = deps.ai;
 	const url = `${upstreamBaseUrl}/models`;
 	const signed = upstreamFetch !== undefined;

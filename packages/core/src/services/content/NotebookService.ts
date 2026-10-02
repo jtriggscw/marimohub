@@ -256,6 +256,20 @@ export class NotebookService {
 		return { meta, readme, source };
 	}
 
+	async getNotebookMeta(projectId: ProjectId, notebookId: NotebookId): Promise<NotebookMeta> {
+		const key = paths.project(projectId).notebook(notebookId).meta;
+		const obj = await this.bucket.get(key);
+		if (!obj) throw new NotFoundError(`Notebook ${notebookId} not found`);
+		return readStored(NotebookMetaSchema, obj, key);
+	}
+
+	async getNotebookSource(projectId: ProjectId, notebookId: NotebookId): Promise<Source> {
+		const key = paths.project(projectId).notebook(notebookId).source;
+		const obj = await this.bucket.get(key);
+		if (!obj) throw new NotFoundError(`Notebook ${notebookId} not found`);
+		return readStored(SourceSchema, obj, key);
+	}
+
 	/**
 	 * The notebook's security-label override from `meta` alone — one object read
 	 * for the hot session/proxy gates, which must apply overrides without paying
@@ -267,12 +281,7 @@ export class NotebookService {
 		notebookId: NotebookId,
 		options: { includeDeleted?: boolean } = {},
 	): Promise<ResourceSecurityLabels | null> {
-		const nb = paths.project(projectId).notebook(notebookId);
-		const metaObj = await this.bucket.get(nb.meta);
-		if (!metaObj) {
-			throw new NotFoundError(`Notebook ${notebookId} not found`);
-		}
-		const meta = await readStored(NotebookMetaSchema, metaObj, nb.meta);
+		const meta = await this.getNotebookMeta(projectId, notebookId);
 		if (meta.status === 'deleted' && !options.includeDeleted) {
 			throw new NotFoundError(`Notebook ${notebookId} not found`);
 		}
@@ -364,6 +373,15 @@ export class NotebookService {
 		input: CreateNotebookInput,
 		actor: UserId,
 	): Promise<NotebookMeta> {
+		return this.createNotebookWithLabels(projectId, input, actor);
+	}
+
+	private async createNotebookWithLabels(
+		projectId: ProjectId,
+		input: CreateNotebookInput,
+		actor: UserId,
+		securityLabels?: ResourceSecurityLabels,
+	): Promise<NotebookMeta> {
 		const notebookId = createNotebookId();
 		const versionId = createVersionId();
 		const now = new Date().toISOString();
@@ -380,6 +398,7 @@ export class NotebookService {
 			runtime: input.runtime,
 			baseImage: input.base_image,
 			computeProfile: input.compute_profile,
+			securityLabels,
 		});
 
 		const source = localSource(versionId);
@@ -465,7 +484,7 @@ export class NotebookService {
 		]);
 		const deps = depsObj ? await depsObj.text() : '';
 
-		return this.createNotebook(
+		return this.createNotebookWithLabels(
 			projectId,
 			{
 				title: newTitle?.trim() || `${meta.title} (copy)`,
@@ -479,6 +498,7 @@ export class NotebookService {
 				compute_profile: meta.compute_profile,
 			},
 			actor,
+			meta.security_labels,
 		);
 	}
 
@@ -621,7 +641,8 @@ export class NotebookService {
 				assertWritable,
 			);
 		// Blob writes must share the read lease so content matches its update token.
-		if (input.code === undefined && input.readme === undefined) return update();
+		if (input.code === undefined && input.deps === undefined && input.readme === undefined)
+			return update();
 		return this.workspace.withMutation(projectId, notebookId, {}, (lease) =>
 			update(lease.heartbeat),
 		);
@@ -652,7 +673,8 @@ export class NotebookService {
 		if (source.type !== 'local' && (input.code !== undefined || input.deps !== undefined)) {
 			throw new ConflictError('Remote-backed notebook source is updated only by sync');
 		}
-		if (input.code !== undefined) await this.assertSourceUpdateAllowed(projectId, notebookId);
+		if (input.code !== undefined || input.deps !== undefined)
+			await this.assertSourceUpdateAllowed(projectId, notebookId);
 
 		const nb = paths.project(projectId).notebook(notebookId);
 		await assertWritable?.();
@@ -690,8 +712,12 @@ export class NotebookService {
 			await this.bucket.put(nb.readme, input.readme);
 		}
 
-		// Write new version if code changed
-		if (input.code !== undefined && source.type === 'local') {
+		const depsChanged =
+			input.code === undefined &&
+			input.deps !== undefined &&
+			input.deps !== (await this.resolveDeps(nb.deps, undefined));
+		if ((input.code !== undefined || depsChanged) && source.type === 'local') {
+			const code = input.code ?? (await this.getContentForSource(projectId, notebookId, source));
 			const versionId = createVersionId();
 
 			// Read once, before the Promise.all, so the read does not race the write
@@ -712,10 +738,10 @@ export class NotebookService {
 			const ver = nb.version(versionId);
 			await assertWritable?.();
 			await Promise.all([
-				this.bucket.put(nb.code, input.code),
+				this.bucket.put(nb.code, code),
 				this.bucket.put(nb.source, JSON.stringify(newSource)),
 				this.bucket.put(nb.deps, deps),
-				this.bucket.put(ver.code, input.code),
+				this.bucket.put(ver.code, code),
 				this.bucket.put(ver.deps, deps),
 				this.bucket.put(ver.meta, JSON.stringify(version)),
 			]);

@@ -5,6 +5,16 @@ import type { ConfigErrorOptions } from './errors';
 
 export type Env = Record<string, string | undefined>;
 
+export function aliasDeprecatedEnv(env: Env, key: string, legacyKey: string): Env {
+	if (env[key]?.trim() || !env[legacyKey]?.trim()) return env;
+	warnLegacyEnv(legacyKey, key);
+	return { ...env, [key]: env[legacyKey] };
+}
+
+export function warnLegacyEnv(legacyKey: string, key: string): void {
+	console.warn(`[marimohub] ${legacyKey} is deprecated; use ${key}.`);
+}
+
 /** Read a required env var or throw — the standard fail-fast for missing config. */
 export function required(env: Env, key: string): string {
 	const value = env[key];
@@ -38,9 +48,10 @@ export function parseList(raw: string | undefined): string[] | undefined {
 }
 
 /** Read a case-insensitive `true` or `false`; reject other non-empty values. */
-export function parseBool(env: Env, key: string): boolean {
+export function parseBool(env: Env, key: string, fallback = false): boolean {
 	const value = readFolded(env, key);
-	if (value === undefined || value === 'false') return false;
+	if (value === undefined) return fallback;
+	if (value === 'false') return false;
 	if (value === 'true') return true;
 	throw new ConfigError(`Invalid ${key}: ${env[key]} (expected true or false)`, { variable: key });
 }
@@ -63,8 +74,9 @@ export function parseOnOff(
 
 /** An integer env value; undefined if unset/empty. Throws on a non-integer. */
 export function parseIntEnv(env: Env, key: string): number | undefined {
-	const raw = env[key];
+	const raw = env[key]?.trim();
 	if (raw === undefined || raw === '') return undefined;
+	// Number('') and Number(' ') are 0, so the empty check above must come first.
 	const n = Number(raw);
 	if (!Number.isInteger(n))
 		throw new ConfigError(`Invalid ${key}: ${raw} (expected an integer)`, { variable: key });

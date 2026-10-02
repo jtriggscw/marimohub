@@ -72,7 +72,16 @@ cluster-specific scheduling is baked in; set `nodeSelector` / `tolerations` /
 ingress controller, cert-manager, and any kernel-namespace resources separately
 (see [Kubernetes](./kubernetes.md) and [CKS](./cks.md)).
 
+## Extra volumes
+
+Use `extraVolumes` and `extraVolumeMounts` to mount Secrets, ConfigMaps, or PVCs in
+API and maintenance pods. See the [chart reference](https://github.com/marimo-team/marimohub/blob/main/charts/marimohub/README.md#extra-volumes)
+for an example and constraints.
+
 ## ServiceAccount
+
+For CoreWeave CAIOS, see [Pod Identity for the API and maintenance pods](./cks.md#pod-identity-for-the-api-and-maintenance-pods)
+for the access policy, webhook installation, and `caios.coreweave.com/inject` annotation.
 
 The chart creates a ServiceAccount using its fullname by default. Use annotations
 to connect it to a cloud workload identity:

@@ -133,10 +133,21 @@ describe('AppSessionIndicator', () => {
 	});
 
 	it('opens a popover with attribution, connections, and controls', async () => {
-		renderIndicator(makeAppSession({ active_connections: 3 }));
+		renderIndicator(
+			makeAppSession({
+				active_connections: 3,
+				app_pool: { state: 'ready', users: 2, max_users: 4 },
+			}),
+		);
 		await userEvent.click(screen.getByRole('button'));
 
 		expect(await screen.findByText('App running')).toBeInTheDocument();
+		expect(screen.getByText('Started by')).toBeInTheDocument();
+		expect(screen.getByText('Up for')).toBeInTheDocument();
+		expect(screen.getByText('ready')).toBeInTheDocument();
+		expect(screen.getByText('2 / 4')).toBeInTheDocument();
+		expect(screen.getByText('ver-2')).toBeInTheDocument();
+		expect(screen.getByText('sess-app')).toBeInTheDocument();
 		expect(screen.getByText('~3')).toBeInTheDocument();
 		expect(screen.getByText('Restart')).toBeInTheDocument();
 		expect(screen.getByText('Stop')).toBeInTheDocument();
@@ -160,7 +171,7 @@ describe('AppSessionIndicator', () => {
 		await userEvent.click(screen.getByRole('button'));
 
 		expect(await screen.findByText('App running')).toBeInTheDocument();
-		expect(screen.queryByText(/New users receive the latest version/)).toBeNull();
+		expect(screen.queryByText(/New browser sessions receive the latest version/)).toBeNull();
 	});
 
 	it('shows the stale hint when the app trails the notebook head', async () => {
@@ -169,7 +180,9 @@ describe('AppSessionIndicator', () => {
 		});
 		await userEvent.click(screen.getByRole('button'));
 
-		expect(await screen.findByText(/New users receive the latest version/)).toBeInTheDocument();
+		expect(
+			await screen.findByText(/New browser sessions receive the latest version/),
+		).toBeInTheDocument();
 	});
 
 	it('does not suppress the stale hint during editing on a git-synced notebook', async () => {
@@ -180,7 +193,9 @@ describe('AppSessionIndicator', () => {
 		});
 		await userEvent.click(screen.getByRole('button'));
 
-		expect(await screen.findByText(/New users receive the latest version/)).toBeInTheDocument();
+		expect(
+			await screen.findByText(/New browser sessions receive the latest version/),
+		).toBeInTheDocument();
 	});
 
 	it('uses the shared compute drift presentation', async () => {
@@ -238,7 +253,7 @@ describe('AppSessionIndicator', () => {
 
 		await userEvent.click(trigger);
 		expect(await screen.findByRole('button', { name: 'Restart' })).toBeInTheDocument();
-		expect(screen.queryByText(/New users receive the latest version/)).toBeNull();
+		expect(screen.queryByText(/New browser sessions receive the latest version/)).toBeNull();
 
 		await userEvent.keyboard('{Escape}');
 		await waitFor(() =>
@@ -248,6 +263,8 @@ describe('AppSessionIndicator', () => {
 		head = 'ver-3';
 		await userEvent.click(trigger);
 
-		expect(await screen.findByText(/New users receive the latest version/)).toBeInTheDocument();
+		expect(
+			await screen.findByText(/New browser sessions receive the latest version/),
+		).toBeInTheDocument();
 	});
 });

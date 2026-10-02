@@ -9,6 +9,8 @@ import {
 	gitSourceUrl,
 	isGitHubRepoInput,
 	isRepoInput,
+	isValidRootPath,
+	normalizeRootPathInput,
 	providerLabel,
 	shortCommit,
 	versionCommit,
@@ -255,5 +257,42 @@ describe('versionCommit', () => {
 		expect(versionCommit({ message: 'Session save' })).toBeNull();
 		expect(versionCommit({ message: 'Sync not-a-sha!' })).toBeNull();
 		expect(versionCommit({ message: '' })).toBeNull();
+	});
+});
+
+describe('normalizeRootPathInput', () => {
+	it.each([
+		['apps/', 'apps'],
+		['  python/apps//  ', 'python/apps'],
+		['', ''],
+		['/', ''],
+	])('normalises %j to %j', (input, expected) => {
+		expect(normalizeRootPathInput(input)).toBe(expected);
+	});
+});
+
+describe('isValidRootPath', () => {
+	it.each(['', 'apps', 'apps/', 'python/apps', ' apps ', 'a-b.c_d', 'x/.github'])(
+		'accepts %j',
+		(input) => {
+			expect(isValidRootPath(input)).toBe(true);
+		},
+	);
+
+	it.each([
+		'/apps',
+		'..',
+		'../x',
+		'a/../b',
+		'.',
+		'a//b',
+		'a\\b',
+		'a\u0001b',
+		'apps\u007f',
+		'.git',
+		'x/.GIT',
+		'.Git/apps',
+	])('rejects %j', (input) => {
+		expect(isValidRootPath(input)).toBe(false);
 	});
 });

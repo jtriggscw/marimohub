@@ -14,6 +14,24 @@ Every marimohub configuration variable, grouped by category and backend. A categ
 
 🔒 marks a sensitive value (a secret).
 
+## Theme
+
+Deployment branding for the hub UI. All values are public. See the [theming guide](./theming.md) for examples and asset hosting.
+
+### Branding
+
+| Variable | Description | Required | Default | Example |
+| --- | --- | --- | --- | --- |
+| `MARIMOHUB_THEME_NAME` | Display name, browser-title suffix, and installed app name. | — | `marimohub` | `Research Hub` |
+| `MARIMOHUB_THEME_FAVICON` | SVG, PNG, or ICO favicon. Use an HTTPS URL or root-relative same-origin path. Falls back to the 192px app icon, then 512px, then the built-in favicon. | — | — | `https://hub.example.com/brand/favicon.svg` |
+| `MARIMOHUB_THEME_LOGO` | SVG or PNG logo that replaces the full icon and wordmark. Use an HTTPS URL or root-relative same-origin path. | — | — | `https://hub.example.com/brand/logo.svg` |
+| `MARIMOHUB_THEME_LOGO_DARK` | SVG or PNG logo for dark mode. Defaults to the main logo. | — | — | `https://hub.example.com/brand/logo-dark.svg` |
+| `MARIMOHUB_THEME_PRIMARY_COLOR` | Opaque #RGB or #RRGGBB color for actions, links, and focus. Generates readable light and dark palettes. | — | — | `#2563eb` |
+| `MARIMOHUB_THEME_SECONDARY_COLOR` | Opaque #RGB or #RRGGBB color for accents and surface tints. Defaults to the primary color. | — | — | `#7c3aed` |
+| `MARIMOHUB_THEME_PWA_ICON_192` | 192×192 PNG app icon. Use an HTTPS URL or root-relative same-origin path. Defaults to the built-in icon. | — | — | `https://hub.example.com/brand/icon-192.png` |
+| `MARIMOHUB_THEME_PWA_ICON_512` | 512×512 PNG app icon. Use an HTTPS URL or root-relative same-origin path. Defaults to the built-in icon. | — | — | `https://hub.example.com/brand/icon-512.png` |
+| `MARIMOHUB_THEME_APPLE_TOUCH_ICON` | 180×180 PNG Apple touch icon. Use an HTTPS URL or root-relative same-origin path. Falls back to the 192px app icon, then 512px, then the built-in icon. | — | — | `https://hub.example.com/brand/apple-touch-icon.png` |
+
 ## Storage
 
 Selected by `MARIMOHUB_STORAGE_BACKEND` (default `s3`); one of `s3`, `gcs`, `azure`, `fs`, `memory`, `library`, `r2`.
@@ -111,7 +129,10 @@ Read regardless of the selected compute backend.
 | Variable | Description | Required | Default | Example |
 | --- | --- | --- | --- | --- |
 | `MARIMOHUB_COMPUTE_IMAGE` | Container image with marimo + uv + python, or a comma-separated list of such images: the first is the default and the rest are selectable per notebook as base images. Required by the `modal` backend; recommended for `coreweave`. | — | — | `ghcr.io/orgname/marimo-sandbox:latest` |
-| `MARIMOHUB_COMPUTE_PROFILES` | Ordered named CPU, memory, and optional GPU profiles. Use `name:cpu=<cores>;mem=<Mi\|Gi\|Ti>;gpu=<type>[:<count>]`. The maximum GPU count is 8. The first profile is the default. Supported backends apply the selected profile when overrides are enabled. The Modal backend applies GPU requests. Other backends ignore GPU values and log a startup warning. | — | — | `small:cpu=1;mem=2Gi,gpu-large:cpu=8;mem=32Gi;gpu=A100` |
+| `MARIMOHUB_COMPUTE_PROFILES` | Ordered named CPU, memory, and optional GPU profiles. Use `name:cpu=<cores>;mem=<Mi\|Gi\|Ti>;gpu=<type>[:<count>]`. The maximum GPU count is 8. The first profile is the default. Supported backends apply the selected profile when overrides are enabled. The Modal backend, and library adapters that declare `gpuProfiles`, apply GPU requests. Other backends ignore GPU values and log a startup warning. | — | — | `small:cpu=1;mem=2Gi,gpu-large:cpu=8;mem=32Gi;gpu=A100` |
+| `MARIMOHUB_COMPUTE_WARM_POOL_ENABLED` | Keep unassigned CoreWeave or Kubernetes sandboxes ready for editor and app sessions. Requires a maintenance replica. Jobs, sandbox startup diagnostics, personal-home mounts, snapshot restores, and non-default images use cold creation. Idle sandboxes consume compute. | — | `false` | — |
+| `MARIMOHUB_COMPUTE_WARM_POOL_SIZE` | Positive integer target of idle sandboxes per selected profile, shared across all server replicas. Used only when warm pools are enabled. | — | `1` | — |
+| `MARIMOHUB_COMPUTE_WARM_POOL_PROFILES` | `default` warms the first compute profile; `all` warms every configured profile. With no profiles, warms adapter defaults. Each pool uses only the default image. | — | `default` | — |
 | `MARIMOHUB_COMPUTE_PROFILE_OVERRIDE` | Whether editors may choose a non-default compute profile per notebook (`none` or `editors`). | — | `none` | `editors` |
 | `MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME` | Public hostname used to expose kernel ports. | — | `'' (empty)` | `hub.example.com` |
 | `MARIMOHUB_COMPUTE_WORKDIR` | Working directory inside the sandbox where notebook files land and marimo runs. | — | `/workspace` | — |
@@ -138,6 +159,7 @@ CoreWeave Sandboxes via the `@coreweave/cwsandbox` SDK (Sandbox v1).
 | --- | --- | --- | --- | --- |
 | `MARIMOHUB_COMPUTE_COREWEAVE_API_KEY` 🔒 | CoreWeave Sandbox API key. | Yes | — | — |
 | `MARIMOHUB_COMPUTE_COREWEAVE_BASE_URL` | Override the CoreWeave Sandbox API base URL. | — | `https://api.cwsandbox.com (SDK default)` | — |
+| `MARIMOHUB_COMPUTE_COREWEAVE_DATA_PLANE_MODE` | Connection mode for exec, logs, and file transfers. `direct` requires runner mTLS and fails if unavailable. `auto` tries direct, then uses the Gateway if unavailable. `gateway` always uses the Gateway. Lifecycle calls still use the API. | — | `auto` | — |
 | `MARIMOHUB_COMPUTE_COREWEAVE_OWNER_TAG` | Tag applied to owned sandboxes for discovery and cleanup. | — | `marimohub` | — |
 | `MARIMOHUB_COMPUTE_COREWEAVE_HOSTNAME_TEMPLATE` | Template for the public kernel URL. Substitutes `{sandboxId}`, `{port}`, `{host}`, `{token}`. | — | `https://{sandboxId}-{port}.{host}` | — |
 | `MARIMOHUB_COMPUTE_COREWEAVE_RUNNER_ID` | Runner (by operator-assigned id) sandboxes schedule on — must name your CKS sandbox runner. A create without a runner id schedules on the CoreWeave-managed serverless pool, not your cluster. Set to an empty value to opt into serverless. | — | `marimohub` | — |
@@ -156,7 +178,7 @@ CoreWeave Sandboxes via the `@coreweave/cwsandbox` SDK (Sandbox v1).
 
 `MARIMOHUB_COMPUTE_BACKEND=wandb`
 
-CoreWeave Sandboxes via the W&B (Weights & Biases) gateway — the `coreweave` backend authenticated with a W&B API key. Kernel URLs are resolved automatically: the managed runner assigns each sandbox a public IP served over plain HTTP, so no sandbox hostname is needed. Profile/placement overrides, GPU requests, egress overrides, and CAIOS vending are not available through the gateway; use hub-minted WIF (docs/workload-identity-federation.md) for bucket access.
+CoreWeave Sandboxes via the W&B (Weights & Biases) gateway — the `coreweave` backend authenticated with a W&B API key. Kernel URLs are resolved automatically: the managed runner assigns each kernel an HTTPS endpoint, so no sandbox hostname is needed. Profile/placement overrides, GPU requests, egress overrides, and CAIOS vending are not available through the gateway; use hub-minted WIF (docs/workload-identity-federation.md) for bucket access.
 
 | Variable | Description | Required | Default | Example |
 | --- | --- | --- | --- | --- |
@@ -179,6 +201,7 @@ Modal sandboxes.
 | `MARIMOHUB_COMPUTE_MODAL_TOKEN_SECRET` 🔒 | Modal API token secret. | Yes | — | — |
 | `MARIMOHUB_COMPUTE_MODAL_ENVIRONMENT` | Runs Modal apps and sandboxes in this named environment instead of the workspace default. | — | — | `notebooks` |
 | `MARIMOHUB_COMPUTE_MODAL_APP_NAME` | Limits cleanup to sandboxes this deployment created, so it never stops others sharing the same Modal workspace. | — | — | `marimohub` |
+| `MARIMOHUB_COMPUTE_MODAL_SECRETS` | Comma-separated Modal secret names injected into every new sandbox, deployment-wide. Secrets must exist in the configured Modal environment. Unset or empty adds none. Every editor, app, and job sandbox in every project receives these values, and any notebook author can read them. Use project integration secret references for project-scoped credentials. | — | — | `shared-credentials,huggingface` |
 
 ### Docker
 
@@ -252,12 +275,15 @@ Native Kubernetes creates one keep-alive Pod and Service per session through `@k
 | `MARIMOHUB_COMPUTE_KUBERNETES_INGRESS_ANNOTATIONS` | JSON string map for each subdomain-mode Ingress. Proxy mode ignores it. Keys must use Kubernetes annotation syntax. The total size cannot exceed 256 KiB. | — | — | `{"route.openshift.io/termination":"edge"}` |
 | `MARIMOHUB_COMPUTE_KUBERNETES_INGRESS_TLS_MODE` | TLS mode for each subdomain-mode Ingress. `controller-default` emits `tls: [{}]`. `secret` uses `MARIMOHUB_COMPUTE_KUBERNETES_TLS_SECRET`. `disabled` requires an `http://` hostname template. Proxy mode ignores this value. `default` aliases `controller-default`. When unset, a configured secret selects `secret`. Otherwise, the controller default applies. | — | `secret when TLS secret is set, else controller-default` | `controller-default` |
 | `MARIMOHUB_COMPUTE_KUBERNETES_TLS_SECRET` | Wildcard TLS secret for each subdomain-mode Ingress. Proxy mode ignores it. This value requires `secret` mode and selects that mode when unset. | — | — | `marimo-kernels-wildcard-tls` |
+| `MARIMOHUB_COMPUTE_KUBERNETES_POD_TEMPLATE_FILE` | Path to a YAML or JSON partial Pod manifest, read at startup for new kernel Pods. Explicit configuration overrides template values. See [pod templates](compute.md#pod-templates) for an example, precedence, and compatibility limits. | — | — | `/etc/marimohub/kernel-pod.yaml` |
 | `MARIMOHUB_COMPUTE_KUBERNETES_SERVICE_ACCOUNT` | ServiceAccount the kernel Pod runs as. Omit for the namespace default. | — | — | `marimo-kernel` |
 | `MARIMOHUB_COMPUTE_KUBERNETES_IMAGE_PULL_SECRET` | `imagePullSecrets` name for pulling a private kernel image. | — | — | `regcred` |
 | `MARIMOHUB_COMPUTE_KUBERNETES_IMAGE_PULL_POLICY` | Kernel-container `imagePullPolicy`: `Always`, `IfNotPresent`, or `Never`. Defaults like Kubernetes: `Always` for a `:latest`/untagged image, `IfNotPresent` for a pinned tag or digest. Pin the image to skip the per-start registry round-trip. | — | `Always for :latest, else IfNotPresent` | `Always` |
 | `MARIMOHUB_COMPUTE_KUBERNETES_CPU` | CPU requested for each kernel Pod (Kubernetes quantity). | — | — | `2` |
 | `MARIMOHUB_COMPUTE_KUBERNETES_MEMORY` | Memory requested for each kernel Pod (Kubernetes quantity). | — | — | `4Gi` |
 | `MARIMOHUB_COMPUTE_KUBERNETES_GPU` | GPU count, mapped to the `nvidia.com/gpu` limit. | — | — | `1` |
+| `MARIMOHUB_COMPUTE_KUBERNETES_POD_LABELS` | Comma-separated `key=value` labels added to each kernel Pod, Service, and Ingress. Use for ownership labels that cluster admission policies require on every object. | — | — | `team=data,app.kubernetes.io/part-of=marimohub` |
+| `MARIMOHUB_COMPUTE_KUBERNETES_RUN_AS_USER` | Sets Pod `runAsUser`, matching `fsGroup`, and `runAsNonRoot` (false for UID `0`). Overrides these template fields only. Unset preserves the template security context. The UID needs write access to the image workdir. `fsGroup` affects mounted volumes only. | — | — | `1000` |
 | `MARIMOHUB_COMPUTE_KUBERNETES_POD_READY_TIMEOUT_SECONDS` | How long to wait for the kernel Pod to reach `Running`. | — | `120` | — |
 
 ### Local (dev only)
@@ -309,7 +335,7 @@ How running kernels are surfaced to the browser, agnostic of the compute backend
 
 `MARIMOHUB_SANDBOX_EXPOSURE=subdomain`
 
-The compute adapter's public kernel URL is used as-is. Set `MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME` to a domain separate from the app host.
+Uses the public kernel URL directly. Set `MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME` to a sibling subdomain or separate domain.
 
 _No environment variables to set here._
 
@@ -419,16 +445,17 @@ Server-wide settings; no backend selector.
 | --- | --- | --- | --- | --- |
 | `MARIMOHUB_EXPERIMENTS` | Comma-separated experimental feature IDs. Unknown or graduated IDs (such as the removed `duckdb-wasm-preview`) are ignored with a startup warning. No experiment currently gates behavior. | — | — | — |
 | `PORT` | Port the HTTP server listens on. | — | `3000` | — |
+| `MARIMOHUB_BIND_HOST` | IP address the HTTP server listens on. Unset listens on all interfaces; an empty value is rejected. Set `127.0.0.1` to accept only connections from the same host, such as a reverse proxy. In a container, leave it unset and publish the port on loopback instead (`-p 127.0.0.1:3000:3000`). | — | — | `127.0.0.1` |
 | `MARIMOHUB_APP_BASE_URL` | Public URL for browser links and the Node SPA base path. When the app uses a path prefix, set this variable. If unset, links use the request origin and the SPA uses `/`. | — | — | `https://hub.example.com/marimohub` |
 | `MARIMOHUB_STATIC_ROOT` | Directory containing the web UI's static files. | — | `./public` | — |
 | `MARIMOHUB_RUN_MAINTENANCE` | Run background maintenance (expiring old sessions, cleaning up sandboxes) on this replica only. | — | `false` | `true` |
 | `MARIMOHUB_MAX_SESSIONS_PER_USER` | Per-user concurrent session cap (`0` = unlimited). Counts `edit` sessions, and separately bounds the apps a single user may have started — the cost ceiling a user cannot escape by fanning apps out across projects (apps are also capped per project via `MARIMOHUB_MAX_APPS_PER_PROJECT`). | — | `10` | — |
 | `MARIMOHUB_MAX_APPS_PER_PROJECT` | Concurrent app (`mode: app`) sessions per project (`0` = unlimited). Counts physical sandboxes, including replicas and draining versions. | — | `5` | — |
-| `MARIMOHUB_APP_MAX_USERS_PER_SESSION` | Distinct accounts per sandbox. Unset means unlimited users in one current-version sandbox. | — | — | — |
+| `MARIMOHUB_APP_MAX_VISITS_PER_SESSION` | Browser sessions (managed page visits) per sandbox. Each tab consumes a slot, including tabs from the same account. Unset means unlimited. | — | — | — |
 | `MARIMOHUB_APP_MAX_SESSIONS_PER_VERSION` | Maximum unexpired starting reservations and ready sandboxes for one notebook’s current version. Draining versions and expired reservations awaiting cleanup do not count. Project and starter-user caps still apply to physical sandboxes. | — | — | — |
 | `MARIMOHUB_SESSION_MAX_LIFETIME_SECONDS` | marimohub-owned hard session lifetime: the lifecycle sweep gracefully saves + tears the session down at this deadline (extending while editors are still connected). Provider-side caps (CoreWeave/E2B) default to 2x this as an orphan backstop. | — | `14400` | — |
 | `MARIMOHUB_SESSION_IDLE_TIMEOUT_SECONDS` | Reap a session when its heartbeat is stale for this period and it has no active connections. Apps inherit this value unless MARIMOHUB_SESSION_APP_IDLE_TIMEOUT_SECONDS is set. Modal uses 1.5x the effective timeout as a provider fallback. | — | `1800` | — |
-| `MARIMOHUB_SESSION_APP_IDLE_TIMEOUT_SECONDS` | Time an app sandbox remains empty after its last account assignment expires, including reconnect grace, subject to connection protection. Falls back to MARIMOHUB_SESSION_IDLE_TIMEOUT_SECONDS (1800 seconds by default). Credential and provider lifetime limits still apply. | — | — | — |
+| `MARIMOHUB_SESSION_APP_IDLE_TIMEOUT_SECONDS` | Time an app sandbox remains empty after its last visit assignment expires, including reconnect grace, subject to connection protection. Falls back to MARIMOHUB_SESSION_IDLE_TIMEOUT_SECONDS (1800 seconds by default). Credential and provider lifetime limits still apply. | — | — | — |
 | `MARIMOHUB_AUTOMATIC_THUMBNAILS` | Capture saved HTML once at editor shutdown when Playwright and Chromium are already installed. Never executes notebook code. Set false to disable. | — | `true` | — |
 | `MARIMOHUB_SESSION_SNAPSHOT_INTERVAL_SECONDS` | Periodic save cadence for live sessions — the durability floor bounding what a hard kill (backstop, node loss, OOM) can lose. Unchanged notebooks are deduped (no spurious versions). `0` disables periodic snapshots. | — | `120` | — |
 | `MARIMOHUB_SESSION_LIFETIME_EXTENSION_SECONDS` | How far the session deadline slides each time the lifecycle sweep finds editors still connected at it. | — | `1800` | — |
@@ -443,7 +470,7 @@ Server-wide settings; no backend selector.
 | `MARIMOHUB_AUTHZ_SUBJECT_CONTEXT_LIBRARY` | The provider module as an npm package, ESM path, or file URL. This value is required for the `library` backend. The module runs with server privileges. Use only trusted, pinned code. | — | — | `/etc/marimohub/subject-context.mjs` |
 | `MARIMOHUB_VIEWER_MODE` | What a user whose effective role is `viewer` gets (static \| applications \| ephemeral-sandbox); each tier is a superset of the previous. `static` serves the last captured HTML snapshot (no compute, no code execution); `applications` also lets viewers use notebooks running as shared apps (note: the app kernel runs with the project’s integration secrets/federated credentials, so only enable it for audiences you trust with the app’s outputs); `ephemeral-sandbox` additionally provisions a real edit kernel whose edits are discarded on teardown (no version, snapshot, or workspace write-back). Applies to any effective viewer — via `MARIMOHUB_DEFAULT_ROLE=viewer` or an explicit viewer membership. Editors and above are unaffected. See [Auth -> What viewers see](./auth.md#what-viewers-see-marimohub_viewer_mode). | — | `static` | `applications` |
 | `MARIMOHUB_EDITOR_SANDBOX_SHARING` | Controls whether editors share one persistent sandbox per notebook (`shared`) or one editor owns it (`exclusive`). In `exclusive` mode, other editors can start temporary sandboxes or confirm a takeover. This setting does not affect apps or viewer sessions. See [Editor sessions](./editor-sessions.md). | — | `shared` | `exclusive` |
-| `MARIMOHUB_PERSIST_WORKSPACE` | Which sandbox working-dir files survive a session (source \| workspace). `source` persists only the source files (notebook.py + pyproject.toml); `workspace` also captures runtime files (e.g. generated data) into the notebook workspace on teardown and restores them on the next session. | — | `source` | `workspace` |
+| `MARIMOHUB_PERSIST_WORKSPACE` | Which sandbox working-dir files survive a session (source \| workspace). `source` persists only the source files (notebook.py + pyproject.toml). `workspace` also captures runtime files (e.g. generated data) into the notebook workspace on teardown and restores them on the next session. This includes hidden files such as `.env` and `.gitignore`, `.git/`, and `__marimo__/`. It excludes regenerable caches such as `.venv/`, `__pycache__/`, `node_modules/`, and `.pytest_cache/`. Any project member with read access can read the captured files, and every later session restores them. | — | `source` | `workspace` |
 | `MARIMOHUB_VERSION` | Build/deploy version (usually the short git SHA or release tag) shown in the UI footer and returned by `GET /api/v1/version`. Baked into the image at build time. | — | `dev` | `a1b2c3d` |
 | `MARIMOHUB_IMAGE` | Fully-qualified Docker image reference (`repo:tag`) the deployment runs, shown in the UI footer. Baked into the image at build time. | — | — | `ghcr.io/marimo-team/marimohub:a1b2c3d` |
 
@@ -455,7 +482,7 @@ The built-in OAuth 2.1 server exposes notebooks to MCP clients. MCP is off by de
 
 | Variable | Description | Required | Default | Example |
 | --- | --- | --- | --- | --- |
-| `MARIMOHUB_MCP` | Enables the MCP endpoint and OAuth server. Requires `MARIMOHUB_APP_BASE_URL`. Values: `on`, `off`. | — | `off` | `on` |
+| `MARIMOHUB_MCP` | Enables the MCP endpoint and OAuth server. Requires an HTTPS `MARIMOHUB_APP_BASE_URL` (plain http is accepted only for localhost and 127.0.0.1). Values: `on`, `off`. | — | `off` | `on` |
 
 ## Jobs
 
@@ -489,6 +516,7 @@ Create a GitHub App with Contents (read and write) and Pull requests (read and w
 | --- | --- | --- | --- | --- |
 | `MARIMOHUB_SOURCE_CONTROL_GITHUB_APP_ID` | Numeric app id from the GitHub App settings page. | — | — | `123456` |
 | `MARIMOHUB_SOURCE_CONTROL_GITHUB_APP_PRIVATE_KEY` 🔒 | PKCS8 or PKCS1 PEM private key downloaded for the GitHub App, or its single-line base64 encoding. Held by the server and never injected into notebook sandboxes. | — | — | `-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----` |
+| `MARIMOHUB_SOURCE_CONTROL_GITHUB_ALLOWED_REPOSITORIES` | Optional JSON array of `{resource, projects}` rules. Unset or blank policies keep shared access with a startup warning. `[]` denies all. See [GitHub project policies](syncing.md#github-project-policies) for syntax. | — | — | `[{"resource":"team/notebooks","projects":["proj-0000000000000000"]}]` |
 
 ## Workload Identity Federation
 
@@ -532,7 +560,7 @@ _No environment variables to set here._
 
 `MARIMOHUB_AI_BACKEND=bedrock`
 
-Uses the Amazon Bedrock OpenAI-compatible endpoint and signs requests with the runtime AWS identity. No Bedrock API key or AWS credential is injected into a sandbox.
+Uses Bedrock Converse for Claude chat and SQL generation, and the OpenAI-compatible endpoint for other requests. The runtime AWS identity authenticates requests. Credentials stay outside sandboxes.
 
 | Variable | Description | Required | Default | Example |
 | --- | --- | --- | --- | --- |
@@ -584,6 +612,7 @@ Resolve references with `backend: aws-sm`. The hub needs `secretsmanager:GetSecr
 | `MARIMOHUB_SECRETS_AWS_ACCESS_KEY_ID` 🔒 | Static credential for non-AWS deployments. Set it with the secret access key. Omit both to use the default AWS credential chain. | — | — | — |
 | `MARIMOHUB_SECRETS_AWS_SECRET_ACCESS_KEY` 🔒 | Static credential paired with the access key ID. | — | — | — |
 | `MARIMOHUB_SECRETS_AWS_CACHE_TTL_SECONDS` | Cache duration for resolved values. A value of `0` disables caching. | — | `0` | — |
+| `MARIMOHUB_SECRETS_AWS_ALLOWED_SECRETS` | Optional JSON array of `{resource, projects}` rules. Unset or blank policies keep shared access with a startup warning. `[]` denies all. See [AWS project policies](integration-secrets.md#aws-project-policies) for syntax. | — | — | `[{"resource":"prod/warehouse","projects":["proj-0000000000000000"]}]` |
 
 ### Kubernetes Secret references
 

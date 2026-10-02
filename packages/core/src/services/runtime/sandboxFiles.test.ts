@@ -1,7 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createNotebookId, createProjectId, createVersionId } from '../../ids';
 import { paths } from '../../paths';
-import { MAX_ARTIFACT_BYTES, MAX_WORKSPACE_FILE_BYTES } from '../../constants';
+import {
+	MAX_ARTIFACT_BYTES,
+	MAX_WORKSPACE_BYTES,
+	MAX_WORKSPACE_FILE_BYTES,
+	MAX_WORKSPACE_FILES,
+} from '../../constants';
 import {
 	bytesOfSize,
 	makeFakeSandbox,
@@ -9,7 +14,7 @@ import {
 	MemoryBucket,
 	RecordingBucket,
 } from '../../testing';
-import { execResult, listFilesFailure } from '../../ports/sandbox';
+import { execResult, listFilesFailure, readFileFailure } from '../../ports/sandbox';
 import {
 	WORKSPACE_DIRECTORY_MARKER,
 	workspaceDirectoryMarkerPath,
@@ -74,6 +79,24 @@ describe('restoreWorkspace', () => {
 		expect(stats.objectCount).toBe(1);
 		expect(fs.has('app.py')).toBe(true);
 		expect(fs.has('.git/HEAD')).toBe(false);
+	});
+
+	it('never restores stored Git hooks, at any depth', async () => {
+		const { nb } = nbCtx();
+		const bucket = new MemoryBucket();
+		await bucket.put(nb.workspaceFile('.git/HEAD'), 'ref: refs/heads/main\n');
+		await bucket.put(nb.workspaceFile('.git/hooks/post-checkout'), '#!/bin/sh\n');
+		await bucket.put(nb.workspaceFile(`.git/hooks/${WORKSPACE_DIRECTORY_MARKER}`), '');
+		await bucket.put(nb.workspaceFile('pkg/.git/hooks/pre-commit'), '#!/bin/sh\n');
+		const { instance, fs, calls } = makeFsSandbox();
+
+		const stats = await restoreWorkspace(instance, bucket, nb.workspacePrefix, MOUNT, {
+			requireComplete: true,
+		});
+
+		expect(stats.objectCount).toBe(1);
+		expect([...fs.keys()].filter((path) => path.includes('hooks'))).toEqual([]);
+		expect(calls.exec.some((command) => command.includes('hooks'))).toBe(false);
 	});
 
 	it('empty workspace: still creates the working dir marimo runs in', async () => {
@@ -385,7 +408,7 @@ describe('captureWorkspace', () => {
 		expect(await bucket.get(nb.code)).toBeNull();
 	});
 
-	it('workspace mode: captures runtime files but excludes source + __marimo__', async () => {
+	it('workspace mode: captures runtime files but excludes source files', async () => {
 		const { projectId, notebookId, nb } = nbCtx();
 		const bucket = new MemoryBucket();
 		const { instance } = makeFsSandbox({
@@ -405,11 +428,58 @@ describe('captureWorkspace', () => {
 			'a,b\n1,2\n',
 		);
 		expect(decode(await (await bucket.get(nb.workspaceFile('out.txt')))!.bytes())).toBe('hello');
-		// Source + __marimo__ excluded.
 		expect(await bucket.get(nb.code)).toBeNull();
 		expect(await bucket.get(nb.deps)).toBeNull();
-		expect(await bucket.get(nb.workspaceFile('__marimo__/notebook.html'))).toBeNull();
+		expect(await (await bucket.get(nb.workspaceFile('__marimo__/notebook.html')))?.text()).toBe(
+			'<html></html>',
+		);
 	});
+
+	it('captures and restores marimo state, dotfiles, and hidden directories', async () => {
+		const { projectId, notebookId, nb } = nbCtx();
+		const bucket = new MemoryBucket();
+		const files = {
+			'__marimo__/notebook.html': '<html>output</html>',
+			'__marimo__/session/notebook.py.json': '{"version":"1"}',
+			'__marimo__/cache/state.bin': new Uint8Array([0, 255, 128]),
+			'pkg/__marimo__/state.json': '{}',
+			'.env': 'EXAMPLE=value\n',
+			'.gitignore': '*.csv\n',
+			'.git/HEAD': 'ref: refs/heads/main\n',
+			'.git/objects/ab/cdef': new Uint8Array([0, 137, 254, 255]),
+			'pkg/.config/.settings': 'enabled=true\n',
+		};
+		const { instance, fs } = makeFsSandbox({ files });
+		const listFiles = vi.fn(instance.listFiles.bind(instance));
+
+		await captureWorkspace(
+			{ ...instance, listFiles },
+			bucket,
+			projectId,
+			notebookId,
+			MOUNT,
+			'workspace',
+		);
+
+		expect(listFiles).toHaveBeenCalledWith(MOUNT, { recursive: true, includeHidden: true });
+		const restored = makeFsSandbox();
+		await restoreWorkspace(restored.instance, bucket, nb.workspacePrefix, MOUNT);
+		expect(restored.fs).toEqual(fs);
+	});
+
+	it.each(['__marimo__/cache/state.bin', '.env', '.gitignore', '.git/HEAD', 'pkg/.config/file'])(
+		'mirror-deletes removed workspace file %s',
+		async (path) => {
+			const { projectId, notebookId, nb } = nbCtx();
+			const bucket = new MemoryBucket();
+			await bucket.put(nb.workspaceFile(path), 'old');
+			const { instance } = makeFsSandbox();
+
+			await captureWorkspace(instance, bucket, projectId, notebookId, MOUNT, 'workspace');
+
+			expect(await bucket.get(nb.workspaceFile(path))).toBeNull();
+		},
+	);
 
 	it('workspace mode: excludes regenerable .venv and __pycache__ (incl. nested) junk', async () => {
 		const { projectId, notebookId, nb } = nbCtx();
@@ -418,8 +488,15 @@ describe('captureWorkspace', () => {
 			files: {
 				'data/cars.csv': 'a,b\n',
 				'.venv/bin/python': 'binary',
+				'pkg/.venv/bin/python': 'binary',
 				'__pycache__/mod.cpython-312.pyc': 'bytecode',
 				'pkg/__pycache__/util.cpython-312.pyc': 'bytecode', // nested, not at root
+				'.pytest_cache/v/cache/lastfailed': '{}',
+				'.ruff_cache/0.5.0/x': 'cache',
+				'pkg/.mypy_cache/3.12/mod.json': '{}',
+				'.ipynb_checkpoints/nb-checkpoint.ipynb': '{}',
+				'web/node_modules/pkg/index.js': 'js',
+				'data/.DS_Store': 'finder',
 			},
 		});
 
@@ -428,8 +505,11 @@ describe('captureWorkspace', () => {
 		// Real data captured; venv + bytecode caches (root and nested) skipped.
 		expect(await bucket.get(nb.workspaceFile('data/cars.csv'))).not.toBeNull();
 		expect(await bucket.get(nb.workspaceFile('.venv/bin/python'))).toBeNull();
+		expect(await bucket.get(nb.workspaceFile('pkg/.venv/bin/python'))).toBeNull();
 		expect(await bucket.get(nb.workspaceFile('__pycache__/mod.cpython-312.pyc'))).toBeNull();
 		expect(await bucket.get(nb.workspaceFile('pkg/__pycache__/util.cpython-312.pyc'))).toBeNull();
+		const stored = (await bucket.list({ prefix: nb.workspacePrefix })).objects.map((o) => o.key);
+		expect(stored).toEqual([nb.workspaceFile('data/cars.csv')]);
 	});
 
 	it('workspace mode: round-trips binary files byte-identically', async () => {
@@ -592,15 +672,10 @@ describe('captureWorkspace', () => {
 			const { instance: base } = makeFsSandbox({ files: { 'good.txt': 'g', 'bad.txt': 'b' } });
 			const instance = {
 				...base,
-				exec: async (cmd: string) =>
-					cmd.startsWith('base64 -w0') && cmd.includes('bad.txt')
-						? {
-								success: false,
-								stdout: '',
-								stderr: 'io error',
-								error: { code: 'COMMAND_FAILED' },
-							}
-						: base.exec(cmd),
+				readFileBounded: async (
+					path: string,
+					options: Parameters<NonNullable<typeof base.readFileBounded>>[1],
+				) => (path.includes('bad.txt') ? readFileFailure() : base.readFileBounded!(path, options)),
 			} as unknown as typeof base;
 
 			await captureWorkspace(instance, bucket, projectId, notebookId, MOUNT, 'workspace');
@@ -612,7 +687,359 @@ describe('captureWorkspace', () => {
 	});
 });
 
+describe('captureWorkspace selection order', () => {
+	let warn: ReturnType<typeof vi.spyOn>;
+	beforeEach(() => {
+		warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+	});
+	afterEach(() => {
+		warn.mockRestore();
+	});
+
+	const storedKeys = async (bucket: MemoryBucket, prefix: string) =>
+		(await bucket.list({ prefix })).objects.map((o) => o.key.slice(prefix.length));
+
+	it('skips an oversized .git wholesale, keeps the stored copy, and still captures data listed later', async () => {
+		const { projectId, notebookId, nb } = nbCtx();
+		const bucket = new MemoryBucket();
+		await bucket.put(nb.workspaceFile('.git/HEAD'), 'ref: refs/heads/old\n');
+		await bucket.put(nb.workspaceFile('.git/objects/old'), 'old object');
+		const files: Record<string, string> = { '.git/HEAD': 'ref: refs/heads/main\n' };
+		for (let i = 0; i < MAX_WORKSPACE_FILES; i++) files[`.git/objects/${i}`] = 'x';
+		files['data/a.csv'] = 'a,b\n';
+		const { instance, calls } = makeFsSandbox({ files });
+
+		await captureWorkspace(instance, bucket, projectId, notebookId, MOUNT, 'workspace');
+
+		expect(await storedKeys(bucket, nb.workspacePrefix)).toEqual(
+			['.git/HEAD', '.git/objects/old', 'data/a.csv'].sort(),
+		);
+		expect(await (await bucket.get(nb.workspaceFile('.git/HEAD')))?.text()).toBe(
+			'ref: refs/heads/old\n',
+		);
+		expect(calls.readFile.filter((path) => path.includes('/.git/'))).toHaveLength(0);
+		const gitWarnings = warn.mock.calls.filter((args: unknown[]) =>
+			String(args[0]).includes('.git'),
+		);
+		expect(gitWarnings).toHaveLength(1);
+	});
+
+	it('captures a .git that fits the remaining budget, without its hooks', async () => {
+		const { projectId, notebookId, nb } = nbCtx();
+		const bucket = new MemoryBucket();
+		await bucket.put(nb.workspaceFile('.git/hooks/post-checkout'), '#!/bin/sh\n');
+		const { instance } = makeFsSandbox({
+			files: {
+				'.git/HEAD': 'ref: refs/heads/main\n',
+				'.git/objects/ab/cdef': new Uint8Array([1, 2, 3]),
+				'.git/hooks/pre-commit': '#!/bin/sh\nexit 1\n',
+				'app.py': 'print(1)',
+			},
+		});
+
+		await captureWorkspace(instance, bucket, projectId, notebookId, MOUNT, 'workspace');
+
+		expect(await storedKeys(bucket, nb.workspacePrefix)).toEqual(
+			['.git/HEAD', '.git/objects/ab/cdef', 'app.py'].sort(),
+		);
+		expect(warn).not.toHaveBeenCalled();
+	});
+
+	it('captures a nested repository that fits as a whole', async () => {
+		const { projectId, notebookId, nb } = nbCtx();
+		const bucket = new MemoryBucket();
+		const { instance } = makeFsSandbox({
+			files: {
+				'pkg/.git/HEAD': 'ref: refs/heads/main\n',
+				'pkg/.git/objects/ab/cdef': new Uint8Array([1, 2, 3]),
+				'pkg/.git/hooks/pre-commit': '#!/bin/sh\n',
+				'pkg/module.py': 'x = 1',
+			},
+		});
+
+		await captureWorkspace(instance, bucket, projectId, notebookId, MOUNT, 'workspace');
+
+		expect(await storedKeys(bucket, nb.workspacePrefix)).toEqual(
+			['pkg/.git/HEAD', 'pkg/.git/objects/ab/cdef', 'pkg/module.py'].sort(),
+		);
+		expect(warn).not.toHaveBeenCalled();
+	});
+
+	it('skips an oversized nested repository wholesale and keeps its stored copy', async () => {
+		const { projectId, notebookId, nb } = nbCtx();
+		const bucket = new MemoryBucket();
+		await bucket.put(nb.workspaceFile('pkg/.git/HEAD'), 'ref: refs/heads/old\n');
+		await bucket.put(nb.workspaceFile('pkg/.git/objects/old'), 'old object');
+		await bucket.put(nb.workspaceFile('pkg/.git/hooks/post-checkout'), '#!/bin/sh\n');
+		const files: Record<string, string> = {
+			'.git/HEAD': 'ref: refs/heads/main\n',
+			'pkg/.git/HEAD': 'ref: refs/heads/main\n',
+			'data/a.csv': 'a,b\n',
+		};
+		for (let i = 0; i < MAX_WORKSPACE_FILES; i++) files[`pkg/.git/objects/${i}`] = 'x';
+		const { instance, calls } = makeFsSandbox({ files });
+
+		await captureWorkspace(instance, bucket, projectId, notebookId, MOUNT, 'workspace');
+
+		expect(await storedKeys(bucket, nb.workspacePrefix)).toEqual(
+			['.git/HEAD', 'data/a.csv', 'pkg/.git/HEAD', 'pkg/.git/objects/old'].sort(),
+		);
+		expect(await (await bucket.get(nb.workspaceFile('pkg/.git/HEAD')))?.text()).toBe(
+			'ref: refs/heads/old\n',
+		);
+		expect(calls.readFile.filter((path) => path.includes('/pkg/.git/'))).toHaveLength(0);
+		const gitWarnings = warn.mock.calls.filter((args: unknown[]) =>
+			String(args[0]).includes('pkg/.git'),
+		);
+		expect(gitWarnings).toHaveLength(1);
+	});
+
+	it('spends the file budget on visible files, then __marimo__, then other hidden paths', async () => {
+		const { projectId, notebookId, nb } = nbCtx();
+		const bucket = new MemoryBucket();
+		const files: Record<string, string> = {
+			'.cache/hidden.bin': 'h',
+			'__marimo__/cache/state.bin': 'm',
+		};
+		for (let i = 0; i < MAX_WORKSPACE_FILES - 1; i++) files[`data/${i}.csv`] = 'x';
+		const { instance } = makeFsSandbox({ files });
+
+		await captureWorkspace(instance, bucket, projectId, notebookId, MOUNT, 'workspace');
+
+		const stored = await storedKeys(bucket, nb.workspacePrefix);
+		expect(stored).toHaveLength(MAX_WORKSPACE_FILES);
+		expect(stored).toContain('__marimo__/cache/state.bin');
+		expect(stored).not.toContain('.cache/hidden.bin');
+		expect(stored.filter((key) => key.startsWith('data/'))).toHaveLength(MAX_WORKSPACE_FILES - 1);
+	});
+});
+
+describe('workspace metadata edge cases', () => {
+	beforeEach(() => {
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+	});
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it('round-trips empty dotfiles and empty hidden or marimo directories', async () => {
+		const { projectId, notebookId, nb } = nbCtx();
+		const bucket = new MemoryBucket();
+		const directories = ['.git/refs/heads', 'pkg/.config', '__marimo__/cache'];
+		const { instance, fs } = makeFsSandbox({
+			files: { '.env': '', '.gitignore': '' },
+			directories,
+		});
+
+		await captureWorkspace(instance, bucket, projectId, notebookId, MOUNT, 'workspace');
+		const restored = makeFsSandbox();
+		await restoreWorkspace(restored.instance, bucket, nb.workspacePrefix, MOUNT);
+
+		expect(restored.fs).toEqual(fs);
+		expect(restored.calls.exec).toHaveLength(1);
+		for (const directory of directories) {
+			expect(restored.calls.exec[0]).toContain(`'${MOUNT}/${directory}'`);
+		}
+	});
+
+	it('source mode removes stored metadata without touching source files or versioned snapshots', async () => {
+		const { projectId, notebookId, nb } = nbCtx();
+		const bucket = new MemoryBucket();
+		const version = nb.version(createVersionId());
+		const files = {
+			'.env': 'EXAMPLE=value',
+			'.gitignore': '*.csv',
+			'.git/HEAD': 'ref: refs/heads/main',
+			'__marimo__/notebook.html': '<html>workspace</html>',
+			'__marimo__/session/notebook.py.json': '{}',
+		};
+		for (const [path, content] of Object.entries(files)) {
+			await bucket.put(nb.workspaceFile(path), content);
+		}
+		const preserved = [nb.code, nb.deps, version.html, version.session];
+		for (const key of preserved) await bucket.put(key, 'saved');
+		const { instance, calls } = makeFsSandbox({ files });
+
+		await captureWorkspace(instance, bucket, projectId, notebookId, MOUNT, 'source');
+
+		for (const path of Object.keys(files)) {
+			expect(await bucket.get(nb.workspaceFile(path))).toBeNull();
+		}
+		for (const key of preserved) expect(await (await bucket.get(key))?.text()).toBe('saved');
+		expect(calls.readFile).toHaveLength(0);
+	});
+
+	it('excludes Python artifacts inside hidden and marimo directories without excluding lookalikes', async () => {
+		const { projectId, notebookId, nb } = nbCtx();
+		const bucket = new MemoryBucket();
+		const excluded = ['.config/.venv/bin/python', '__marimo__/__pycache__/cache.pyc'];
+		const included = ['.venv-backup/config', '__pycache__.txt', '__marimo__/cache/value'];
+		const { instance, calls } = makeFsSandbox({
+			files: Object.fromEntries([...excluded, ...included].map((path) => [path, 'contents'])),
+			directories: ['.config/.venv', '__marimo__/__pycache__'],
+		});
+
+		await captureWorkspace(instance, bucket, projectId, notebookId, MOUNT, 'workspace');
+
+		expect(
+			(await bucket.list({ prefix: nb.workspacePrefix })).objects.map((o) => o.key).sort(),
+		).toEqual(included.map((path) => nb.workspaceFile(path)).sort());
+		for (const path of excluded) expect(calls.readFile).not.toContain(`${MOUNT}/${path}`);
+	});
+
+	it('never reads unsafe or reserved paths returned by the hidden-file listing', async () => {
+		const { projectId, notebookId, nb } = nbCtx();
+		const bucket = new MemoryBucket();
+		const unsafe = [
+			'.git/../../outside',
+			'/tmp/.env',
+			'.config/../outside',
+			'.git\\config',
+			'.env\nextra',
+			WORKSPACE_DIRECTORY_MARKER,
+			`.git/${WORKSPACE_DIRECTORY_MARKER}/config`,
+		];
+		const { instance, calls } = makeFsSandbox({
+			files: Object.fromEntries([...unsafe, '.git/config'].map((path) => [path, 'contents'])),
+		});
+
+		await captureWorkspace(instance, bucket, projectId, notebookId, MOUNT, 'workspace');
+
+		expect(calls.readFile).toEqual([`${MOUNT}/.git/config`]);
+		expect((await bucket.list({ prefix: nb.workspacePrefix })).objects.map((o) => o.key)).toEqual([
+			nb.workspaceFile('.git/config'),
+		]);
+	});
+
+	it.each(['NOT_FOUND', 'READ_FAILED', 'malformed base64'] as const)(
+		'preserves saved metadata after %s while saving readable siblings',
+		async (failure) => {
+			const { projectId, notebookId, nb } = nbCtx();
+			const bucket = new MemoryBucket();
+			const failedPaths = ['.env', '.git/objects/ab/cdef', '__marimo__/cache/state'];
+			for (const path of failedPaths) await bucket.put(nb.workspaceFile(path), 'last good');
+			await bucket.put(nb.workspaceFile('.git/refs/heads/deleted'), 'stale');
+			const { instance } = makeFsSandbox({
+				files: {
+					...Object.fromEntries(failedPaths.map((path) => [path, 'new'])),
+					'.gitignore': '*.csv',
+				},
+			});
+			const read = instance.readFileBounded!.bind(instance);
+			vi.spyOn(instance, 'readFileBounded').mockImplementation(async (path, options) => {
+				if (path === `${MOUNT}/.gitignore`) return read(path, options);
+				return failure === 'malformed base64'
+					? { success: true, content: '!!!!', encoding: 'base64' }
+					: readFileFailure(failure);
+			});
+
+			await captureWorkspace(instance, bucket, projectId, notebookId, MOUNT, 'workspace');
+
+			for (const path of failedPaths) {
+				expect(await (await bucket.get(nb.workspaceFile(path)))?.text()).toBe('last good');
+			}
+			expect(await (await bucket.get(nb.workspaceFile('.gitignore')))?.text()).toBe('*.csv');
+			expect(await bucket.get(nb.workspaceFile('.git/refs/heads/deleted'))).toBeNull();
+		},
+	);
+
+	it.each(['.git/objects/ab/cdef', '__marimo__/cache/state'])(
+		'preserves %s when its listed size exceeds the file limit',
+		async (path) => {
+			const { projectId, notebookId, nb } = nbCtx();
+			const bucket = new MemoryBucket();
+			await bucket.put(nb.workspaceFile(path), 'last good');
+			const { instance, calls } = makeFsSandbox({
+				files: { [path]: 'new', '.env': '' },
+				sizes: { [path]: MAX_WORKSPACE_FILE_BYTES + 1 },
+			});
+
+			await captureWorkspace(instance, bucket, projectId, notebookId, MOUNT, 'workspace');
+
+			expect(await (await bucket.get(nb.workspaceFile(path)))?.text()).toBe('last good');
+			expect(calls.readFile).not.toContain(`${MOUNT}/${path}`);
+			expect(await (await bucket.get(nb.workspaceFile('.env')))?.text()).toBe('');
+		},
+	);
+
+	it.each(['listing', 'read', 'upload'] as const)(
+		'preserves stored metadata and skips cleanup when %s throws',
+		async (stage) => {
+			const { projectId, notebookId, nb } = nbCtx();
+			const bucket = new MemoryBucket();
+			const stored = ['.env', '.git/HEAD', '__marimo__/cache/state'];
+			for (const path of stored) await bucket.put(nb.workspaceFile(path), 'last good');
+			const { instance } = makeFsSandbox({ files: { '.env': 'new' } });
+			const error = new Error(`${stage} unavailable`);
+			if (stage === 'listing') vi.spyOn(instance, 'listFiles').mockRejectedValue(error);
+			if (stage === 'read') vi.spyOn(instance, 'readFileBounded').mockRejectedValue(error);
+			if (stage === 'upload') vi.spyOn(bucket, 'put').mockRejectedValue(error);
+			const remove = vi.spyOn(bucket, 'delete');
+
+			await expect(
+				captureWorkspace(instance, bucket, projectId, notebookId, MOUNT, 'workspace'),
+			).rejects.toThrow(error);
+
+			for (const path of stored) {
+				expect(await (await bucket.get(nb.workspaceFile(path)))?.text()).toBe('last good');
+			}
+			expect(remove).not.toHaveBeenCalled();
+		},
+	);
+});
+
 describe('readSessionArtifacts', () => {
+	it.each(['READ_FAILED', 'BACKEND_ERROR'] as const)(
+		'rejects a notebook read failure with its adapter error code (%s)',
+		async (code) => {
+			const { instance } = makeFakeSandbox();
+			instance.readFileBounded = async () => readFileFailure(code);
+
+			await expect(readSessionArtifacts(instance, MOUNT)).rejects.toMatchObject({
+				code,
+				operation: 'sandbox.read_session_artifacts',
+				object: 'notebook.py',
+			});
+		},
+	);
+
+	it('logs a missing notebook and still returns optional artifacts', async () => {
+		const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+		try {
+			const { instance } = makeFakeSandbox({
+				files: { [`${MOUNT}/pyproject.toml`]: '[project]' },
+			});
+
+			expect(await readSessionArtifacts(instance, MOUNT)).toMatchObject({
+				code: undefined,
+				deps: '[project]',
+			});
+			expect(error).toHaveBeenCalledOnce();
+			expect(JSON.parse(error.mock.calls[0][0])).toMatchObject({
+				event: 'session_notebook_missing',
+				operation: 'sandbox.read_session_artifacts',
+				error: { code: 'NOT_FOUND', object: 'notebook.py' },
+			});
+		} finally {
+			error.mockRestore();
+		}
+	});
+
+	it('omits failed optional reads without rejecting the notebook capture', async () => {
+		const { instance } = makeFakeSandbox();
+		instance.readFileBounded = async (path) =>
+			path === `${MOUNT}/notebook.py`
+				? { success: true, content: 'saved' }
+				: readFileFailure('BACKEND_ERROR');
+
+		expect(await readSessionArtifacts(instance, MOUNT)).toEqual({
+			code: 'saved',
+			deps: undefined,
+			html: undefined,
+			session: undefined,
+		});
+	});
+
 	it('reads code, deps, and both __marimo__ snapshots when present', async () => {
 		const { instance } = makeFakeSandbox({
 			files: {
@@ -783,5 +1210,308 @@ describe('sandboxFiles security', () => {
 		await expect(restoreWorkspace(instance, bucket, nb.workspacePrefix, MOUNT)).rejects.toThrow(
 			'ECONNRESET',
 		);
+	});
+});
+
+describe('captureWorkspace mirror-delete after a skipped file', () => {
+	let warn: ReturnType<typeof vi.spyOn>;
+	beforeEach(() => {
+		warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+	});
+	afterEach(() => {
+		warn.mockRestore();
+	});
+
+	it('does not mirror-delete a still-present file whose read failed transiently', async () => {
+		const { projectId, notebookId, nb } = nbCtx();
+		const bucket = new MemoryBucket();
+		await bucket.put(nb.workspaceFile('data/keep.csv'), 'last good copy');
+		const { instance } = makeFsSandbox({
+			files: { 'notebook.py': 'import marimo', 'data/keep.csv': 'newer content' },
+		});
+		const read = instance.readFileBounded!.bind(instance);
+		instance.readFileBounded = async (path, options) => {
+			if (path.includes('data/keep.csv')) return readFileFailure();
+			return read(path, options);
+		};
+
+		await captureWorkspace(instance, bucket, projectId, notebookId, MOUNT, 'workspace');
+
+		const stored = await bucket.get(nb.workspaceFile('data/keep.csv'));
+		expect(decode(await stored!.bytes())).toBe('last good copy');
+		expect(warn).toHaveBeenCalledWith('captureWorkspace: could not read data/keep.csv; skipping');
+	});
+
+	it('does not mirror-delete a still-present file skipped by the per-file cap', async () => {
+		const { projectId, notebookId, nb } = nbCtx();
+		const bucket = new MemoryBucket();
+		await bucket.put(nb.workspaceFile('data/big.bin'), 'older smaller copy');
+		const { instance } = makeFsSandbox({
+			files: { 'notebook.py': 'import marimo', 'data/big.bin': 'x' },
+			sizes: { 'data/big.bin': MAX_WORKSPACE_FILE_BYTES + 1 },
+		});
+
+		await captureWorkspace(instance, bucket, projectId, notebookId, MOUNT, 'workspace');
+
+		const stored = await bucket.get(nb.workspaceFile('data/big.bin'));
+		expect(decode(await stored!.bytes())).toBe('older smaller copy');
+		expect(warn).toHaveBeenCalledWith(
+			`captureWorkspace: per-file cap (${MAX_WORKSPACE_FILE_BYTES}) exceeded; skipping data/big.bin (${MAX_WORKSPACE_FILE_BYTES + 1} bytes)`,
+		);
+	});
+});
+
+describe('capture transport budgets', () => {
+	it('rejects a notebook above the listed size limit without reading it', async () => {
+		const { instance } = makeFsSandbox({
+			files: { 'notebook.py': 'edited' },
+			sizes: { 'notebook.py': MAX_ARTIFACT_BYTES + 1 },
+		});
+		const read = vi.spyOn(instance, 'readFileBounded');
+
+		await expect(readSessionArtifacts(instance, MOUNT)).rejects.toMatchObject({
+			code: 'READ_FAILED',
+			object: 'notebook.py',
+		});
+		expect(read.mock.calls.some(([path]) => path.endsWith('/notebook.py'))).toBe(false);
+	});
+
+	it.each([
+		['text size limit', () => ({ content: 'x'.repeat(MAX_ARTIFACT_BYTES + 1) })],
+		[
+			'encoded base64 size limit',
+			() => ({
+				content: 'A'.repeat(4 * Math.ceil(MAX_ARTIFACT_BYTES / 3) + 4),
+				encoding: 'base64' as const,
+			}),
+		],
+		[
+			'decoded base64 size limit',
+			() => ({
+				content: 'A'.repeat(4 * Math.ceil(MAX_ARTIFACT_BYTES / 3)),
+				encoding: 'base64' as const,
+			}),
+		],
+		['decoded UTF-8 size limit', () => ({ content: 'é'.repeat(MAX_ARTIFACT_BYTES / 2 + 1) })],
+		['malformed base64', () => ({ content: '!!!!', encoding: 'base64' as const })],
+	] as const)('rejects notebook content refused for %s', async (_reason, content) => {
+		const { instance } = makeFakeSandbox();
+		instance.readFileBounded = async (path) =>
+			path === `${MOUNT}/notebook.py`
+				? { success: true, ...content() }
+				: readFileFailure('NOT_FOUND');
+
+		await expect(readSessionArtifacts(instance, MOUNT)).rejects.toMatchObject({
+			code: 'READ_FAILED',
+			object: 'notebook.py',
+		});
+	});
+
+	it.each(['source', 'workspace'] as const)(
+		'warns once without changing stored content when bounded reads are unsupported (%s)',
+		async (mode) => {
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			try {
+				const { projectId, notebookId, nb } = nbCtx();
+				const bucket = new MemoryBucket();
+				await bucket.put(nb.workspaceFile('previous.csv'), 'saved data');
+				const { instance } = makeFsSandbox({ files: { 'notebook.py': 'new code' } });
+				const bounded = instance.readFileBounded;
+				instance.readFileBounded = undefined;
+				const list = vi.spyOn(instance, 'listFiles');
+				const legacy = vi.spyOn(instance, 'readFile');
+				const exec = vi.spyOn(instance, 'exec');
+				expect(await readSessionArtifacts(instance, MOUNT)).toEqual({});
+				await captureWorkspace(instance, bucket, projectId, notebookId, MOUNT, mode);
+				await readSessionArtifacts(instance, MOUNT);
+				expect(warn).toHaveBeenCalledOnce();
+				expect(warn).toHaveBeenCalledWith(
+					expect.stringContaining(
+						'New sandbox changes will not be saved; stored content is preserved',
+					),
+				);
+				expect(list).not.toHaveBeenCalled();
+				expect(legacy).not.toHaveBeenCalled();
+				expect(exec).not.toHaveBeenCalled();
+				expect(await (await bucket.get(nb.workspaceFile('previous.csv')))!.text()).toBe(
+					'saved data',
+				);
+				instance.readFileBounded = bounded;
+				expect((await readSessionArtifacts(instance, MOUNT)).code).toBe('new code');
+			} finally {
+				warn.mockRestore();
+			}
+		},
+	);
+
+	it.each(['missing', 'failed', 'stale'] as const)(
+		'caps actual artifact bytes with %s listing metadata',
+		async (listing) => {
+			const { instance } = makeFsSandbox({
+				files: {
+					'notebook.py': 'saved',
+					'__marimo__/notebook.html': bytesOfSize(MAX_ARTIFACT_BYTES + 1),
+				},
+				sizes: { '__marimo__/notebook.html': 1 },
+			});
+			if (listing === 'missing') instance.listFiles = async () => ({ success: true, files: [] });
+			if (listing === 'failed') instance.listFiles = async () => listFilesFailure();
+			const legacy = vi.spyOn(instance, 'readFile');
+			const result = await readSessionArtifacts(instance, MOUNT);
+			expect(result.code).toBe('saved');
+			expect(result.html).toBeUndefined();
+			expect(legacy).not.toHaveBeenCalled();
+		},
+	);
+
+	it('omits malformed base64 while preserving other artifacts', async () => {
+		const { instance } = makeFsSandbox({
+			files: { 'notebook.py': 'saved', 'pyproject.toml': 'dependencies' },
+		});
+		const read = instance.readFileBounded!.bind(instance);
+		instance.readFileBounded = (path, options) =>
+			path.endsWith('.html')
+				? Promise.resolve({ success: true, content: '!!!!', encoding: 'base64' })
+				: read(path, options);
+		const result = await readSessionArtifacts(instance, MOUNT);
+		expect(result).toMatchObject({ code: 'saved', deps: 'dependencies', html: undefined });
+	});
+
+	it('propagates unexpected adapter failures so a save cannot silently lose changes', async () => {
+		const { instance } = makeFsSandbox();
+		instance.readFileBounded = async () => {
+			throw new Error('connection lost');
+		};
+		await expect(readSessionArtifacts(instance, MOUNT)).rejects.toThrow('connection lost');
+	});
+
+	it.each(['directory', 'symlink'] as const)(
+		'never reads artifacts listed as a %s',
+		async (type) => {
+			const { instance } = makeFsSandbox({ files: { 'notebook.py': 'saved' } });
+			const list = instance.listFiles.bind(instance);
+			instance.listFiles = async (...args) => {
+				const result = await list(...args);
+				return result.success
+					? { ...result, files: result.files.map((file) => ({ ...file, type })) }
+					: result;
+			};
+			const read = vi.spyOn(instance, 'readFileBounded');
+			await expect(readSessionArtifacts(instance, MOUNT)).rejects.toMatchObject({
+				code: 'READ_FAILED',
+			});
+			expect(read.mock.calls.some(([path]) => path.endsWith('/notebook.py'))).toBe(false);
+		},
+	);
+
+	it('reserves worst-case file bytes before reads and holds the slots until uploads finish', async () => {
+		const { projectId, notebookId } = nbCtx();
+		const { instance } = makeFsSandbox({
+			files: Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`file-${i}`, 'x'])),
+		});
+		const bucket = new MemoryBucket();
+		let releaseReads!: () => void;
+		let releaseUploads!: () => void;
+		const reads = new Promise<void>((resolve) => {
+			releaseReads = resolve;
+		});
+		const uploads = new Promise<void>((resolve) => {
+			releaseUploads = resolve;
+		});
+		const limits: number[] = [];
+		instance.readFileBounded = vi.fn(async (_path, { maxBytes }) => {
+			limits.push(maxBytes);
+			await reads;
+			return { success: true as const, content: 'x' };
+		});
+		const put = bucket.put.bind(bucket);
+		const upload = vi.spyOn(bucket, 'put').mockImplementation(async (...args) => {
+			await uploads;
+			return put(...args);
+		});
+		const capture = captureWorkspace(instance, bucket, projectId, notebookId, MOUNT, 'workspace');
+		await vi.waitFor(() =>
+			expect(limits).toHaveLength(MAX_WORKSPACE_BYTES / MAX_WORKSPACE_FILE_BYTES),
+		);
+		expect(limits.reduce((sum, limit) => sum + limit, 0)).toBeLessThanOrEqual(MAX_WORKSPACE_BYTES);
+		releaseReads();
+		await vi.waitFor(() => expect(upload).toHaveBeenCalledTimes(limits.length));
+		expect(limits).toHaveLength(MAX_WORKSPACE_BYTES / MAX_WORKSPACE_FILE_BYTES);
+		releaseUploads();
+		await capture;
+		expect(instance.readFileBounded).toHaveBeenCalledTimes(9);
+	});
+
+	it.each(['unsupported', 'refused'] as const)(
+		'preserves present workspace files with %s bounded reads',
+		async (kind) => {
+			const { projectId, notebookId, nb } = nbCtx();
+			const bucket = new MemoryBucket();
+			await bucket.put(nb.workspaceFile('data.csv'), 'previous');
+			const { instance } = makeFsSandbox({ files: { 'data.csv': 'new contents' } });
+			instance.readFileBounded = kind === 'unsupported' ? undefined : async () => readFileFailure();
+			const legacy = vi.spyOn(instance, 'readFile');
+			await captureWorkspace(instance, bucket, projectId, notebookId, MOUNT, 'workspace');
+			expect(await (await bucket.get(nb.workspaceFile('data.csv')))!.text()).toBe('previous');
+			expect(legacy).not.toHaveBeenCalled();
+		},
+	);
+
+	it('enforces the total workspace limit against actual concurrent reads and preserves skipped files', async () => {
+		const { projectId, notebookId, nb } = nbCtx();
+		const bucket = new MemoryBucket();
+		const files = Object.fromEntries(Array.from({ length: 5 }, (_, i) => [`file-${i}`, 'x']));
+		for (const name of Object.keys(files)) await bucket.put(nb.workspaceFile(name), 'previous');
+		const { instance } = makeFsSandbox({ files });
+		const content = 'x'.repeat(MAX_WORKSPACE_FILE_BYTES);
+		instance.readFileBounded = async () => ({ success: true, content });
+		const captured: { path: string; bytes: number }[] = [];
+		vi.spyOn(bucket, 'put').mockImplementation(async (path, bytes) => {
+			captured.push({ path, bytes: (bytes as Uint8Array).byteLength });
+			return {
+				key: path,
+				etag: 'captured',
+				size: (bytes as Uint8Array).byteLength,
+				uploaded: new Date(),
+			};
+		});
+		await captureWorkspace(instance, bucket, projectId, notebookId, MOUNT, 'workspace');
+		expect(captured).toHaveLength(4);
+		expect(captured.reduce((sum, file) => sum + file.bytes, 0)).toBe(MAX_WORKSPACE_BYTES);
+		const skipped = Object.keys(files).find(
+			(name) => !captured.some((file) => file.path === nb.workspaceFile(name)),
+		)!;
+		expect(await (await bucket.get(nb.workspaceFile(skipped)))!.text()).toBe('previous');
+	});
+
+	it('retains the last workspace copy when a file outgrows its listed size', async () => {
+		const { projectId, notebookId, nb } = nbCtx();
+		const bucket = new MemoryBucket();
+		await bucket.put(nb.workspaceFile('growing'), 'last good');
+		const { instance } = makeFsSandbox({
+			files: { growing: bytesOfSize(MAX_WORKSPACE_FILE_BYTES + 1), good: 'saved' },
+			sizes: { growing: 1 },
+		});
+		await captureWorkspace(instance, bucket, projectId, notebookId, MOUNT, 'workspace');
+		expect(await (await bucket.get(nb.workspaceFile('growing')))!.text()).toBe('last good');
+		expect(await (await bucket.get(nb.workspaceFile('good')))!.text()).toBe('saved');
+	});
+
+	it('never falls back to the legacy transport for unsupported or failed bounded reads', async () => {
+		const { instance } = makeFakeSandbox({ files: { [`${MOUNT}/notebook.py`]: 'code' } });
+		const legacy = vi.spyOn(instance, 'readFile');
+		expect(
+			(await readSessionArtifacts({ ...instance, readFileBounded: undefined }, MOUNT)).code,
+		).toBeUndefined();
+		await expect(
+			readSessionArtifacts(
+				{
+					...instance,
+					readFileBounded: async () => readFileFailure(),
+				},
+				MOUNT,
+			),
+		).rejects.toMatchObject({ code: 'READ_FAILED' });
+		expect(legacy).not.toHaveBeenCalled();
 	});
 });

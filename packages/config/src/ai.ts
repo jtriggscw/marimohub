@@ -6,10 +6,12 @@
  * there is no separate AI key to manage.
  */
 import type { ApiDeps } from '@marimo-hub/api';
-import { Seconds } from '@marimo-hub/core';
-import { createAwsSigV4Fetch } from '@marimo-hub/credentials-aws';
+import { Seconds, isAnthropicBedrockModel } from '@marimo-hub/core';
+import { awsDefaultCredentialProvider, createAwsSigV4Fetch } from '@marimo-hub/credentials-aws';
+import { createAmazonBedrock } from '@ai-sdk/amazon-bedrock';
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { generateText } from 'ai';
+import { converseChatCompletion } from './openaiToConverse';
 import { parseIntEnv, parseList, requiredVar } from './env';
 import type { Env } from './env';
 import { ConfigError } from './errors';
@@ -145,9 +147,10 @@ export function makeAi(env: Env): Pick<ApiDeps, 'ai'> {
 					docs: DOCS,
 				})
 			: undefined;
+	const awsCredentials = awsRegion !== undefined ? awsDefaultCredentialProvider() : undefined;
 	const upstreamFetch =
 		awsRegion !== undefined
-			? createAwsSigV4Fetch({ region: awsRegion, service: 'bedrock' })
+			? createAwsSigV4Fetch({ region: awsRegion, service: 'bedrock', credentials: awsCredentials })
 			: undefined;
 	const model = requiredVar(env, 'MARIMOHUB_AI_MODEL', {
 		remediation: 'Set the default upstream model id, e.g. gpt-4o-mini',
@@ -162,6 +165,14 @@ export function makeAi(env: Env): Pick<ApiDeps, 'ai'> {
 		headers: upstreamProject ? { 'OpenAI-Project': upstreamProject } : undefined,
 		fetch: upstreamFetch,
 	});
+	// Both Bedrock APIs share one refreshable credential provider.
+	const bedrockProvider =
+		awsRegion !== undefined
+			? createAmazonBedrock({
+					region: awsRegion,
+					credentialProvider: awsCredentials,
+				})
+			: undefined;
 	const maxTokens = parseIntEnv(env, 'MARIMOHUB_AI_MAX_TOKENS');
 	if (maxTokens !== undefined && (!Number.isSafeInteger(maxTokens) || maxTokens < 1)) {
 		throw new ConfigError(
@@ -182,9 +193,25 @@ export function makeAi(env: Env): Pick<ApiDeps, 'ai'> {
 			maxTokens,
 			rules: env.MARIMOHUB_AI_RULES,
 			tokenTtlSeconds: tokenTtl === undefined ? undefined : Seconds.of(tokenTtl),
+			converse:
+				bedrockProvider === undefined
+					? undefined
+					: (input) =>
+							converseChatCompletion({
+								model: bedrockProvider(input.model),
+								modelId: input.model,
+								payload: input.payload,
+								signal: input.signal,
+								maxOutputTokens: maxTokens,
+								onStreamError: input.onStreamError,
+							}),
 			async generateSql(input) {
+				const sqlModel =
+					bedrockProvider !== undefined && isAnthropicBedrockModel(model)
+						? bedrockProvider(model)
+						: provider.chatModel(model);
 				const result = await generateText({
-					model: provider.chatModel(model),
+					model: sqlModel,
 					instructions: sqlGenerationInstructions(input.dialect, env.MARIMOHUB_AI_RULES),
 					prompt: [
 						`Mode: ${input.mode}`,

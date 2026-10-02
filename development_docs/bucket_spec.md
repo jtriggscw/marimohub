@@ -218,7 +218,7 @@ created for combined workspace and Git inputs up to 32 MiB.
 | `_system/sessions/{pid}/{sid}.json`                                       | JSON     | Live session record, partitioned by project so a project-scoped read lists only `_system/sessions/{pid}/`. Created on notebook open, updated by heartbeat, and retired by an explicit stop or lifecycle deadline. Closing a browser tab does not immediately delete it.                                                                                                                                                                                                                                |
 | `_system/version-prune-cutoffs/{pid}/{nid}.json`                          | JSON     | Monotonic `{ cutoff_version_id }` advanced before pruning old version folders. A new source-pinned session writes its record and then rejects itself if its version is at or before the cutoff; otherwise a later cutoff advance must see and protect that session. CAS updates are owned by `SessionService`. Hard deletion removes the record.                                                                                                                                                       |
 | `_system/proposal-payloads/{pid}/{nid}/{proposal-id}.json`                | JSON     | Immutable expiry marker listing the temporary proposal change objects eligible for retention cleanup. It remains until every listed payload is deleted successfully.                                                                                                                                                                                                                                                                                                                                   |
-| `_system/app-pools/{pid}/{nid}.json`                                      | JSON     | Versioned pool record owned by `AppPoolStore`: reservations, account assignments, visit leases, and deletion tombstones. See [App pool records](#app-pool-records).                                                                                                                                                                                                                                                                                                                                    |
+| `_system/app-pools/{pid}/{nid}.json`                                      | JSON     | Versioned pool record owned by `AppPoolStore`: reservations, visit assignments, visit leases, and deletion tombstones. See [App pool records](#app-pool-records).                                                                                                                                                                                                                                                                                                                                      |
 | `_system/apps/{pid}/{nid}.json`                                           | JSON     | Legacy app-singleton claim, released through `SessionService` during pool migration. New app admissions use `_system/app-pools/{pid}/{nid}.json`. See §4.8.1.                                                                                                                                                                                                                                                                                                                                          |
 | `_system/editors/{pid}/{nid}.json`                                        | JSON     | Per-notebook persistent-editor claim. Records the shared/exclusive mode, names the only session allowed to save, and records idempotent takeover phases. All writes go through `SessionService`. See §4.8.2.                                                                                                                                                                                                                                                                                           |
 | `_system/identities/{user-id}.json`                                       | JSON     | User display identity (`{ id, email, name, picture_url?, suspended_at? }`). Owned and CAS-updated by `IdentityService`. Resolves opaque `author`/`user_id` IDs to a person and gates suspended users at authentication time.                                                                                                                                                                                                                                                                           |
@@ -260,7 +260,7 @@ created for combined workspace and Git inputs up to 32 MiB.
 | `projects/{pid}/notebooks/{nid}/versions/{vid}/pyproject.toml`            | TOML     | Dependency snapshot at time of version.                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `projects/{pid}/notebooks/{nid}/versions/{vid}/version.json`              | JSON     | Version metadata: saved_at, author, message, parent_id, optional snapshot descriptors.                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `projects/{pid}/notebooks/{nid}/versions/{vid}/workspace/`                | any      | Complete immutable tree from one Git sync. Present only for a `git` source version.                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `projects/{pid}/notebooks/{nid}/versions/{vid}/git/`                      | any      | Immutable credential-free `.git` payload for a pull-mode source version. Restored into the sandbox workdir at provision and pruned with the enclosing version.                                                                                                                                                                                                                                                                                                                                         |
+| `projects/{pid}/notebooks/{nid}/versions/{vid}/git/`                      | any      | Immutable credential-free `.git` payload for a pull-mode source version. Restored into the sandbox workdir at provision and pruned with the enclosing version. With a `root_path`, `.git` is restored to the Git root (the configured workdir) and the workspace to `<workdir>/<root_path>`.                                                                                                                                                                                                           |
 | `projects/{pid}/notebooks/{nid}/versions/{vid}/workspace.zip`             | ZIP      | Optional duplicate of the final synced sandbox tree used only as a startup fast path. Pull-mode Git metadata is stored under `.git/`. Canonical reads and fallback restores continue to use `workspace/` and `git/`.                                                                                                                                                                                                                                                                                   |
 | `projects/{pid}/notebooks/{nid}/versions/{vid}/notebook.html`             | HTML     | **Optional.** Rendered HTML snapshot, copied from `__marimo__/notebook.html` on session teardown. Immutable once written.                                                                                                                                                                                                                                                                                                                                                                              |
 | `projects/{pid}/notebooks/{nid}/versions/{vid}/session.json`              | JSON     | **Optional.** marimo session state (cell outputs), copied from `__marimo__/session/{notebook}.py.json` on teardown. Immutable.                                                                                                                                                                                                                                                                                                                                                                         |
@@ -496,7 +496,7 @@ When a session goes `failed`, `markFailed` may persist an optional sanitized `er
 2. A heartbeat updates `last_heartbeat`. The service coalesces bucket writes to one write per minute.
 3. `DELETE /sessions/{id}` changes the record to `terminating`. Teardown changes it to `terminated` after the sandbox is gone.
 4. The lifecycle sweep changes an overdue live session to `expired`.
-5. The reaper deletes old `terminated`, `failed`, and `expired` records after the retention period.
+5. The reaper deletes old `terminated`, `failed`, and `expired` records after the retention period. Records with a `sandbox_id` also require `sandbox_reclaimed_at`, which confirms sandbox destruction.
 
 > **On object storage vs. a live state store for sessions:** the object store is appropriate for session _records_ — created on open, updated periodically, read for display — and the record carries `sandbox_id` / `sandbox_url` pointing at the live kernel runtime (a separate container/compute service). It is not appropriate for sub-second kernel state (output streaming, variable inspection); that lives in the kernel runtime itself, backed by a low-latency state store (in-memory cache / stateful coordinator) if cross-request coordination is needed. For MVP — tracking who has what open, TTL cleanup — the object store is sufficient.
 
@@ -1172,6 +1172,8 @@ On teardown, **before destroying the sandbox**, the service:
 
 // 1. Always read the final notebook back (not only in the mount-fallback case),
 //    so the live workspace/notebook.py is persisted and the session's edits are captured.
+//    READ_FAILED / BACKEND_ERROR on notebook.py rejects capture so the caller can retry;
+//    NOT_FOUND logs `session_notebook_missing` and continues without code.
 read notebook.py, pyproject.toml from the sandbox workspace
 PUT projects/{pid}/notebooks/{nid}/workspace/notebook.py       // live code
 PUT projects/{pid}/notebooks/{nid}/workspace/pyproject.toml    // live deps
@@ -1196,11 +1198,13 @@ if exists __marimo__/session/{notebook}.py.json:
 patch versions/{vid}/version.json with html_snapshot / session_snapshot descriptors (§4.7)
 
 // 4. Capture the rest of the workspace IF PERSIST_WORKSPACE=workspace (best-effort).
-//    Source files (notebook.py / pyproject.toml) and __marimo__/ are excluded —
-//    they are persisted by steps 1–3 — as are regenerable Python artifacts
-//    (.venv/, __pycache__/). Everything else is mirrored into workspace/.
+//    Steps 1–2 own the root source files (notebook.py / pyproject.toml).
+//    Capture excludes those files, regenerable caches at any depth, and .git/hooks/.
+//    It includes __marimo__/ and hidden files, subject to path, file-type, and size limits.
+//    Budget order: visible files, __marimo__/, other hidden paths, then each .git/ (nested too) all-or-nothing.
+//    Step 3 separately saves only the selected HTML/session artifacts in versions/.
 if PERSIST_WORKSPACE == "workspace":
-  for each runtime file under the working dir (excluding notebook.py, pyproject.toml, __marimo__/, .venv/, __pycache__/):
+  for each eligible runtime file under the working dir (including hidden files and __marimo__/):
     PUT projects/{pid}/notebooks/{nid}/workspace/{path}    // binary-safe
   delete workspace/{path} objects no longer present in the sandbox  // mirror deletes
 
@@ -1223,8 +1227,8 @@ The version cut (steps 1–2) is the **durable record of the session's edits**, 
 | `workspace` | source files **plus** runtime files (e.g. `data/cars.csv`) | source files via the version cut, then mirror the rest of the working dir | brings back source **and** runtime files |
 
 - **Restore is unconditional.** On provision, the contents of `workspace/` are loaded into the sandbox working dir before marimo starts. Because `workspace/` reflects whatever was last captured, no mode branch is needed — `source` mode simply has only the two source files to restore.
-- **Capture is mode-gated and binary-safe.** Under `workspace`, every runtime file under the working dir (excluding `notebook.py`, `pyproject.toml`, `__marimo__/`, and regenerable Python artifacts `.venv/` / `__pycache__/`) is mirrored into `workspace/` byte-for-byte, so parquet, images, and `.db` files round-trip — not just UTF-8 text. **Mirror deletes** keep `workspace/` accurate: any `workspace/` object (other than the source files) no longer present in the sandbox is removed, which also cleans up stale data if a notebook is changed from `workspace` back to `source`.
-- **Caps.** Capture is bounded by a max total-bytes and max file-count limit; a file skipped because it would exceed the cap is logged (`console.warn`), never silently truncated.
+- **Capture is mode-gated and binary-safe.** Under `workspace`, capture copies runtime files from the working directory into `workspace/` without changing their bytes. This includes `__marimo__/`, hidden directories such as `.git/`, and dotfiles such as `.env` and `.gitignore`. Capture excludes the root source files (`notebook.py` and `pyproject.toml`), which the version cut saves separately. It also excludes regenerable directories at any depth (`.venv/`, `__pycache__/`, `.ipynb_checkpoints/`, `.mypy_cache/`, `.pytest_cache/`, `.ruff_cache/`, `node_modules/`) and `.DS_Store` files; the list lives in `packages/core/src/integrations/workspaceIgnore.ts` and proposal capture shares it. Capture never stores `.git/hooks/` at any depth, and restore never writes stored hooks back, because hooks are executable code. **Mirror deletes** remove stored runtime files that no longer exist in the sandbox. They leave the root source files and regenerable paths alone. A change from `workspace` to `source` also removes the stored runtime files.
+- **Caps.** Capture is bounded by a max total-bytes and max file-count limit; a file skipped because it would exceed the cap is logged (`console.warn`), never silently truncated. Selection is ordered so that caches cannot crowd out data: visible files first, then `__marimo__/`, then other hidden paths, in listing order within each group. `.git/` goes last and is all-or-nothing, because a partial repository restores corrupt. If the whole tree does not fit the remaining budget, capture skips it with one warning and keeps the stored `.git/` copy instead of mirror-deleting it. A stale but complete repository is safer than none. The same rule applies to each nested repository (`pkg/.git/`), decided separately after the root `.git/`.
 - **`workspace/` is never pruned.** Version pruning (§11) only reaps `versions/{vid}/`; the latest-only `workspace/` mirror is untouched.
 
 ---
@@ -1523,7 +1527,9 @@ authorization and have no public bucket URLs.
 ## App pool records
 
 `_system/app-pools/{pid}/{nid}.json` is a versioned CAS record owned by `AppPoolStore`.
-It stores sandbox reservations, account assignments, and per-visit leases together.
+It stores sandbox reservations, visit assignments, and per-visit leases together.
+Each assignment is scoped to `(user_id, visit_id)`. Its `visit_id` remains recorded during reconnect grace.
+Legacy assignments without `visit_id` split into one assignment per live visit before routing or expiry.
 `AppPoolService` applies the pure router decisions and coordinates session provisioning and retirement.
 Compute operations run outside CAS retries. Operation tokens fence late provisioning completions.
 Retiring members remain recorded until sandbox reclamation succeeds.
@@ -1533,3 +1539,20 @@ The empty deletion tombstone remains to prevent delayed admissions from recreati
 
 The legacy `_system/apps/{pid}/{nid}.json` claim remains owned by `SessionService` during migration.
 New pool members do not acquire that singleton claim. See [App pools](../docs/app-pools.md) for rollout and presence semantics.
+
+## Warm pool records
+
+`_system/warm-pools/{backend}.json` is a CAS record owned by `WarmPoolStore`.
+It stores pool configuration fingerprints, retry deadlines, and sandbox members.
+Member states are `creating`, `ready`, `claimed`, and `retiring`.
+
+Creation reservations precede provider calls. Claims record their destination session before session publication.
+An assigned claim remains until session reclamation, so an interrupted handoff does not lose ownership.
+Retiring records remain until provider deletion succeeds. A claimed sandbox never returns to `ready`.
+
+Orphan reconciliation discovers every record under `_system/warm-pools/` after its provider snapshot.
+A failed listing or unreadable warm record prevents orphan deletion during that sweep.
+Pool cleanup uses recorded sandbox IDs and does not require provider enumeration.
+
+The maintenance replica uses `_system/_warm_pool.lock` as its advisory lease.
+Pool CAS transitions remain authoritative when maintenance passes overlap.

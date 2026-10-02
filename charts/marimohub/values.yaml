@@ -4,7 +4,9 @@
 image:
   repository: ghcr.io/marimo-team/marimohub
   # Empty => use the chart's appVersion, so --version pins chart and image together.
-  tag: '@sha256:65768bd13e4d2de57df93db6c507335cf6193eeafea5f9f1d142bd703431ea23'
+  tag: ''
+  # When set, takes precedence over tag and appVersion.
+  digest: ''
   pullPolicy: IfNotPresent
 
 # Pull secrets for a private image; the public GHCR image needs none.
@@ -29,6 +31,18 @@ serviceAccount:
 # Ingress (pair with MARIMOHUB_COMPUTE_COREWEAVE_INGRESS_NAMESPACE).
 sandboxIngress:
   namespace: ''
+
+# Enabling requires images and a nodeSelector for the sandbox node pool.
+sandboxImagePrepuller:
+  enabled: false
+  images: []
+  nodeSelector: {}
+  tolerations: []
+  imagePullSecrets: []
+  pullPolicy: IfNotPresent
+  pauseImage: registry.k8s.io/pause:3.10
+  # Change when re-pulling a mutable tag; prefer immutable image digests.
+  revision: ''
 
 # Resolve integration credentials from explicitly named Kubernetes Secrets.
 # The chart grants get-only RBAC and passes the same project policy to the app.
@@ -116,7 +130,8 @@ extraEnv: []
 #  - name: MARIMOHUB_DEFAULT_ROLE
 #    value: editor
 
-# Extra volumes and mounts for both API and maintenance pods.
+# Applied to both API and maintenance pods, not notebook sandbox pods.
+# The chart reserves the volume name tmp and mount path /tmp.
 extraVolumes: []
 extraVolumeMounts: []
 
@@ -189,5 +204,7 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
+# Deployment metadata for both API and maintenance (e.g. reload controllers).
+deploymentAnnotations: {}
 podAnnotations: {}
 podLabels: {}

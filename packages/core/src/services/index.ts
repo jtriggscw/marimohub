@@ -272,6 +272,12 @@ export type {
 	WorkspaceLoadStrategy,
 } from './runtime/SandboxProvisioner';
 export { captureWorkspace, restoreWorkspace } from './runtime/sandboxFiles';
+export {
+	pullSourceGitOptions,
+	pullSourceRootPath,
+	sandboxWorkspaceLayout,
+} from './runtime/workspaceLayout';
+export type { SandboxWorkspaceLayout } from './runtime/workspaceLayout';
 export { ProxyExposure, SubdomainExposure } from './runtime/sandboxExposure';
 export {
 	ACTIVE_STATUSES,
@@ -328,6 +334,7 @@ export { resolveComputeProfile, toComputeResourceRecord } from './runtime/resolv
 export type { ComputeProfileConfig, ResolvedComputeProfile } from './runtime/resolveComputeProfile';
 export { resolveLaunchStrategyForSession } from './runtime/launchStrategy';
 export type { ResolvedLaunchStrategy } from './runtime/launchStrategy';
+export { resolveNotebookLaunchSource } from './runtime/notebookLaunchSource';
 export { buildMarimoLaunch } from './runtime/marimoLaunch';
 export type { MarimoLaunchMode, MarimoLaunchStrategyName } from './runtime/marimoLaunch';
 export { executeInActiveKernel, KernelDiscoveryTimeoutError } from './runtime/activeKernel';
@@ -373,6 +380,7 @@ export {
 	MARIMOHUB_AI_PROVIDER,
 } from './ai/aiSessionConfig';
 export type { AiSessionConfig, AiTokenClaims } from './ai/aiSessionConfig';
+export { isAnthropicBedrockModel } from './ai/bedrockModels';
 export {
 	assembleMarimoToml,
 	marimoConfigToSessionEnv,
@@ -386,7 +394,11 @@ export {
 	reapFilesystemSnapshots,
 	resolveRestoreSnapshot,
 } from './content/filesystemSnapshots';
-export { SessionService } from './runtime/SessionService';
+export {
+	isPastAuthorizationDeadline,
+	SessionService,
+	sessionWorkspaceDir,
+} from './runtime/SessionService';
 export { SessionRetirer, TakeoverRetirementError } from './runtime/SessionRetirer';
 export type { SessionRetirerDeps } from './runtime/SessionRetirer';
 export * from './runtime/surfaces';
@@ -658,3 +670,11 @@ export type {
 	AppPoolDecision,
 	AppRetirementDecision,
 } from './runtime/AppPoolRouter';
+
+export { WarmPoolStore, WarmPoolRecordSchema } from './runtime/WarmPoolStore';
+export {
+	WarmPoolService,
+	WarmPoolClaimExpiredError,
+	WARM_POOL_MAX_IDLE_MS,
+} from './runtime/WarmPoolService';
+export type { WarmPoolConfig, WarmPoolClaim, WarmPoolProfile } from './runtime/WarmPoolService';

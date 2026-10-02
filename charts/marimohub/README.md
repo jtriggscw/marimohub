@@ -60,6 +60,7 @@ Updater](https://argocd-image-updater.readthedocs.io/) or
 | --- | --- | --- |
 | `image.repository` | `ghcr.io/marimo-team/marimohub` | |
 | `image.tag` | `""` → chart `appVersion` | Override to decouple image from chart version |
+| `image.digest` | `""` | Optional `sha256:…` digest. Overrides the tag. |
 | `replicaCount` | `2` | Stateless API replicas |
 | `serviceAccount.create` / `.name` | `true` / `""` | Create a release-scoped account, or name an existing account |
 | `serviceAccount.annotations` | `{}` | Workload identity annotations, such as EKS IRSA or GKE Workload Identity |
@@ -74,6 +75,9 @@ Updater](https://argocd-image-updater.readthedocs.io/) or
 | `config` | see `values.yaml` | Non-secret `MARIMOHUB_*` → ConfigMap |
 | `secrets.existingSecret` | `""` | Secret you create with the secret vars (recommended) |
 | `secrets.data` | `{}` | Or let the chart create the Secret (dev) |
+| `extraVolumes` / `extraVolumeMounts` | `[]` / `[]` | Volumes and container mounts for API and maintenance pods |
+| `deploymentAnnotations` | `{}` | Metadata annotations on both API and maintenance Deployments |
+| `podAnnotations` | `{}` | Pod-template annotations on both API and maintenance pods |
 | `ingress.enabled` / `.className` / `.host` | `true` / `""` / `hub.example.com` | |
 | `ingress.tls.*` | enabled, `marimohub-tls` | |
 | `metrics.enabled` / `.port` | `false` / `9464` | Prometheus scrape mode; port exposed on the Service, never the ingress |
@@ -92,7 +96,53 @@ The chart sets `MARIMOHUB_RUN_MAINTENANCE` per deployment (`false` on API pods,
 `true` on the maintenance pod), overriding any value in `config`. The maintenance
 pod is pinned to one replica with the `Recreate` strategy — don't scale it.
 
+### Deployment annotations
+
+Controllers such as Stakater Reloader read annotations from the Deployment,
+not its pod template. Use `deploymentAnnotations` for these integrations:
+
+```yaml
+deploymentAnnotations:
+  reloader.stakater.com/auto: 'true'
+```
+
+This does not install a reload controller. `podAnnotations` remains separate;
+neither setting applies to notebook sandbox pods.
+
+### Extra volumes
+
+`extraVolumes` and `extraVolumeMounts` append Kubernetes volumes and mounts to API
+and maintenance pods only. Notebook sandbox pods are unaffected.
+
+To mount certificate files from an existing Secret:
+
+```yaml
+extraVolumes:
+  - name: certificates
+    secret:
+      secretName: marimohub-certificates
+extraVolumeMounts:
+  - name: certificates
+    mountPath: /etc/marimohub/certificates
+    readOnly: true
+```
+
+The volume name `tmp` and mount path `/tmp` are reserved. Referenced Secrets,
+ConfigMaps, and PVCs must exist in the release namespace. PVCs must support access
+from all API and maintenance pods.
+
 ### ServiceAccount
+
+For CoreWeave CAIOS, see [Pod Identity for the API and maintenance pods](../../docs/deploying/cks.md#pod-identity-for-the-api-and-maintenance-pods)
+for the access policy and webhook installation. Add the annotation in your chart values:
+
+```yaml
+serviceAccount:
+  create: true
+  name: marimohub
+  annotations:
+    caios.coreweave.com/inject: 'true'
+```
 
 By default, the chart creates a ServiceAccount using the chart fullname and uses
 it for both the API and maintenance pods. Add cloud workload identity annotations
@@ -153,3 +203,25 @@ The chart creates a Role and RoleBinding in each namespace. Each Role grants
 Label each Secret with `marimohub.io/integration-secret: "true"`. The
 [integration secret guide](../../docs/integration-secrets.md#kubernetes-secrets)
 explains locators, access rules, caching, and rotation.
+
+## Pre-pull sandbox images
+
+Enable the optional DaemonSet to download sandbox images before notebook launches.
+Select the sandbox node pool explicitly. Its placement is independent of the API pods.
+Enabling requires nonempty `images` and `nodeSelector` values.
+The DaemonSet uses the chart's `podSecurityContext`, including its non-root and seccomp defaults.
+
+```yaml
+sandboxImagePrepuller:
+  enabled: true
+  images:
+    - ghcr.io/marimo-team/marimo-sandbox:sha-YOUR_COMMIT
+  nodeSelector:
+    compute.coreweave.com/node-pool: marimohub-sandboxes
+  tolerations:
+    - operator: Exists
+```
+
+Use the same immutable image references as your compute configuration.
+For private images, set `sandboxImagePrepuller.imagePullSecrets` with secrets in the release namespace.
+For mutable tags, set `pullPolicy: Always` and change `revision` when the image changes.

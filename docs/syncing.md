@@ -11,10 +11,10 @@ description: Sync read-only notebooks into marimohub from external Git repositor
 marimohub can serve a notebook whose source of truth is an external **Git
 repository**. Choose a source mode when you create the notebook:
 
-| Mode   | Primary sync path               | Credential | Supported path  | Git metadata                    |
-| ------ | ------------------------------- | ---------- | --------------- | ------------------------------- |
-| `push` | CI upload or **Sync now**       | Sync token | Root or subtree | Only when the upload has `.git` |
-| `pull` | Create request and **Sync now** | GitHub App | Root only       | Included in every version       |
+| Mode   | Primary sync path               | Credential | Supported path   | Git metadata                    |
+| ------ | ------------------------------- | ---------- | ---------------- | ------------------------------- |
+| `push` | CI upload or **Sync now**       | Sync token | Root or subtree  | Only when the upload has `.git` |
+| `pull` | Create request and **Sync now** | GitHub App | Any subdirectory | Included in every version       |
 
 The source mode cannot change after creation. For a push source, **Sync now**
 updates the files but does not add Git metadata to the version.
@@ -83,7 +83,7 @@ Content-Type: application/json
 | `branch`         | yes      | Branch this notebook tracks.                                                              |
 | `root_path`      | no       | Repo subdirectory whose tree is mirrored. Defaults to the repo root (`""`).               |
 | `entry_notebook` | yes      | The notebook to open (`.py`, `.md`, `.markdown`, or `.qmd`), **relative to `root_path`**. |
-| `sync_mode`      | no       | `push` (default) or `pull`. Pull mode is GitHub-only and requires `root_path: ""`.        |
+| `sync_mode`      | no       | `push` (default) or `pull`. Pull mode is GitHub-only.                                     |
 
 `repo` accepts `owner/repo` or a repository URL. The shorthand refers to GitHub,
 unless `provider` is `gitlab`. GitLab URLs can contain nested groups, such as
@@ -114,7 +114,7 @@ only a SHA-256 of it.
 ### Pull mode: connect a GitHub repository
 
 Use pull mode when marimohub must sync the repository. Set `sync_mode` to
-`pull` and use an empty `root_path`:
+`pull`:
 
 ```json
 {
@@ -122,7 +122,7 @@ Use pull mode when marimohub must sync the repository. Set `sync_mode` to
 	"description": "Connected to the analytics repo",
 	"repo": "acme/analytics",
 	"branch": "main",
-	"root_path": "",
+	"root_path": "python",
 	"entry_notebook": "apps/dashboard.py",
 	"sync_mode": "pull"
 }
@@ -137,24 +137,31 @@ If the first pull fails, the response contains a draft notebook and
 `sync_error`. Correct the repository coordinates or GitHub App access. Then use
 **Sync now** to retry.
 
-Pull mode supports only the repository root in v1. Put the full
-repository-relative path in `entry_notebook`. For example, use
-`apps/dashboard.py` instead of `root_path: "apps"`.
+`root_path` selects the subtree to mirror, such as the `python/` directory of a
+monorepo. The workspace contains only that subtree, and `entry_notebook` is
+relative to it. Leave it empty to mirror the whole repository.
 
 Each pull stores a shallow, credential-free Git directory for the exact commit.
-marimohub restores this directory into the session workspace. Session startup
-fails if the Git directory cannot be restored completely. The GitHub
-installation token stays on the server.
+marimohub restores this directory into the session workspace. With a
+`root_path`, `.git` sits above the workspace and the session runs from the
+subtree under a sparse checkout, so `git status` reports only changes inside
+it. The sparse checkout is best-effort. If it fails, `git status` reports the
+rest of the repository as deleted. Proposals still contain only changes inside
+the subtree, because capture runs with `--relative`. Session startup fails if
+the Git directory cannot be restored completely.
+The GitHub installation token stays on the server.
 
 Git data larger than 25 MB is rejected. Use push mode for a repository that
-exceeds this limit.
+exceeds this limit. The stored `.git` covers the whole repository, not only
+`root_path`. Large monorepos, the main use of `root_path`, can exceed this
+limit.
 
 ### View or edit sync settings
 
-In the notebook menu, open **Sync settings** to view the repository, branch,
-repository folder, entry notebook, and last successful sync. Push sources also
-show the sync URL and token controls. Project editors can change the four source
-coordinates:
+In the project list, open the notebook's actions menu and choose **Sync
+settings**. It shows the repository, branch, repository folder, entry notebook,
+and last successful sync. Push sources also show the sync URL and token
+controls. Project editors can change the four source coordinates:
 
 ```http
 PATCH /api/v1/projects/{pid}/notebooks/{nid}/source
@@ -171,9 +178,9 @@ Content-Type: application/json
 For an existing custom-host source, a bare `owner/repo` continues to use that
 host. GitHub.com shorthand remains bare.
 
-The source mode cannot change. A pull source must continue to use the repository
-root and a supported GitHub.com repository. marimohub rejects unsupported source
-changes before it stores them.
+The source mode cannot change. A pull source must continue to use a supported
+GitHub.com repository. marimohub rejects unsupported source changes before it
+stores them.
 
 Before the first successful sync, changes take effect immediately. After that,
 changes remain pending until a CI upload or server sync matches the new source
@@ -214,9 +221,11 @@ time and does not change notebook state. Pending source settings always set
 `in_sync` to `false`.
 
 The sync endpoint reads the repository tree at the resolved commit. It applies
-the push-sync file-count and size limits to files under `root_path`. For a push
-source, files outside `root_path` do not count against these limits. Pull sources
-always use the repository root.
+the push-sync file-count and size limits to files under `root_path`. Files
+outside `root_path` do not count against these limits. A pull source's Git
+directory still covers the whole repository at that commit, so the 25 MB Git
+data limit applies to the full tree. A large monorepo can exceed it even when
+its `root_path` is small.
 
 Server sync omits symlinks and other special entries from the workspace. For a
 pull source, proposal capture also ignores these omitted Git index entries.
@@ -227,9 +236,11 @@ endpoint returns `synced: false` and creates no version. A sync against pending
 source settings makes those settings active. The response includes the resolved
 `commit` and the new `version_id`. For a no-op, `version_id` is `null`.
 
-The web interface shows drift status and **Sync now** in **Sync settings** and
-the repository popover. The action is available to editors when the provider
-supports server sync.
+The web interface shows drift status and **Sync now** in **Sync settings**. On
+the notebook page, it also shows them in the **Git source details** dialog. Open
+that dialog from the branch badge or the notebook menu. In the project list, the
+repository popover shows them too. The action is available to editors when the
+provider supports server sync.
 
 CI uploads and **Sync now** share commit-based idempotency. If one method already
 synced a commit, the other method does not create a duplicate version.
@@ -405,6 +416,7 @@ sync-notebook:
 ## Rotating the sync token
 
 If a token leaks, rotate it. The old token stops working immediately.
+This operation requires project manager access or higher.
 
 ```http
 POST /api/v1/projects/{pid}/notebooks/{nid}/sync-token/rotate
@@ -414,20 +426,18 @@ Returns a fresh `sync_url` + `sync_token`.
 
 ## Dependencies
 
-A session environment starts with the packages in the sandbox image. marimohub
-then applies dependency sources from the synced workspace in this order:
+marimohub adds dependencies to the sandbox image environment in this order:
 
-- If the synced root contains `pyproject.toml`, `uv sync --inexact` adds its
-  dependencies to the base environment. If this command fails, the session
-  continues with the base environment.
-- [PEP 723](https://peps.python.org/pep-0723/) inline metadata
-  (`# /// script … # ///`) in the entry notebook adds another dependency layer.
-  marimohub installs these dependencies with `uv export --script` and
-  `uv pip install`. If uv cannot resolve them, the session fails.
+1. Synced root `pyproject.toml` dependencies, through `uv sync --inexact`.
+2. Entry notebook [PEP 723](https://peps.python.org/pep-0723/) dependencies,
+   through `uv export --script` and `uv pip install`.
 
-If both sources declare the same package, inline metadata takes precedence.
-`marimo` is the exception: marimohub keeps the image version and prunes dependencies
-used only by marimo. No configuration is necessary.
+Setup failures stop startup with `PYTHON_ENV_SETUP_FAILED`.
+Inline pins can replace project versions, so keep requirements compatible.
+The image supplies marimo regardless of notebook pins.
+
+Local notebooks follow the same [dependency contract](sandbox-image.md#inline-dependencies),
+including Python-version and custom-index limits.
 
 ## Read-only sessions
 
@@ -461,3 +471,23 @@ If the synced version [includes `.git`](#include-git-for-multi-file-publishing),
 the proposal can contain changes from the full working tree. Otherwise, the
 proposal contains only the entry notebook. Each proposal supports 1,000 changes
 and 10 MB of added or modified content.
+
+## GitHub project policies
+
+`MARIMOHUB_SOURCE_CONTROL_GITHUB_ALLOWED_REPOSITORIES` optionally restricts the
+shared GitHub App by repository and project. Unset or blank policies keep existing
+access with a startup warning. `[]` denies all access. Invalid policies stop startup.
+
+```bash
+MARIMOHUB_SOURCE_CONTROL_GITHUB_ALLOWED_REPOSITORIES='[{"resource":"team/notebooks","projects":["proj-0000000000000000"]}]'
+```
+
+- `resource` matches a GitHub `owner/repo` or URL, regardless of case. `"*"`
+  permits any repository for the listed projects.
+- `projects` lists project IDs. `"*"` shares the repository across projects.
+
+Rules cover branch checks, workspace and Git downloads, and pull request creation
+and updates. The App installation must also allow the repository. The policy does not restrict
+user-supplied credentials.
+
+Restart the hub to apply policy changes.

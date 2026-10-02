@@ -25,13 +25,16 @@ import type {
 import { SandboxId } from '@marimo-hub/core/ids';
 import {
 	defaultImagePullPolicy,
+	KERNEL_CONTAINER_NAME,
 	MANAGED_BY_LABEL,
 	MANAGED_BY_VALUE,
 	portName,
 	resolveIngressTlsMode,
 	SANDBOX_ID_ANNOTATION,
+	SANDBOX_NAME_LABEL,
 	validateIngressAnnotations,
 } from './shared';
+import { validatePodTemplate } from './podTemplate';
 import type {
 	EnsureSandboxOptions,
 	K8sClient,
@@ -41,11 +44,6 @@ import type {
 	K8sSandboxInfo,
 	KubernetesConfig,
 } from './shared';
-
-/** Per-session label the Service selector matches (unique per sandbox). */
-const SANDBOX_NAME_LABEL = 'marimohub.io/sandbox-name';
-/** The single container name in each kernel Pod (the exec target). */
-const CONTAINER_NAME = 'marimo';
 
 interface ExecSocket {
 	on?(event: 'close' | 'error', listener: (event?: unknown) => void): void;
@@ -102,28 +100,53 @@ function buildResources(r: EnsureSandboxOptions['resources']): V1Container['reso
 	return Object.keys(out).length > 0 ? out : undefined;
 }
 
-function podManifest(o: EnsureSandboxOptions): V1Pod {
+export function podManifest(o: EnsureSandboxOptions): V1Pod {
+	const template = o.podTemplate === undefined ? undefined : validatePodTemplate(o.podTemplate);
+	const spec = template?.spec;
+	const kernel = spec?.containers?.find((c) => c.name === KERNEL_CONTAINER_NAME);
 	return {
+		...(template?.apiVersion ? { apiVersion: template.apiVersion } : {}),
+		...(template?.kind ? { kind: template.kind } : {}),
 		metadata: {
 			name: o.name,
 			namespace: o.namespace,
-			labels: { [MANAGED_BY_LABEL]: MANAGED_BY_VALUE, [SANDBOX_NAME_LABEL]: o.name },
-			annotations: { [SANDBOX_ID_ANNOTATION]: String(o.sandboxId) },
+			labels: {
+				...template?.metadata?.labels,
+				...o.extraLabels,
+				[MANAGED_BY_LABEL]: MANAGED_BY_VALUE,
+				[SANDBOX_NAME_LABEL]: o.name,
+			},
+			annotations: validateIngressAnnotations({
+				...template?.metadata?.annotations,
+				[SANDBOX_ID_ANNOTATION]: String(o.sandboxId),
+			}),
 		},
 		spec: {
+			...spec,
 			restartPolicy: 'Never',
+			securityContext:
+				o.runAsUser === undefined
+					? spec?.securityContext
+					: {
+							...spec?.securityContext,
+							runAsUser: o.runAsUser,
+							runAsNonRoot: o.runAsUser !== 0,
+							fsGroup: o.runAsUser,
+						},
 			// The keep-alive `sleep` ignores SIGTERM, so the k8s default 30s grace
 			// would leave every deleted Pod Terminating (still holding its resources,
 			// still phase Running) for 30s. Nothing in the Pod needs a graceful stop —
 			// session state is captured before destroy — so keep the window short.
-			terminationGracePeriodSeconds: 5,
-			serviceAccountName: o.serviceAccountName,
-			imagePullSecrets: o.imagePullSecret ? [{ name: o.imagePullSecret }] : undefined,
+			terminationGracePeriodSeconds: spec?.terminationGracePeriodSeconds ?? 5,
+			serviceAccountName: o.serviceAccountName ?? spec?.serviceAccountName,
+			imagePullSecrets: o.imagePullSecret ? [{ name: o.imagePullSecret }] : spec?.imagePullSecrets,
 			containers: [
 				{
-					name: CONTAINER_NAME,
+					...kernel,
+					name: KERNEL_CONTAINER_NAME,
 					image: o.image,
-					imagePullPolicy: o.imagePullPolicy ?? defaultImagePullPolicy(o.image),
+					imagePullPolicy:
+						o.imagePullPolicy ?? kernel?.imagePullPolicy ?? defaultImagePullPolicy(o.image),
 					// Keep-alive: the Pod idles while we exec marimo into it (see
 					// startProcess). Mirrors the CoreWeave "main process is keep-alive".
 					command: ['sh', '-c', 'sleep infinity'],
@@ -140,7 +163,7 @@ function serviceManifest(o: EnsureSandboxOptions): V1Service {
 		metadata: {
 			name: o.name,
 			namespace: o.namespace,
-			labels: { [MANAGED_BY_LABEL]: MANAGED_BY_VALUE },
+			labels: { ...o.extraLabels, [MANAGED_BY_LABEL]: MANAGED_BY_VALUE },
 		},
 		spec: {
 			selector: { [SANDBOX_NAME_LABEL]: o.name },
@@ -169,7 +192,7 @@ function ingressManifest(o: EnsureSandboxOptions): V1Ingress {
 		metadata: {
 			name: o.name,
 			namespace: o.namespace,
-			labels: { [MANAGED_BY_LABEL]: MANAGED_BY_VALUE },
+			labels: { ...o.extraLabels, [MANAGED_BY_LABEL]: MANAGED_BY_VALUE },
 			annotations: validateIngressAnnotations(o.ingressAnnotations),
 		},
 		spec: {
@@ -202,12 +225,11 @@ function exitCodeFromStatus(status: V1Status | undefined): number {
 	return Number.isNaN(code) ? 1 : code;
 }
 
-/** A `Writable` that accumulates everything written to it into a string. */
-function collector(): { stream: Writable; text: () => string } {
+function collector(accept: (bytes: number) => boolean): { stream: Writable; text: () => string } {
 	const chunks: Buffer[] = [];
 	const stream = new Writable({
 		write(chunk, _enc, cb) {
-			chunks.push(Buffer.from(chunk));
+			if (accept(chunk.length)) chunks.push(Buffer.from(chunk));
 			cb();
 		},
 	});
@@ -277,6 +299,26 @@ export function createK8sClient(config: KubernetesConfig): K8sClient {
 			if (hasCode(err, 404)) return; // already gone — idempotent
 			throw err;
 		}
+	}
+
+	async function readOptional<T>(read: () => Promise<T>): Promise<T | undefined> {
+		try {
+			return await read();
+		} catch (err) {
+			if (hasCode(err, 404)) return;
+			throw err;
+		}
+	}
+
+	function routePreconditions(resource: V1Service | V1Ingress | undefined, kind: string) {
+		if (!resource) return;
+		const metadata = resource.metadata;
+		if (metadata?.labels?.[MANAGED_BY_LABEL] !== MANAGED_BY_VALUE) {
+			throw new Error(`Refusing to delete unmanaged ${kind}`);
+		}
+		const { uid, resourceVersion } = metadata;
+		if (!uid || !resourceVersion) throw new Error(`${kind} has no UID or resourceVersion`);
+		return { uid, resourceVersion };
 	}
 
 	async function reconcileIngress(net: K8s.NetworkingV1Api, desired: V1Ingress): Promise<void> {
@@ -350,20 +392,36 @@ export function createK8sClient(config: KubernetesConfig): K8sClient {
 		}
 	}
 
+	async function reconcileRoutes(
+		service: V1Service,
+		ingress: V1Ingress | undefined,
+	): Promise<void> {
+		const { core, net } = await apis();
+		await Promise.all([
+			reconcileService(core, service),
+			ingress ? reconcileIngress(net, ingress) : undefined,
+		]);
+	}
+
 	return {
+		async reconcileRoutes(o: EnsureSandboxOptions): Promise<void> {
+			await reconcileRoutes(
+				serviceManifest(o),
+				o.ports.some((p) => p.host) ? ingressManifest(o) : undefined,
+			);
+		},
 		async ensure(o: EnsureSandboxOptions): Promise<{ createdPod: boolean }> {
 			const pod = podManifest(o);
 			const service = serviceManifest(o);
 			const ingress = o.ports.some((p) => p.host) ? ingressManifest(o) : undefined;
-			const { core, net } = await apis();
+			const { core } = await apis();
 			// Order-independent: k8s is declarative (a Service's selector / an
 			// Ingress's backend need not pre-exist), so the creates fan out. The
 			// Service and Ingress reconcile so a reconnect picks up newly reserved
 			// surface ports rather than swallowing the create conflict.
 			const [createdPod] = await Promise.all([
 				createTolerant(() => core.createNamespacedPod({ namespace, body: pod })),
-				reconcileService(core, service),
-				ingress ? reconcileIngress(net, ingress) : undefined,
+				reconcileRoutes(service, ingress),
 			]);
 			return { createdPod };
 		},
@@ -376,6 +434,8 @@ export function createK8sClient(config: KubernetesConfig): K8sClient {
 					pod.status?.conditions?.find((c) => c.type === type && c.status === 'True')
 						?.lastTransitionTime;
 				return {
+					managedBy: pod.metadata?.labels?.[MANAGED_BY_LABEL],
+					sandboxId: pod.metadata?.annotations?.[SANDBOX_ID_ANNOTATION],
 					phase: pod.status?.phase,
 					uid: pod.metadata?.uid,
 					createdAt: pod.metadata?.creationTimestamp,
@@ -448,8 +508,6 @@ export function createK8sClient(config: KubernetesConfig): K8sClient {
 			options?: K8sExecOptions,
 		): Promise<K8sExecResult> {
 			const { exec } = await apis();
-			const out = collector();
-			const errc = collector();
 			// objectMode: false — the default would emit a Uint8Array as a single
 			// object chunk instead of streaming its bytes to the pod's stdin.
 			const stdinStream =
@@ -471,6 +529,20 @@ export function createK8sClient(config: KubernetesConfig): K8sClient {
 					clearTimeout(timer);
 					reject(execSocketError(error));
 				};
+				let bytes = 0;
+				const accept = (length: number) => {
+					if (settled) return false;
+					bytes += length;
+					if (options?.maxOutputBytes !== undefined && bytes > options.maxOutputBytes) {
+						fail(new Error('Sandbox output exceeded byte limit'));
+						stdinStream?.destroy();
+						socket?.close();
+						return false;
+					}
+					return true;
+				};
+				const out = collector(accept);
+				const errc = collector(accept);
 				const timer =
 					options?.timeout !== undefined && options.timeout > 0
 						? setTimeout(() => {
@@ -484,7 +556,7 @@ export function createK8sClient(config: KubernetesConfig): K8sClient {
 					.exec(
 						namespace,
 						name,
-						CONTAINER_NAME,
+						KERNEL_CONTAINER_NAME,
 						command,
 						out.stream,
 						errc.stream,
@@ -513,14 +585,55 @@ export function createK8sClient(config: KubernetesConfig): K8sClient {
 			});
 		},
 
-		async delete(name: string, options: { ingress: boolean }): Promise<void> {
+		async delete(name: string, options: { ingress: boolean; sandboxId: SandboxId }): Promise<void> {
 			const { core, net } = await apis();
-			await Promise.all([
+			const pod = await readOptional(() => core.readNamespacedPod({ name, namespace }));
+			if (
+				pod &&
+				(pod.metadata?.labels?.[MANAGED_BY_LABEL] !== MANAGED_BY_VALUE ||
+					pod.metadata?.annotations?.[SANDBOX_ID_ANNOTATION] !== options.sandboxId)
+			) {
+				throw new Error(`Refusing to delete Pod "${name}" owned by another sandbox`);
+			}
+			const uid = pod?.metadata?.uid;
+			if (pod && !uid) throw new Error(`Pod "${name}" has no UID`);
+			// Capture routes before deleting the Pod; reconnect may replace or update them afterward.
+			const [service, ingress] = await Promise.all([
+				readOptional(() => core.readNamespacedService({ name, namespace })),
 				options.ingress
-					? deleteTolerant(() => net.deleteNamespacedIngress({ name, namespace }))
+					? readOptional(() => net.readNamespacedIngress({ name, namespace }))
 					: undefined,
-				deleteTolerant(() => core.deleteNamespacedService({ name, namespace })),
-				deleteTolerant(() => core.deleteNamespacedPod({ name, namespace })),
+			]);
+			const servicePreconditions = routePreconditions(service, `Service "${name}"`);
+			const ingressPreconditions = routePreconditions(ingress, `Ingress "${name}"`);
+			const confirmed = await readOptional(() => core.readNamespacedPod({ name, namespace }));
+			if (confirmed?.metadata?.uid !== uid) {
+				throw new Error(`Pod "${name}" changed during cleanup`);
+			}
+			if (pod) {
+				await deleteTolerant(() =>
+					core.deleteNamespacedPod({ name, namespace, body: { preconditions: { uid } } }),
+				);
+			}
+			await Promise.all([
+				ingressPreconditions
+					? deleteTolerant(() =>
+							net.deleteNamespacedIngress({
+								name,
+								namespace,
+								body: { preconditions: ingressPreconditions },
+							}),
+						)
+					: undefined,
+				servicePreconditions
+					? deleteTolerant(() =>
+							core.deleteNamespacedService({
+								name,
+								namespace,
+								body: { preconditions: servicePreconditions },
+							}),
+						)
+					: undefined,
 			]);
 		},
 

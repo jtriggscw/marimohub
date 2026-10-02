@@ -31,6 +31,10 @@ targets:
 OpenCode is pinned to 1.18.17 with separate SHA-256 checksums for Linux x64 and
 arm64 builds.
 
+> **Build requirement:** All `images/marimo-sandbox` targets require the
+> `notebook_bridge` named build context. Older build commands without this context
+> fail. See [Build the maintained image](#build-the-maintained-image).
+
 ## Multiple images
 
 To offer more than one image — say a lean default plus a GPU or heavy-ML
@@ -79,10 +83,12 @@ capture it. Custom images must use a marimo version that supports
 During the sync, `--no-install-package marimo` keeps the image's pinned marimo
 version even if the notebook declares another version.
 
-If a git-synced notebook's entry file contains
-[PEP 723](https://peps.python.org/pep-0723/) inline metadata, marimohub runs three
-more setup commands. These commands run after the project sync and install the
-inline dependencies into the base environment:
+### Inline dependencies
+
+For local and synced notebooks, marimohub installs
+[PEP 723](https://peps.python.org/pep-0723/) dependencies after project sync,
+before the edit session, app session, or job starts. Apps and jobs use their
+selected source version.
 
 ```sh
 [ -d "${UV_PROJECT_ENVIRONMENT:-.venv}" ] || uv venv "${UV_PROJECT_ENVIRONMENT:-.venv}"
@@ -90,9 +96,23 @@ uv export --script notebook.py --format requirements-txt --no-hashes --prune mar
 uv pip install --python "${UV_PROJECT_ENVIRONMENT:-.venv}" -r "${UV_PROJECT_ENVIRONMENT:-.venv}/marimohub-script-requirements.txt"
 ```
 
-A setup failure stops the session with `PYTHON_ENV_SETUP_FAILED` before the kernel
-starts. The export keeps the image's bytecode-compiled `marimo` version and removes
-packages used only by marimo. Direct notebook dependencies remain in the export.
+Setup failures stop startup with `PYTHON_ENV_SETUP_FAILED`.
+The export excludes marimo and packages used only by marimo, preserving the image's
+marimo version. Direct notebook dependencies remain in the export.
+
+Project and inline requirements resolve separately. Inline pins can replace project
+versions and leave project requirements unsatisfied. Keep requirements compatible
+across both files. Headers remain unchanged and are not copied into `pyproject.toml`.
+Dependency changes apply at the next sandbox startup.
+
+Installation reuses the image environment, without `marimo --sandbox` isolation.
+Inline `requires-python` does not select the kernel Python. Use an image with a
+compatible Python version.
+
+Custom indexes must be available to both export and installation. Configure them
+for `uv pip install` through sandbox uv configuration, not only in the header.
+
+### Image requirements
 
 So your image must provide:
 
@@ -275,3 +295,24 @@ Installation failures preserve the normal launch behavior.
 No image change is required for marimo 0.23.10 or 0.24.2. The environment must permit
 local wheel installation. See the [bridge package guide](https://github.com/marimo-team/marimohub/blob/main/packages/notebook-bridge/README.md)
 for timeout, fallback, and compatibility details.
+
+## Build the maintained image
+
+The maintained `images/marimo-sandbox` image includes the notebook bridge wheel.
+Its default, `base`, `release`, `vscode`, `opencode`, and `tools` targets all require
+the `notebook_bridge` named build context. Builds without this context fail.
+
+From the repository root, use:
+
+```sh
+docker build --build-context notebook_bridge=packages/notebook-bridge \
+  -t marimo-sandbox:local images/marimo-sandbox
+```
+
+For an optional target, add `--target vscode`, `--target opencode`, or `--target tools`.
+The publish workflow supplies this context automatically.
+At launch, the bridge checks its artifact identity and skips installation when the identity matches.
+Custom images and older images retain the offline installation fallback.
+
+For a standalone image without bridge preinstallation, use `examples/sandbox-image`.
+That Dockerfile needs no named context. Hub installs the bridge at launch.

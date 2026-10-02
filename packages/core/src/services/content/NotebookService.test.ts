@@ -58,7 +58,7 @@ describe('NotebookService', () => {
 	});
 
 	describe('source updates during sessions', () => {
-		it.each(['update', 'restore', 'notebook.py', 'pyproject.toml'] as const)(
+		it.each(['update', 'deps', 'restore', 'notebook.py', 'pyproject.toml'] as const)(
 			'blocks %s during editing and permits retry after the editor fails without a sandbox',
 			async (operation) => {
 				const notebook = await notebooks.createNotebook(
@@ -75,6 +75,8 @@ describe('NotebookService', () => {
 				const update = () => {
 					if (operation === 'update')
 						return notebooks.updateNotebook(projectId, notebook.id, { code: '' }, ACTOR);
+					if (operation === 'deps')
+						return notebooks.updateNotebook(projectId, notebook.id, { deps: 'replacement' }, ACTOR);
 					if (operation === 'restore')
 						return notebooks.restoreVersion(projectId, notebook.id, version.version_id, ACTOR);
 					return notebooks.workspace.write(
@@ -86,6 +88,8 @@ describe('NotebookService', () => {
 					);
 				};
 				await expect(update()).rejects.toThrow(session.session_id);
+				const storedDeps = await bucket.get(paths.project(projectId).notebook(notebook.id).deps);
+				expect(await storedDeps?.text()).toBe('');
 				expect((await notebooks.getNotebook(projectId, notebook.id)).meta).toEqual(notebook);
 				expect(await notebooks.getNotebookContent(projectId, notebook.id)).toBe('original');
 				expect(await notebooks.listVersions(projectId, notebook.id)).toHaveLength(1);
@@ -95,6 +99,10 @@ describe('NotebookService', () => {
 				expect(await notebooks.getNotebookContent(projectId, notebook.id)).toBe(
 					operation === 'update' ? '' : operation === 'notebook.py' ? 'replacement' : 'original',
 				);
+				if (operation === 'deps') {
+					const deps = await bucket.get(paths.project(projectId).notebook(notebook.id).deps);
+					expect(await deps?.text()).toBe('replacement');
+				}
 			},
 		);
 
@@ -168,62 +176,72 @@ describe('NotebookService', () => {
 			}
 		});
 
-		it('does not mutate source or metadata when a session record is corrupt', async () => {
-			const notebook = await notebooks.createNotebook(
-				projectId,
-				{ title: 'NB', description: '', code: 'original' },
-				ACTOR,
-			);
-			await bucket.put(`${paths.sessionsForProject(projectId)}corrupt.json`, '{invalid json');
-			await expect(
-				notebooks.updateNotebook(
+		it.each(['code', 'deps'] as const)(
+			'does not mutate %s or metadata when a session record is corrupt',
+			async (field) => {
+				const notebook = await notebooks.createNotebook(
 					projectId,
-					notebook.id,
-					{ code: 'replacement', title: 'Blocked' },
+					{ title: 'NB', description: '', code: 'original' },
 					ACTOR,
-				),
-			).rejects.toMatchObject({ code: 'SERVICE_UNAVAILABLE' });
-			expect((await notebooks.getNotebook(projectId, notebook.id)).meta).toEqual(notebook);
-			expect(await notebooks.getNotebookContent(projectId, notebook.id)).toBe('original');
-			expect(await notebooks.listVersions(projectId, notebook.id)).toHaveLength(1);
-		});
-
-		it('fails closed on session lookup errors without blocking metadata updates', async () => {
-			const notebook = await notebooks.createNotebook(
-				projectId,
-				{ title: 'NB', description: '', code: 'original', readme: 'original readme' },
-				ACTOR,
-			);
-			const before = await notebooks.getNotebook(projectId, notebook.id);
-			const lookup = vi
-				.spyOn(sessions, 'listEditorsBlockingSourceUpdate')
-				.mockRejectedValue(new Error('session storage unavailable'));
-			try {
+				);
+				await bucket.put(`${paths.sessionsForProject(projectId)}corrupt.json`, '{invalid json');
 				await expect(
 					notebooks.updateNotebook(
 						projectId,
 						notebook.id,
-						{ code: 'replacement', title: 'Blocked', readme: 'Blocked' },
+						{ [field]: 'replacement', title: 'Blocked' },
 						ACTOR,
 					),
-				).rejects.toThrow('session storage unavailable');
-				expect(await notebooks.getNotebook(projectId, notebook.id)).toEqual(before);
+				).rejects.toMatchObject({ code: 'SERVICE_UNAVAILABLE' });
+				const storedDeps = await bucket.get(paths.project(projectId).notebook(notebook.id).deps);
+				expect(await storedDeps?.text()).toBe('');
+				expect((await notebooks.getNotebook(projectId, notebook.id)).meta).toEqual(notebook);
 				expect(await notebooks.getNotebookContent(projectId, notebook.id)).toBe('original');
 				expect(await notebooks.listVersions(projectId, notebook.id)).toHaveLength(1);
-				await notebooks.updateNotebook(
+			},
+		);
+
+		it.each(['code', 'deps'] as const)(
+			'fails closed on %s updates when session lookup fails without blocking metadata updates',
+			async (field) => {
+				const notebook = await notebooks.createNotebook(
 					projectId,
-					notebook.id,
-					{ title: 'Renamed', readme: '' },
+					{ title: 'NB', description: '', code: 'original', readme: 'original readme' },
 					ACTOR,
 				);
-				expect(await notebooks.getNotebook(projectId, notebook.id)).toMatchObject({
-					meta: { title: 'Renamed' },
-					readme: '',
-				});
-			} finally {
-				lookup.mockRestore();
-			}
-		});
+				const before = await notebooks.getNotebook(projectId, notebook.id);
+				const lookup = vi
+					.spyOn(sessions, 'listEditorsBlockingSourceUpdate')
+					.mockRejectedValue(new Error('session storage unavailable'));
+				try {
+					await expect(
+						notebooks.updateNotebook(
+							projectId,
+							notebook.id,
+							{ [field]: 'replacement', title: 'Blocked', readme: 'Blocked' },
+							ACTOR,
+						),
+					).rejects.toThrow('session storage unavailable');
+					const storedDeps = await bucket.get(paths.project(projectId).notebook(notebook.id).deps);
+					expect(await storedDeps?.text()).toBe('');
+					expect(await notebooks.getNotebook(projectId, notebook.id)).toEqual(before);
+					expect(await notebooks.getNotebookContent(projectId, notebook.id)).toBe('original');
+					expect(await notebooks.listVersions(projectId, notebook.id)).toHaveLength(1);
+					await notebooks.updateNotebook(
+						projectId,
+						notebook.id,
+						{ title: 'Renamed', readme: '' },
+						ACTOR,
+					);
+					expect(await notebooks.getNotebook(projectId, notebook.id)).toMatchObject({
+						meta: { title: 'Renamed' },
+						readme: '',
+					});
+				} finally {
+					lookup.mockRestore();
+				}
+			},
+		);
 	});
 
 	describe('createNotebook', () => {
@@ -2564,6 +2582,47 @@ describe('NotebookService', () => {
 			]);
 		});
 	});
+
+	it.each(['old-deps', ''])('preserves the version for unchanged deps %j', async (deps) => {
+		const meta = await notebooks.createNotebook(
+			projectId,
+			{ title: 'NB', description: 'D', code: 'v1', deps },
+			ACTOR,
+		);
+		const originalSource = await notebooks.getNotebookSource(projectId, meta.id);
+		const list = vi.spyOn(bucket, 'list');
+
+		await notebooks.updateNotebook(projectId, meta.id, { deps, title: 'Renamed' }, ACTOR);
+
+		expect(
+			list.mock.calls.some(
+				([options]) =>
+					options?.prefix === `${paths.project(projectId).notebook(meta.id).base}/versions/`,
+			),
+		).toBe(false);
+		expect(await notebooks.getNotebookSource(projectId, meta.id)).toEqual(originalSource);
+		expect(await notebooks.listVersions(projectId, meta.id)).toHaveLength(1);
+		expect((await notebooks.getNotebookMeta(projectId, meta.id)).title).toBe('Renamed');
+	});
+
+	it('persists a deps-only update on a local notebook', async () => {
+		const meta = await notebooks.createNotebook(
+			projectId,
+			{ title: 'NB', description: 'D', code: 'v1', deps: 'old-deps' },
+			ACTOR,
+		);
+		const nb = paths.project(projectId).notebook(meta.id);
+
+		await notebooks.updateNotebook(projectId, meta.id, { deps: 'new-deps' }, ACTOR);
+
+		expect(await (await bucket.get(nb.deps))!.text()).toBe('new-deps');
+		expect(await notebooks.getNotebookContent(projectId, meta.id)).toBe('v1');
+		expect(await notebooks.listVersions(projectId, meta.id)).toHaveLength(2);
+		const { source } = await notebooks.getNotebook(projectId, meta.id);
+		expect(await (await bucket.get(nb.version(source.current_version_id!).deps))!.text()).toBe(
+			'new-deps',
+		);
+	});
 });
 
 describe('NotebookService security labels', () => {
@@ -2606,6 +2665,137 @@ describe('NotebookService security labels', () => {
 		(await catalog.getCurrentSnapshot()).projects
 			.find((p) => p.id === pid)
 			?.notebooks.find((n) => n.id === nid);
+
+	it.each(['local', 'git'] as const)(
+		'duplicates %s notebooks with labels before publication',
+		async (kind) => {
+			let nid: NotebookId;
+			if (kind === 'local') nid = await createLabeled();
+			else {
+				const { meta } = await notebooks.synced.create(
+					pid,
+					{
+						title: 'Git',
+						description: '',
+						repo: 'org/repo',
+						branch: 'main',
+						entry_notebook: 'app.py',
+					},
+					ACTOR,
+				);
+				nid = meta.id as NotebookId;
+				await notebooks.synced.sync(pid, nid, {
+					repo: 'org/repo',
+					branch: 'main',
+					root_path: '',
+					commit: 'abc',
+					files: [{ path: 'app.py', bytes: new TextEncoder().encode('import marimo') }],
+				});
+				await notebooks.setSecurityLabels(pid, nid, LABELS, ACTOR);
+			}
+			const labels = (await notebooks.getNotebookMeta(pid, nid)).security_labels;
+			const append = catalog.appendNotebookEntry.bind(catalog);
+			const publication = vi
+				.spyOn(catalog, 'appendNotebookEntry')
+				.mockImplementation(async (...args) => {
+					const entry = args[3];
+					expect(entry.security_labels).toEqual(labels);
+					expect((await notebooks.getNotebookMeta(pid, entry.id)).security_labels).toEqual(labels);
+					return append(...args);
+				});
+			try {
+				const copy = await notebooks.duplicateNotebook(pid, nid, ACTOR);
+				expect(copy.security_labels).toEqual(labels);
+				expect((await entryFor(copy.id))?.security_labels).toEqual(labels);
+				expect(
+					await notebooks.listNotebooks(pid, {
+						subject: SUBJECT,
+						resourceSecurity: security(
+							makeSubjectContext({ classification: 'UNCLASSIFIED', compartments: [] }),
+						),
+					}),
+				).toEqual([]);
+				expect(
+					(
+						await notebooks.listNotebooks(pid, { subject: SUBJECT, resourceSecurity: security() })
+					).map((n) => n.id),
+				).toEqual(expect.arrayContaining([nid, copy.id]));
+			} finally {
+				publication.mockRestore();
+			}
+		},
+	);
+
+	it('keeps an unlabeled duplicate unlabeled', async () => {
+		const original = await notebooks.createNotebook(
+			pid,
+			{ title: 'Plain', description: '', code: 'import marimo' },
+			ACTOR,
+		);
+		const copy = await notebooks.duplicateNotebook(pid, original.id, ACTOR);
+		expect(copy.security_labels).toBeUndefined();
+		expect((await entryFor(copy.id))?.security_labels).toBeNull();
+	});
+
+	it('does not couple labels between the original and duplicate after creation', async () => {
+		const nid = await createLabeled();
+		const copy = await notebooks.duplicateNotebook(pid, nid, ACTOR);
+		await notebooks.setSecurityLabels(
+			pid,
+			nid,
+			{ classification: 'TOP_SECRET', compartments: [] },
+			ACTOR,
+		);
+		expect((await notebooks.getNotebookMeta(pid, copy.id)).security_labels).toEqual(
+			copy.security_labels,
+		);
+		await notebooks.setSecurityLabels(pid, copy.id, undefined, ACTOR);
+		expect((await notebooks.getNotebookMeta(pid, nid)).security_labels?.classification).toBe(
+			'TOP_SECRET',
+		);
+		expect((await entryFor(nid))?.security_labels?.classification).toBe('TOP_SECRET');
+	});
+
+	it('does not publish a duplicate when its labeled metadata cannot be written', async () => {
+		const nid = await createLabeled();
+		const put = bucket.put.bind(bucket);
+		const write = vi.spyOn(bucket, 'put').mockImplementation((key, ...args) => {
+			if (key.endsWith('/meta.json') && !key.includes(`/${nid}/`))
+				return Promise.reject(new Error('metadata unavailable'));
+			return put(key, ...args);
+		});
+		const publication = vi.spyOn(catalog, 'appendNotebookEntry');
+		try {
+			await expect(notebooks.duplicateNotebook(pid, nid, ACTOR)).rejects.toThrow(
+				'metadata unavailable',
+			);
+			expect(publication).not.toHaveBeenCalled();
+			expect(
+				(await catalog.getCurrentSnapshot()).projects.find((p) => p.id === pid)?.notebooks,
+			).toHaveLength(1);
+		} finally {
+			write.mockRestore();
+			publication.mockRestore();
+		}
+	});
+
+	it('failed duplicate publication leaves no unlabeled entry and a retry preserves labels', async () => {
+		const nid = await createLabeled();
+		const publication = vi
+			.spyOn(catalog, 'appendNotebookEntry')
+			.mockRejectedValueOnce(new Error('publication failed'));
+		await expect(notebooks.duplicateNotebook(pid, nid, ACTOR)).rejects.toThrow(
+			'publication failed',
+		);
+		expect(
+			(await catalog.getCurrentSnapshot()).projects.find((p) => p.id === pid)?.notebooks,
+		).toHaveLength(1);
+		publication.mockRestore();
+		const copy = await notebooks.duplicateNotebook(pid, nid, ACTOR);
+		expect((await entryFor(copy.id))?.security_labels).toEqual(
+			(await entryFor(nid))?.security_labels,
+		);
+	});
 
 	it('routine projections never resurrect an override while a mutation is pending', async () => {
 		const nid = await createLabeled();

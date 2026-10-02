@@ -19,6 +19,7 @@ export { scheduleProjectAlert } from './notifications';
 export {
 	authorizeProxyRequest,
 	CREDENTIAL_HEADERS,
+	isCredentialHeader,
 	forwardHttp,
 	sandboxProxyMiddleware,
 	UNSAFE_RESPONSE_HEADERS,
@@ -26,3 +27,5 @@ export {
 export type { ProxyDecision } from './sandboxProxy';
 
 export { sweepAppPools } from './appPools';
+
+export type { ThemeConfig } from '@marimo-hub/core/theme';

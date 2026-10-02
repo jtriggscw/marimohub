@@ -11,6 +11,8 @@ import type {
 	FileWrites,
 	ProcessResult,
 	SandboxInfo,
+	Service,
+	ServiceUrl,
 } from '@coreweave/cwsandbox';
 import { scriptContractLaunch } from '@marimo-hub/core/testing/compute-contract';
 import type { CoreWeaveClient } from './index';
@@ -91,8 +93,10 @@ export function contractLaunchProcess(command: readonly string[]): CommandProces
 
 export interface FakeSandbox {
 	sandboxId: string;
+	serviceUrls: ServiceUrl[];
 	runCalls: string[][];
 	startCalls: string[][];
+	stdinWrites: string[];
 	/** One entry per `files.write(files)` call — the set sent in that call. */
 	batchWrites: { path: string; content: unknown }[][];
 	reads: Record<string, string>;
@@ -103,8 +107,9 @@ export interface FakeSandbox {
 
 // `FileWrites` also admits a path→content record, but the adapter only ever
 // sends the array form; normalize so the fake satisfies the SDK type.
-function recordWrite(fake: FakeSandbox) {
+function recordWrite(fake: FakeSandbox, writeImpl?: () => Promise<void>) {
 	return async (files: FileWrites): Promise<void> => {
+		await writeImpl?.();
 		const list = Array.isArray(files)
 			? (files as readonly { path: string; content: unknown }[]).map((f) => ({ ...f }))
 			: Object.entries(files).map(([path, content]) => ({ path, content }));
@@ -117,6 +122,8 @@ export function makeWorld(opts?: {
 	startImpl?: (cmd: readonly string[]) => Promise<CommandProcess>;
 	/** Runs inside the boot `wait()`; use it to simulate a slow boot. */
 	waitImpl?: () => Promise<void>;
+	/** Runs before each `files.write`; throw to fail that write. */
+	writeImpl?: () => Promise<void>;
 	/** State for started processes; omit to leave them running. */
 	proc?: FakeProcessState;
 }) {
@@ -132,11 +139,17 @@ export function makeWorld(opts?: {
 	const runImpl = opts?.runImpl ?? (async () => procResult());
 	const waitImpl = opts?.waitImpl ?? (async () => {});
 
-	function build(sandboxId: string) {
+	function build(sandboxId: string, services: readonly Service[] = []) {
 		const fake: FakeSandbox = {
 			sandboxId,
+			serviceUrls: services.map((service) => ({
+				name: service.name ?? `port-${service.port}`,
+				port: service.port,
+				url: `${service.endpoint?.kind === 'https' ? 'https' : 'http'}://${sandboxId}-${service.port}.sandbox.test`,
+			})),
 			runCalls: [],
 			startCalls: [],
+			stdinWrites: [],
 			batchWrites: [],
 			reads: {},
 			deleted: 0,
@@ -144,6 +157,9 @@ export function makeWorld(opts?: {
 		};
 		const sandbox = {
 			sandboxId,
+			get serviceUrls() {
+				return fake.serviceUrls;
+			},
 			wait: async () => {
 				fake.waitCalls++;
 				await waitImpl();
@@ -153,8 +169,18 @@ export function makeWorld(opts?: {
 					fake.runCalls.push([...command]);
 					return runImpl(command);
 				},
-				start: async (command: readonly string[]) => {
+				start: async (command: readonly string[], options?: { stdin?: boolean }) => {
 					fake.startCalls.push([...command]);
+					if (options?.stdin)
+						return {
+							...fakeProcess({ exitCode: 0 }),
+							stdin: {
+								write: async (content: string) => {
+									fake.stdinWrites.push(content);
+								},
+								close: async () => {},
+							},
+						};
 					return opts?.startImpl?.(command) ?? fakeProcess(opts?.proc);
 				},
 			},
@@ -163,7 +189,7 @@ export function makeWorld(opts?: {
 					if (path in fake.reads) return fake.reads[path];
 					throw new Error('not found');
 				},
-				write: recordWrite(fake),
+				write: recordWrite(fake, opts?.writeImpl),
 			},
 			delete: async () => {
 				fake.deleted++;
@@ -178,14 +204,14 @@ export function makeWorld(opts?: {
 		create: async (options) => {
 			created.push(options!);
 			const cwId = `cw-${++seq}`;
-			const { fake, sandbox } = build(cwId);
+			const { fake, sandbox } = build(cwId, options?.services);
 			registry.set(cwId, { fake, tags: [...(options?.tags ?? [])] });
 			return sandbox;
 		},
 		runFromTemplate: async (templateId, options) => {
 			createdFromTemplate.push({ templateId, options: options ?? {} });
 			const cwId = `cw-${++seq}`;
-			const { fake, sandbox } = build(cwId);
+			const { fake, sandbox } = build(cwId, options?.services);
 			registry.set(cwId, { fake, tags: [...(options?.tags ?? [])] });
 			return sandbox;
 		},
@@ -215,6 +241,9 @@ export function makeWorld(opts?: {
 	function reconnect(entry: { fake: FakeSandbox }, cwId: string) {
 		return {
 			sandboxId: cwId,
+			get serviceUrls() {
+				return entry.fake.serviceUrls;
+			},
 			wait: async () => {
 				entry.fake.waitCalls++;
 			},
@@ -223,8 +252,18 @@ export function makeWorld(opts?: {
 					entry.fake.runCalls.push([...command]);
 					return runImpl(command);
 				},
-				start: async (command: readonly string[]) => {
+				start: async (command: readonly string[], options?: { stdin?: boolean }) => {
 					entry.fake.startCalls.push([...command]);
+					if (options?.stdin)
+						return {
+							...fakeProcess({ exitCode: 0 }),
+							stdin: {
+								write: async (content: string) => {
+									entry.fake.stdinWrites.push(content);
+								},
+								close: async () => {},
+							},
+						};
 					return opts?.startImpl?.(command) ?? fakeProcess();
 				},
 			},
@@ -233,7 +272,7 @@ export function makeWorld(opts?: {
 					if (path in entry.fake.reads) return entry.fake.reads[path];
 					throw new Error('not found');
 				},
-				write: recordWrite(entry.fake),
+				write: recordWrite(entry.fake, opts?.writeImpl),
 			},
 			delete: async () => {
 				entry.fake.deleted++;

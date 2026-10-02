@@ -252,6 +252,7 @@ export const icebergRest = defineIntegration({
 			throw new ValidationError('SigV4 extra properties conflict with the typed auth fields.');
 		}
 		validateExtraProperties(config.extra_properties, OWNED_PROP_KEYS);
+		assertSafeHeaders(headersFromProperties(config.extra_properties));
 		if (
 			config.storage.scheme === 'catalog' &&
 			config.storage.vended_s3 !== undefined &&
@@ -467,7 +468,7 @@ export const icebergRest = defineIntegration({
 			const catalog = await openCatalog(config, probe, request?.signal);
 			const body = await catalogGet(
 				catalog,
-				`/namespaces/${namespacePathSegment(catalog, namespace)}/tables/${encodeURIComponent(table)}`,
+				`/namespaces/${namespacePathSegment(catalog, namespace)}/tables/${catalogPathSegment(table)}`,
 			);
 			return tableSchemaOf(body);
 		},
@@ -1314,7 +1315,13 @@ function childNamespaces(items: string[][], parent: string[]): string[][] {
  * is used and re-encoded by URLSearchParams.
  */
 function namespacePathSegment(catalog: OpenedCatalog, namespace: string[]): string {
-	return namespace.map(encodeURIComponent).join(catalog.separator);
+	return namespace.map(catalogPathSegment).join(catalog.separator);
+}
+
+function catalogPathSegment(value: string): string {
+	if (value === '.' || value === '..')
+		throw new ValidationError('Catalog path segments cannot be dots.');
+	return encodeURIComponent(value);
 }
 
 function decodedSeparator(separator: string): string {
@@ -1437,6 +1444,15 @@ function typeText(type: unknown): string {
 		default:
 			return typeof record.type === 'string' ? record.type : 'unknown';
 	}
+}
+
+function headersFromProperties(properties: Record<string, string>): Record<string, string> {
+	const prefix = 'header.';
+	return Object.fromEntries(
+		Object.entries(properties)
+			.filter(([key]) => key.toLowerCase().startsWith(prefix))
+			.map(([key, value]) => [key.slice(prefix.length), value]),
+	);
 }
 
 function assertSafeHeaders(headers: Record<string, string>): void {

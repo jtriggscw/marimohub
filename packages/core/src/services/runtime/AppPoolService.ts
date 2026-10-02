@@ -3,7 +3,7 @@ import { mapWithConcurrency } from '../../concurrency';
 import { logOperationalError } from '../../operationalLog';
 import { ConflictError, NotFoundError, ResourceExhaustedError } from '../../errors';
 import { createSandboxId, createSessionId } from '../../ids';
-import type { NotebookId, ProjectId, SessionId, UserId, VersionId } from '../../ids';
+import type { NotebookId, ProjectId, SandboxId, SessionId, UserId, VersionId } from '../../ids';
 import type { Bucket } from '../../ports/bucket';
 import { noopMetrics } from '../../ports/metrics';
 import type { Metrics } from '../../ports/metrics';
@@ -14,6 +14,7 @@ import { logEvent } from '../../logs';
 import { AppPoolStore } from './AppPoolStore';
 import {
 	DEFAULT_APP_POOL_POLICY,
+	appOccupancyBySession,
 	expireAppPresence,
 	renewAppVisit,
 	routeApp,
@@ -27,6 +28,7 @@ import type {
 	AppPoolPolicy,
 	AppVisit,
 } from './AppPoolRouter';
+import { isPastAuthorizationDeadline } from './SessionService';
 import type { SessionService } from './SessionService';
 import { isTerminal, sessionMode } from './sessionState';
 
@@ -106,7 +108,6 @@ export class AppPoolService {
 				if (pool.deleted_at !== undefined) throw new NotFoundError('App pool was deleted');
 				// Reading the head after the pool snapshot fences stale requests on CAS retries.
 				await this.assertCommittedVersion(input);
-				const previous = pool.assignments.find((item) => item.user_id === input.userId);
 				const routed = decide(pool, reservation, this.now());
 				const assignment = routed.decision.kind === 'busy' ? undefined : routed.decision.assignment;
 				return {
@@ -114,7 +115,13 @@ export class AppPoolService {
 					value: {
 						decision: routed.decision,
 						newGeneration:
-							assignment?.generation !== previous?.generation ? assignment?.generation : undefined,
+							assignment &&
+							!pool.assignments.some(
+								(item) =>
+									item.user_id === input.userId && item.generation === assignment.generation,
+							)
+								? assignment.generation
+								: undefined,
 					},
 				};
 			},
@@ -167,6 +174,28 @@ export class AppPoolService {
 		const source = await readStored(SourceSchema, object, key);
 		if (source.current_version_id !== input.versionId)
 			throw new ConflictError('The app version changed. Retry shortly.');
+	}
+
+	async bindWarmSandbox(
+		projectId: ProjectId,
+		notebookId: NotebookId,
+		sessionId: SessionId,
+		token: string,
+		sandboxId: SandboxId,
+	): Promise<void> {
+		const bound = await this.store.mutate(projectId, notebookId, (pool) => {
+			const member = pool.members.find((item) => item.session_id === sessionId);
+			if (
+				member?.state !== 'starting' ||
+				member.operation_token !== token ||
+				member.operation_expires_at <= this.now()
+			) {
+				return { pool, value: false };
+			}
+			member.sandbox_id = sandboxId;
+			return { pool, value: true };
+		});
+		if (!bound) throw new ConflictError('The app startup reservation expired. Retry shortly.');
 	}
 
 	async complete(
@@ -248,11 +277,12 @@ export class AppPoolService {
 				(item) => item.session_id === sessionId && item.state !== 'retiring',
 			);
 			if (!member) return { pool, value: false };
-			let assignment = pool.assignments.find((item) => item.user_id === userId);
+			let assignment = this.findPresenceAssignment(pool, userId, sessionId, visit);
 			// Old pages have no visit token. They can register only with an adopted legacy member.
 			const legacyVisit = member.legacy && !visit;
 			if (!assignment && legacyVisit) {
 				assignment = {
+					visit_id: 'api',
 					user_id: userId,
 					session_id: sessionId,
 					generation: crypto.randomUUID(),
@@ -260,13 +290,7 @@ export class AppPoolService {
 				};
 				pool.assignments.push(assignment);
 			}
-			if (
-				!assignment ||
-				assignment.session_id !== sessionId ||
-				(visit && assignment.generation !== visit.generation)
-			) {
-				return { pool, value: false };
-			}
+			if (!assignment) return { pool, value: false };
 			const visitId = visit?.visit_id ?? 'api';
 			const currentVisit = assignment.visits.find((item) => item.visit_id === visitId);
 			if (!currentVisit && !legacyVisit) return { pool, value: false };
@@ -295,12 +319,7 @@ export class AppPoolService {
 		await this.store.mutate(projectId, notebookId, (pool) => {
 			const now = this.now();
 			expireAppPresence(pool, now);
-			const assignment = pool.assignments.find(
-				(item) =>
-					item.user_id === userId &&
-					item.session_id === sessionId &&
-					item.generation === visit.generation,
-			);
+			const assignment = this.findPresenceAssignment(pool, userId, sessionId, visit);
 			if (assignment?.visits.some((item) => item.visit_id === visit.visit_id)) {
 				assignment.visits = assignment.visits.filter((item) => item.visit_id !== visit.visit_id);
 				if (assignment.visits.length === 0)
@@ -320,6 +339,21 @@ export class AppPoolService {
 		return (await this.view(projectId, notebookId)).canAccess(userId, sessionId, legacy);
 	}
 
+	private findPresenceAssignment(
+		pool: AppPool,
+		userId: UserId,
+		sessionId: SessionId,
+		visit?: AppVisit,
+	) {
+		return pool.assignments.find(
+			(item) =>
+				item.user_id === userId &&
+				item.session_id === sessionId &&
+				item.visit_id === (visit?.visit_id ?? 'api') &&
+				(!visit || item.generation === visit.generation),
+		);
+	}
+
 	async inspect(projectId: ProjectId, notebookId: NotebookId) {
 		return [...(await this.view(projectId, notebookId)).members.values()];
 	}
@@ -327,10 +361,13 @@ export class AppPoolService {
 	async view(projectId: ProjectId, notebookId: NotebookId) {
 		const pool = await this.store.read(projectId, notebookId);
 		if (pool) expireAppPresence(pool, this.now());
-		const assignments = new Map(pool?.assignments.map((item) => [item.user_id, item.session_id]));
-		const counts = new Map<SessionId, number>();
-		for (const sessionId of assignments.values())
-			counts.set(sessionId, (counts.get(sessionId) ?? 0) + 1);
+		const assignments = new Map<UserId, Set<SessionId>>();
+		const counts = appOccupancyBySession(pool ?? { assignments: [] });
+		for (const assignment of pool?.assignments ?? []) {
+			const sessions = assignments.get(assignment.user_id) ?? new Set<SessionId>();
+			sessions.add(assignment.session_id);
+			assignments.set(assignment.user_id, sessions);
+		}
 		const members = new Map(
 			pool?.members.map((member) => [
 				member.session_id,
@@ -338,7 +375,7 @@ export class AppPoolService {
 					session_id: member.session_id,
 					state: member.state,
 					users: counts.get(member.session_id) ?? 0,
-					max_users: this.policy.maxUsersPerSession ?? null,
+					max_users: this.policy.maxVisitsPerSession ?? null,
 				},
 			]),
 		);
@@ -353,7 +390,7 @@ export class AppPoolService {
 				pool
 					? pool.deleted_at === undefined &&
 						(legacyMembers.has(sessionId) ||
-							assignments.get(userId) === sessionId ||
+							assignments.get(userId)?.has(sessionId) === true ||
 							(legacy && !members.has(sessionId)))
 					: legacy,
 		};
@@ -410,8 +447,7 @@ export class AppPoolService {
 					if (
 						isTerminal(session.status) ||
 						session.status === 'terminating' ||
-						(session.authorization_expires_at &&
-							Date.parse(session.authorization_expires_at) <= this.now())
+						isPastAuthorizationDeadline(session, this.now())
 					)
 						member.state = 'retiring';
 				} else if (
@@ -504,7 +540,7 @@ export class AppPoolService {
 		}
 
 		const pool = changed ? await this.store.read(projectId, notebookId) : snapshot;
-		this.metrics.gauge('app_pool.users', pool?.assignments.length ?? 0, {
+		this.metrics.gauge('app_pool.visits', pool?.assignments.length ?? 0, {
 			project_id: projectId,
 			notebook_id: notebookId,
 		});

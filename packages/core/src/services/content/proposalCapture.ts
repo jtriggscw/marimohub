@@ -1,11 +1,17 @@
 import { MAX_REQUEST_BYTES } from '../../constants';
 import { ConflictError, NotFoundError, ValidationError } from '../../errors';
 import { isSafeWorkspacePath } from '../../integrations/remoteWorkspace';
+import {
+	isRegenerableArtifactPath,
+	REGENERABLE_DIRECTORY_NAMES,
+	REGENERABLE_FILE_NAMES,
+} from '../../integrations/workspaceIgnore';
 import type { Bucket } from '../../ports/bucket';
 import type { SandboxInstance } from '../../ports/sandbox';
 import type { NotebookProposal, ProposalChange } from '../../schema';
 import type { VersionPaths } from '../../paths';
 import { shellQuote } from '../runtime/shell';
+import type { SandboxWorkspaceLayout } from '../runtime/workspaceLayout';
 import { decodeProposalContent, proposalBytesEqual, proposalSha256 } from './proposalUtils';
 
 export const MAX_PROPOSAL_CHANGES = 1_000;
@@ -20,22 +26,17 @@ export interface CapturedProposalChanges {
 	changes: CapturedProposalChange[];
 }
 
-const IGNORED_DIRECTORY_NAMES = new Set([
+// Repository metadata and marimo runtime state are never proposal content.
+const PROPOSAL_IGNORED_DIRECTORY_NAMES = new Set([
+	...REGENERABLE_DIRECTORY_NAMES,
 	'.git',
-	'.ipynb_checkpoints',
-	'.mypy_cache',
-	'.pytest_cache',
-	'.ruff_cache',
-	'.venv',
 	'__marimo__',
-	'__pycache__',
-	'node_modules',
 ]);
 
-const GIT_EXCLUDE_PATHS = [...IGNORED_DIRECTORY_NAMES].map(
-	(name) => `:(exclude,glob)**/${name}/**`,
-);
-GIT_EXCLUDE_PATHS.push(':(exclude,glob)**/.DS_Store');
+const GIT_EXCLUDE_PATHS = [
+	...[...PROPOSAL_IGNORED_DIRECTORY_NAMES].map((name) => `:(exclude,glob)**/${name}/**`),
+	...[...REGENERABLE_FILE_NAMES].map((name) => `:(exclude,glob)**/${name}`),
+];
 
 const READ_REGULAR_FILE_SCRIPT = `
 import base64
@@ -70,10 +71,9 @@ finally:
 `.trim();
 
 function isIgnoredPath(path: string): boolean {
-	const segments = path.split('/');
 	return (
-		segments.some((segment) => IGNORED_DIRECTORY_NAMES.has(segment)) ||
-		segments.at(-1) === '.DS_Store'
+		isRegenerableArtifactPath(path) ||
+		path.split('/').some((segment) => PROPOSAL_IGNORED_DIRECTORY_NAMES.has(segment))
 	);
 }
 
@@ -131,11 +131,14 @@ function gitPathspec(): string {
 	return ['.', ...GIT_EXCLUDE_PATHS].map(shellQuote).join(' ');
 }
 
-function gitInWorkdir(workdir: string, args: string): string {
+/** Git runs from the workdir so paths come back workdir-relative; only the Git root is trusted. */
+type GitWorkingTree = Pick<SandboxWorkspaceLayout, 'workdir' | 'gitRoot'>;
+
+function gitInWorkdir(tree: GitWorkingTree, args: string): string {
 	// Modal restores `.git` as a different uid than the kernel user. Git 2.35+
 	// then refuses the worktree unless this directory is trusted; `-c` keeps
 	// capture working on sessions provisioned before gitconfig was updated.
-	return `cd ${shellQuote(workdir)} && git -c ${shellQuote(`safe.directory=${workdir}`)} ${args}`;
+	return `cd ${shellQuote(tree.workdir)} && git -c ${shellQuote(`safe.directory=${tree.gitRoot}`)} ${args}`;
 }
 
 function gitConflict(message: string, result: { stdout: string; stderr: string }): ConflictError {
@@ -145,20 +148,20 @@ function gitConflict(message: string, result: { stdout: string; stderr: string }
 	return new ConflictError(detail ? `${message}: ${detail}` : message);
 }
 
-async function hasGitWorkingTree(sandbox: SandboxInstance, workdir: string): Promise<boolean> {
+async function hasGitWorkingTree(sandbox: SandboxInstance, gitRoot: string): Promise<boolean> {
 	const result = await sandbox.exec(
-		`cd ${shellQuote(workdir)} && test -e .git && command -v git >/dev/null 2>&1 && printf git-working-tree`,
+		`cd ${shellQuote(gitRoot)} && test -e .git && command -v git >/dev/null 2>&1 && printf git-working-tree`,
 	);
 	return result.success && result.stdout === 'git-working-tree';
 }
 
 async function resolvedGitBase(
 	sandbox: SandboxInstance,
-	workdir: string,
+	tree: GitWorkingTree,
 	commit: string,
 ): Promise<string> {
 	const result = await sandbox.exec(
-		gitInWorkdir(workdir, `rev-parse --verify ${shellQuote(`${commit}^{commit}`)}`),
+		gitInWorkdir(tree, `rev-parse --verify ${shellQuote(`${commit}^{commit}`)}`),
 	);
 	if (!result.success) {
 		throw gitConflict('The Git working tree does not contain the pinned source commit', result);
@@ -239,21 +242,24 @@ async function readGitChangedFile(
 async function captureGitWorkingTree(
 	bucket: Bucket,
 	sandbox: SandboxInstance,
-	workdir: string,
+	tree: GitWorkingTree,
 	base: VersionPaths,
 	source: NotebookProposal['source'],
 ): Promise<CapturedProposalChanges | null> {
-	if (!(await hasGitWorkingTree(sandbox, workdir))) return null;
-	const resolvedBase = await resolvedGitBase(sandbox, workdir, source.commit);
+	if (!(await hasGitWorkingTree(sandbox, tree.gitRoot))) return null;
+	const { workdir } = tree;
+	const resolvedBase = await resolvedGitBase(sandbox, tree, source.commit);
 	const pathspec = gitPathspec();
+	// `--relative` keeps a subtree workspace's paths workdir-relative, matching
+	// the synced version's layout; `ls-files` is cwd-relative by default.
 	const [diff, untracked] = await Promise.all([
 		sandbox.exec(
 			gitInWorkdir(
-				workdir,
-				`diff --name-status -z --no-renames ${shellQuote(resolvedBase)} -- ${pathspec}`,
+				tree,
+				`diff --name-status -z --no-renames --relative ${shellQuote(resolvedBase)} -- ${pathspec}`,
 			),
 		),
-		sandbox.exec(gitInWorkdir(workdir, `ls-files --others --exclude-standard -z -- ${pathspec}`)),
+		sandbox.exec(gitInWorkdir(tree, `ls-files --others --exclude-standard -z -- ${pathspec}`)),
 	]);
 	if (!diff.success || !untracked.success) {
 		throw gitConflict('Could not inspect the Git working tree', !diff.success ? diff : untracked);
@@ -342,13 +348,16 @@ async function captureEntryNotebook(
 export async function captureProposalChanges(
 	bucket: Bucket,
 	sandbox: SandboxInstance,
-	workdirValue: string,
+	tree: GitWorkingTree,
 	base: VersionPaths,
 	source: NotebookProposal['source'],
 ): Promise<CapturedProposalChanges> {
-	const workdir = workingDirectory(workdirValue);
+	const normalized = {
+		workdir: workingDirectory(tree.workdir),
+		gitRoot: workingDirectory(tree.gitRoot),
+	};
 	return (
-		(await captureGitWorkingTree(bucket, sandbox, workdir, base, source)) ??
-		(await captureEntryNotebook(bucket, sandbox, workdir, base, source))
+		(await captureGitWorkingTree(bucket, sandbox, normalized, base, source)) ??
+		(await captureEntryNotebook(bucket, sandbox, normalized.workdir, base, source))
 	);
 }

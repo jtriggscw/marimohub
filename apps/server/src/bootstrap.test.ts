@@ -3,13 +3,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ApiDeps } from '@marimo-hub/api';
 import { createInitializedBucket, makeTestDeps } from '@marimo-hub/api/testing';
 import { ConfigError } from '@marimo-hub/config';
+import { ProxyExposure, SubdomainExposure } from '@marimo-hub/core';
 import { bootstrap } from './bootstrap';
 import type { BootstrapOverrides } from './bootstrap';
-import { startJobScheduler, startMaintenance, startSessionLifecycle } from './cron';
+import { startJobScheduler, startMaintenance, startSessionLifecycle, startWarmPools } from './cron';
 import type { OtelHandle } from './otel';
 
 vi.mock('./cron', () => ({
 	startMaintenance: vi.fn(() => vi.fn()),
+	startWarmPools: vi.fn(),
 	startSessionLifecycle: vi.fn(() => vi.fn()),
 	startJobScheduler: vi.fn(() => ({ stop: vi.fn(), drain: vi.fn(async () => {}) })),
 }));
@@ -73,6 +75,36 @@ describe('bootstrap', () => {
 		vi.useRealTimers();
 	});
 
+	it('adds report-only CSP to SPA responses without changing API policies', async () => {
+		const harness = makeHarness(deps);
+		await bootstrap(BASE_ENV, harness.overrides);
+		const fetch = harness.serveFn.mock.calls[0][0].fetch;
+		const spa = (await fetch(new Request('http://localhost/'), {} as never)) as Response;
+		expect(spa.headers.get('content-security-policy-report-only')).toContain(
+			"script-src 'self' 'wasm-unsafe-eval'",
+		);
+		expect(spa.headers.get('content-security-policy')).toBeNull();
+		const api = (await fetch(new Request('http://localhost/api/health'), {} as never)) as Response;
+		expect(api.headers.get('content-security-policy-report-only')).toBeNull();
+	});
+
+	it.each([
+		['proxy', new ProxyExposure('secret'), "frame-src 'self'"],
+		['subdomain', new SubdomainExposure(), "frame-src 'self' https: http:"],
+	] as const)(
+		'scopes SPA connection and frame sources for %s',
+		async (_mode, exposure, framePolicy) => {
+			deps.sandbox.exposure = exposure;
+			const harness = makeHarness(deps);
+			await bootstrap(BASE_ENV, harness.overrides);
+			const fetch = harness.serveFn.mock.calls[0][0].fetch;
+			const response = (await fetch(new Request('http://localhost/'), {} as never)) as Response;
+			const directives = response.headers.get('content-security-policy-report-only')!.split('; ');
+			expect(directives).toContain("connect-src 'self'");
+			expect(directives).toContain(framePolicy);
+		},
+	);
+
 	it('exits on a fatal preflight result without serving', async () => {
 		const report: PreflightReport = {
 			ok: false,
@@ -130,6 +162,31 @@ describe('bootstrap', () => {
 		const harness = makeHarness(deps);
 
 		await bootstrap(BASE_ENV, { ...harness.overrides, hostname: '127.0.0.1' });
+
+		expect(harness.serveFn).toHaveBeenCalledWith(
+			{ fetch: expect.any(Function), hostname: '127.0.0.1', port: 3000 },
+			expect.any(Function),
+		);
+	});
+
+	it('passes MARIMOHUB_BIND_HOST to the server', async () => {
+		const harness = makeHarness(deps);
+
+		await bootstrap({ ...BASE_ENV, MARIMOHUB_BIND_HOST: '::1' }, harness.overrides);
+
+		expect(harness.serveFn).toHaveBeenCalledWith(
+			{ fetch: expect.any(Function), hostname: '::1', port: 3000 },
+			expect.any(Function),
+		);
+	});
+
+	it('prefers an explicit hostname over MARIMOHUB_BIND_HOST', async () => {
+		const harness = makeHarness(deps);
+
+		await bootstrap(
+			{ ...BASE_ENV, MARIMOHUB_BIND_HOST: '0.0.0.0' },
+			{ ...harness.overrides, hostname: '127.0.0.1' },
+		);
 
 		expect(harness.serveFn).toHaveBeenCalledWith(
 			{ fetch: expect.any(Function), hostname: '127.0.0.1', port: 3000 },
@@ -394,6 +451,7 @@ describe('bootstrap', () => {
 		await bootstrap({ ...BASE_ENV, MARIMOHUB_RUN_MAINTENANCE: enabled }, harness.overrides);
 
 		expect(startMaintenance).toHaveBeenCalledTimes(calls);
+		expect(startWarmPools).toHaveBeenCalledTimes(calls);
 		expect(startSessionLifecycle).toHaveBeenCalledTimes(calls);
 	});
 
@@ -476,6 +534,20 @@ describe('bootstrap', () => {
 		expect(harness.createDeps).not.toHaveBeenCalled();
 		expect(harness.serveFn).not.toHaveBeenCalled();
 	});
+
+	it.each(['', '[::1]', '127.0.0.1:3000'])(
+		'exits on MARIMOHUB_BIND_HOST=%j without creating adapters',
+		async (value) => {
+			const harness = makeHarness(deps);
+
+			await expect(
+				bootstrap({ ...BASE_ENV, MARIMOHUB_BIND_HOST: value }, harness.overrides),
+			).resolves.toBeUndefined();
+			expect(harness.exit).toHaveBeenCalledWith(1);
+			expect(harness.createDeps).not.toHaveBeenCalled();
+			expect(harness.serveFn).not.toHaveBeenCalled();
+		},
+	);
 
 	it('can be drained with await using without exiting the process', async () => {
 		const harness = makeHarness(deps);

@@ -2,7 +2,8 @@ import type { Bucket } from '../../ports/bucket';
 import { mapWithConcurrency } from '../../concurrency';
 import type { NotebookId, ProjectId } from '../../ids';
 import { paths } from '../../paths';
-import type { SandboxInstance } from '../../ports/sandbox';
+import { logOperationalError } from '../../operationalLog';
+import type { ReadFileResult, SandboxInstance } from '../../ports/sandbox';
 import {
 	MAX_ARTIFACT_BYTES,
 	MAX_WORKSPACE_BYTES,
@@ -16,6 +17,7 @@ import {
 	workspaceDirectoryFromMarkerPath,
 	workspaceDirectoryMarkerPath,
 } from '../../integrations/remoteWorkspace';
+import { isRegenerableArtifactPath } from '../../integrations/workspaceIgnore';
 import { listAllKeys, listAllObjects } from '../catalog/storage';
 import type { CommitSessionInput } from '../content/NotebookService';
 
@@ -26,6 +28,26 @@ import type { CommitSessionInput } from '../content/NotebookService';
  */
 const RESTORE_FETCH_CONCURRENCY = 32;
 const CAPTURE_FILE_CONCURRENCY = 8;
+// Reserve a full per-file budget for each read/upload slot, regardless of listed size.
+const CAPTURE_READ_CONCURRENCY = Math.min(
+	CAPTURE_FILE_CONCURRENCY,
+	Math.floor(MAX_WORKSPACE_BYTES / MAX_WORKSPACE_FILE_BYTES),
+);
+const CAPTURE_READ_TIMEOUT_MS = 10_000;
+const warnedUnsupportedSandboxes = new WeakSet<SandboxInstance>();
+
+function supportsBoundedReads(sandbox: SandboxInstance): boolean {
+	if (typeof sandbox.readFileBounded === 'function') return true;
+	if (!warnedUnsupportedSandboxes.has(sandbox)) {
+		warnedUnsupportedSandboxes.add(sandbox);
+		console.warn(
+			'Sandbox adapter does not implement readFileBounded; artifact and workspace capture are disabled. ' +
+				'New sandbox changes will not be saved; stored content is preserved. ' +
+				'Implement readFileBounded to enable capture.',
+		);
+	}
+	return false;
+}
 
 /**
  * Attempts for an idempotent sandbox write. A backend stream can reset mid-call
@@ -101,33 +123,49 @@ async function createSandboxDirectories(
 	if (command.length > 'mkdir -p'.length) await execute(command);
 }
 
-/**
- * Workspace-relative paths the capture/restore path leaves alone. Entries ending
- * in `/` are directory names matched at any depth; the rest are exact root files.
- * `notebook.py` / `pyproject.toml` are the source files — owned by
- * `NotebookService.commitSession`, which writes them into `workspace/` and into
- * the immutable `versions/{vid}/` record. `__marimo__/` holds marimo's rendered
- * HTML / session snapshots, which are versioned separately. `.venv/` and
- * `__pycache__/` are regenerable Python build/env artifacts (uv resolves the venv
- * beside the notebook) — large, churny, and pointless to persist. Everything else
- * under the working dir is "the workspace."
- */
-const WORKSPACE_EXCLUDE = [
-	'notebook.py',
-	'pyproject.toml',
-	'__marimo__/',
-	'.venv/',
-	'__pycache__/',
-];
+/** `commitSession` owns these; capture never uploads or mirror-deletes them. */
+const ROOT_SOURCE_FILES = new Set(['notebook.py', 'pyproject.toml']);
 
-/** True when a workspace-relative path is a source/snapshot/junk path we never capture/delete. */
-function isExcluded(rel: string): boolean {
+function isRootSourceFile(rel: string): boolean {
+	return ROOT_SOURCE_FILES.has(rel);
+}
+
+// Hooks are executable code; restoring them would run user-supplied scripts on
+// the next `git` command if file modes were ever preserved.
+function isGitHooksPath(rel: string): boolean {
 	const segments = rel.split('/');
-	return WORKSPACE_EXCLUDE.some((ex) =>
-		// Directory entries (`foo/`) match a `foo` segment at any depth (e.g. nested
-		// `pkg/__pycache__/x.pyc`); bare entries are exact root-level files.
-		ex.endsWith('/') ? segments.includes(ex.slice(0, -1)) : rel === ex,
-	);
+	return segments.some((segment, index) => segment === '.git' && segments[index + 1] === 'hooks');
+}
+
+function isCaptureExcluded(rel: string): boolean {
+	return isRootSourceFile(rel) || isRegenerableArtifactPath(rel) || isGitHooksPath(rel);
+}
+
+/**
+ * Mirror-delete leaves regenerable paths alone, as it always did for `.venv/`
+ * and `__pycache__/`: a copy uploaded through the files API is not capture's to
+ * remove. Stored hooks are removed.
+ */
+function isMirrorProtected(rel: string): boolean {
+	return isRootSourceFile(rel) || isRegenerableArtifactPath(rel);
+}
+
+/** The repository a path belongs to (`.git`, `pkg/.git`, …), or null outside any `.git`. */
+function gitGroupOf(rel: string): string | null {
+	const segments = rel.split('/');
+	const index = segments.indexOf('.git');
+	return index === -1 ? null : segments.slice(0, index + 1).join('/');
+}
+
+/**
+ * Capture priority under the shared count/byte budget. `.git` is handled
+ * separately; the rest must not let marimo caches or dotfiles crowd out data.
+ */
+function captureTier(rel: string): number {
+	const segments = rel.split('/');
+	if (segments.includes('__marimo__')) return 1;
+	if (segments.some((segment) => segment.startsWith('.'))) return 2;
+	return 0;
 }
 
 /** What a workspace restore actually moved into the sandbox. */
@@ -171,7 +209,7 @@ export async function restoreWorkspace(
 		if (!rel) continue;
 		const markerDirectory = workspaceDirectoryFromMarkerPath(rel);
 		if (markerDirectory !== null) {
-			if (!markerDirectory) continue;
+			if (!markerDirectory || isGitHooksPath(markerDirectory)) continue;
 			if (
 				options.excludeRelativeRoots?.some(
 					(root) => markerDirectory === root || markerDirectory.startsWith(`${root}/`),
@@ -189,7 +227,10 @@ export async function restoreWorkspace(
 			directories.push(`${workingDir}/${markerDirectory}`);
 			continue;
 		}
-		if (options.excludeRelativeRoots?.some((root) => rel === root || rel.startsWith(`${root}/`))) {
+		if (
+			isGitHooksPath(rel) ||
+			options.excludeRelativeRoots?.some((root) => rel === root || rel.startsWith(`${root}/`))
+		) {
 			continue;
 		}
 		// A poisoned key (e.g. from a compromised/synced source) whose relative path
@@ -253,12 +294,18 @@ export async function restoreWorkspace(
 
 /**
  * Capture the notebook's `workspace/` folder from the sandbox working directory
- * back into the bucket on teardown. Source files (`notebook.py`,
- * `pyproject.toml`) and `__marimo__/` snapshots are excluded — they are owned by
- * `NotebookService.commitSession` — so this captures only the runtime workspace.
+ * back into the bucket on teardown. `NotebookService.commitSession` owns the
+ * root source files (`notebook.py`, `pyproject.toml`), so capture excludes them.
+ * Capture also excludes regenerable caches (see `workspaceIgnore`) at any depth
+ * and `.git/hooks/`.
  *
- * In `workspace` mode every remaining file is read binary-safely (via
- * `base64 -w0`) and written to its `workspace/` key. In `source` mode no runtime
+ * In `workspace` mode, capture includes `__marimo__/` and hidden files, subject
+ * to path, file-type, and size limits. The workspace copies of marimo artifacts
+ * are separate from the selected HTML/session artifacts saved in versions.
+ * Visible files claim the budget first, then `__marimo__/`, then other hidden
+ * paths. Each Git directory (`.git/`, `pkg/.git/`, …) goes last and
+ * all-or-nothing, because a partial repository restores corrupt. Each file is read with a byte/deadline budget and written
+ * to its `workspace/` key. In `source` mode no runtime
  * files are uploaded. Both modes then mirror-delete: any key under `workspace/`
  * (other than the excluded source files) that is no longer present in the sandbox
  * is removed, keeping `workspace/` an accurate latest-only mirror and cleaning up
@@ -275,14 +322,16 @@ export async function captureWorkspace(
 	workingDir: string,
 	mode: 'source' | 'workspace',
 ): Promise<void> {
+	if (!supportsBoundedReads(sandbox)) return;
 	const nb = paths.project(projectId).notebook(notebookId);
 
 	// Relative paths currently present in the sandbox working dir, excluding source
-	// files and snapshots. Used to upload files and drive mirror-deletes.
+	// files and regenerable artifacts. Used to upload files and drive mirror-deletes.
 	const present = new Set<string>();
+	const retainedGitGroups = new Set<string>();
 
 	if (mode === 'workspace') {
-		const listing = await sandbox.listFiles(workingDir, { recursive: true });
+		const listing = await sandbox.listFiles(workingDir, { recursive: true, includeHidden: true });
 		if (!listing.success) {
 			// Could not enumerate the working dir — bail out entirely. Falling through
 			// to the mirror-delete below with an empty `present` set would treat every
@@ -300,55 +349,107 @@ export async function captureWorkspace(
 		// upload), so the decision never waits on a read.
 		const selected: string[] = [];
 		const directoryMarkers: string[] = [];
-		let totalBytes = 0;
+		const candidates: { rel: string; size: number; tier: number }[] = [];
+		const gitGroups = new Map<
+			string,
+			{ files: string[]; directoryMarkers: string[]; bytes: number; fitsPerFileCap: boolean }
+		>();
+		const gitGroupFor = (group: string) => {
+			let entry = gitGroups.get(group);
+			if (!entry) {
+				entry = { files: [], directoryMarkers: [], bytes: 0, fitsPerFileCap: true };
+				gitGroups.set(group, entry);
+			}
+			return entry;
+		};
 		for (const file of listing.files) {
 			const rel = file.relativePath;
-			if (!isSafeWorkspacePath(rel) || isWorkspaceInternalPath(rel) || isExcluded(rel)) {
+			if (!isSafeWorkspacePath(rel) || isWorkspaceInternalPath(rel) || isCaptureExcluded(rel)) {
 				continue;
 			}
+			const group = gitGroupOf(rel);
 			if (file.type === 'directory') {
-				directoryMarkers.push(workspaceDirectoryMarkerPath(rel));
+				(group === null ? directoryMarkers : gitGroupFor(group).directoryMarkers).push(
+					workspaceDirectoryMarkerPath(rel),
+				);
 				continue;
 			}
 			if (file.type !== 'file') continue;
+			present.add(rel);
+			if (group !== null) {
+				const entry = gitGroupFor(group);
+				entry.files.push(rel);
+				entry.bytes += file.size;
+				if (file.size > MAX_WORKSPACE_FILE_BYTES) entry.fitsPerFileCap = false;
+				continue;
+			}
+			candidates.push({ rel, size: file.size, tier: captureTier(rel) });
+		}
+		// Stable sort keeps listing order within a tier.
+		candidates.sort((left, right) => left.tier - right.tier);
 
+		let totalBytes = 0;
+		for (const { rel, size } of candidates) {
 			if (selected.length >= MAX_WORKSPACE_FILES) {
 				console.warn(
 					`captureWorkspace: file count cap (${MAX_WORKSPACE_FILES}) reached; skipping ${rel}`,
 				);
 				continue;
 			}
-			if (file.size > MAX_WORKSPACE_FILE_BYTES) {
+			if (size > MAX_WORKSPACE_FILE_BYTES) {
 				console.warn(
-					`captureWorkspace: per-file cap (${MAX_WORKSPACE_FILE_BYTES}) exceeded; skipping ${rel} (${file.size} bytes)`,
+					`captureWorkspace: per-file cap (${MAX_WORKSPACE_FILE_BYTES}) exceeded; skipping ${rel} (${size} bytes)`,
 				);
 				continue;
 			}
-			if (totalBytes + file.size > MAX_WORKSPACE_BYTES) {
+			if (totalBytes + size > MAX_WORKSPACE_BYTES) {
 				console.warn(
-					`captureWorkspace: total-byte cap (${MAX_WORKSPACE_BYTES}) would be exceeded; skipping ${rel} (${file.size} bytes)`,
+					`captureWorkspace: total-byte cap (${MAX_WORKSPACE_BYTES}) would be exceeded; skipping ${rel} (${size} bytes)`,
 				);
 				continue;
 			}
 			selected.push(rel);
-			totalBytes += file.size;
+			totalBytes += size;
 		}
 
-		// A read failure skips just that file (logged); successful ones join the
-		// `present` mirror set that drives the delete pass below.
-		const captured = await mapWithConcurrency(selected, CAPTURE_FILE_CONCURRENCY, async (rel) => {
-			const result = await sandbox.exec(`base64 -w0 ${shellQuote(`${workingDir}/${rel}`)}`);
-			if (!result.success) {
-				console.warn(`captureWorkspace: could not read ${rel}; skipping`);
+		// Root repository first, then nested ones in listing order.
+		const orderedGitGroups = [...gitGroups].sort(
+			([left], [right]) => Number(right === '.git') - Number(left === '.git'),
+		);
+		for (const [group, entry] of orderedGitGroups) {
+			if (
+				entry.fitsPerFileCap &&
+				selected.length + entry.files.length <= MAX_WORKSPACE_FILES &&
+				totalBytes + entry.bytes <= MAX_WORKSPACE_BYTES
+			) {
+				selected.push(...entry.files);
+				directoryMarkers.push(...entry.directoryMarkers);
+				totalBytes += entry.bytes;
+			} else {
+				// A stale but complete repository beats a deleted one, so the stored
+				// copy is kept whole rather than mirror-deleted.
+				retainedGitGroups.add(group);
+				console.warn(
+					`captureWorkspace: ${group.slice(0, 256)} (${entry.files.length} files, ${entry.bytes} bytes) does not fit the remaining workspace budget; keeping the stored copy`,
+				);
+			}
+		}
+
+		// Presence comes from the listing: skipped uploads retain the last good copy.
+		let capturedBytes = 0;
+		await mapWithConcurrency(selected, CAPTURE_READ_CONCURRENCY, async (rel) => {
+			const result = await readBoundedBytes(
+				sandbox,
+				`${workingDir}/${rel}`,
+				Math.min(MAX_WORKSPACE_FILE_BYTES, MAX_WORKSPACE_BYTES - capturedBytes),
+			);
+			if (!result?.success || capturedBytes + result.bytes.byteLength > MAX_WORKSPACE_BYTES) {
+				console.warn(`captureWorkspace: could not read ${rel.slice(0, 256)}; skipping`);
 				return;
 			}
-			const bytes = base64Decode(result.stdout.trim());
-			await bucket.put(nb.workspaceFile(rel), bytes);
-			return rel;
+			capturedBytes += result.bytes.byteLength;
+			await bucket.put(nb.workspaceFile(rel), result.bytes);
 		});
-		for (const rel of captured) {
-			if (rel) present.add(rel);
-		}
 		await mapWithConcurrency(directoryMarkers, CAPTURE_FILE_CONCURRENCY, async (marker) =>
 			bucket.put(nb.workspaceFile(marker), new Uint8Array()),
 		);
@@ -360,7 +461,10 @@ export async function captureWorkspace(
 	const existingKeys = await listAllKeys(bucket, nb.workspacePrefix);
 	const staleKeys = existingKeys.filter((key) => {
 		const rel = key.slice(nb.workspacePrefix.length);
-		if (!rel || isExcluded(rel)) return false;
+		if (!rel || isMirrorProtected(rel)) return false;
+		if (isGitHooksPath(rel)) return true;
+		const group = gitGroupOf(rel);
+		if (group !== null && retainedGitGroups.has(group)) return false;
 		return !present.has(rel);
 	});
 	if (staleKeys.length > 0) {
@@ -371,9 +475,9 @@ export async function captureWorkspace(
 /**
  * Read a session's final artifacts back from the sandbox workspace on teardown:
  * the notebook code/deps plus marimo's optional `__marimo__/notebook.html` and
- * `__marimo__/session/notebook.py.json`. Every field is omitted when its file is
- * absent or unreadable. The result is handed to `NotebookService.commitSession`,
- * which cuts a version and attaches the snapshots.
+ * `__marimo__/session/notebook.py.json`. Optional artifacts may be omitted, but
+ * notebook read failures other than NOT_FOUND reject capture so callers can retry.
+ * `NotebookService.commitSession` cuts a version and attaches the snapshots.
  *
  * The session file is keyed by the notebook filename, which is always
  * `notebook.py` in the sandbox (see `SandboxProvisioner.provision`), so the path
@@ -383,10 +487,11 @@ export async function readSessionArtifacts(
 	sandbox: SandboxInstance,
 	mountPath: string,
 ): Promise<CommitSessionInput> {
+	if (!supportsBoundedReads(sandbox)) return {};
 	const sizes = await listFileSizes(sandbox, mountPath);
 	const read = (path: string) => readCappedFile(sandbox, path, sizes);
 	const [code, deps, html, session] = await Promise.all([
-		read(`${mountPath}/notebook.py`),
+		readNotebookCode(sandbox, `${mountPath}/notebook.py`, sizes),
 		read(`${mountPath}/pyproject.toml`),
 		read(`${mountPath}/__marimo__/notebook.html`),
 		read(`${mountPath}/__marimo__/session/notebook.py.json`),
@@ -395,12 +500,25 @@ export async function readSessionArtifacts(
 	return { code, deps, html, session };
 }
 
-/**
- * Sizes of every file under `mountPath`, keyed by absolute path, so an
- * oversized artifact can be refused BEFORE `readFile` buffers it. Best-effort:
- * a listing failure yields an empty map and the reads below run uncapped —
- * a teardown's save-on-reap commit must never be blocked by a stat.
- */
+async function readNotebookCode(
+	sandbox: SandboxInstance,
+	absolutePath: string,
+	sizes: ReadonlyMap<string, number>,
+): Promise<string | undefined> {
+	const result = await readCappedBytes(sandbox, absolutePath, sizes);
+	if (result?.success) return new TextDecoder().decode(result.bytes);
+	const code = result?.error.code ?? 'READ_FAILED';
+	const error = Object.assign(new Error(`Could not read notebook.py: ${code}`), {
+		code,
+		operation: 'sandbox.read_session_artifacts',
+		object: 'notebook.py',
+	});
+	if (code !== 'NOT_FOUND') throw error;
+	logOperationalError('session_notebook_missing', { operation: error.operation }, error);
+	return undefined;
+}
+
+/** Listing sizes are an optimization; bounded reads enforce the actual limit. */
 export async function listFileSizes(
 	sandbox: SandboxInstance,
 	mountPath: string,
@@ -410,25 +528,33 @@ export async function listFileSizes(
 		const listing = await sandbox.listFiles(mountPath, { recursive: true, includeHidden: true });
 		if (listing.success) {
 			for (const file of listing.files) {
-				if (file.type === 'file') sizes.set(file.absolutePath, file.size);
+				sizes.set(file.absolutePath, file.type === 'file' ? file.size : Infinity);
 			}
 		}
 	} catch {
-		// Listing unsupported/failed: the caller reads without the cap.
+		// Transport limits still apply when listing is unavailable.
 	}
 	return sizes;
 }
 
-/**
- * Read one sandbox file as text, or `undefined` when it is absent, unreadable,
- * or listed above `MAX_ARTIFACT_BYTES` (an artifact absent from `sizes` falls
- * through to the read, preserving the omit-when-unreadable contract).
- */
 export async function readCappedFile(
 	sandbox: SandboxInstance,
 	absolutePath: string,
 	sizes: ReadonlyMap<string, number>,
 ): Promise<string | undefined> {
+	const result = await readCappedBytes(sandbox, absolutePath, sizes);
+	return result?.success ? new TextDecoder().decode(result.bytes) : undefined;
+}
+
+type BoundedBytesResult =
+	| { success: true; bytes: Uint8Array }
+	| Extract<ReadFileResult, { success: false }>;
+
+async function readCappedBytes(
+	sandbox: SandboxInstance,
+	absolutePath: string,
+	sizes: ReadonlyMap<string, number>,
+): Promise<BoundedBytesResult | undefined> {
 	const size = sizes.get(absolutePath);
 	if (size !== undefined && size > MAX_ARTIFACT_BYTES) {
 		console.warn(
@@ -436,8 +562,32 @@ export async function readCappedFile(
 		);
 		return undefined;
 	}
-	const result = await sandbox.readFile(absolutePath);
-	return result.success ? result.content : undefined;
+	return readBoundedBytes(sandbox, absolutePath, MAX_ARTIFACT_BYTES);
+}
+
+async function readBoundedBytes(
+	sandbox: SandboxInstance,
+	path: string,
+	maxBytes: number,
+): Promise<BoundedBytesResult | undefined> {
+	if (!supportsBoundedReads(sandbox)) return undefined;
+	// External adapters must opt into the bounded contract; never fall back to readFile.
+	const result = await sandbox.readFileBounded?.(path, {
+		maxBytes,
+		timeoutMs: CAPTURE_READ_TIMEOUT_MS,
+	});
+	if (!result?.success) return result;
+	const encodedLimit = result.encoding === 'base64' ? 4 * Math.ceil(maxBytes / 3) : maxBytes;
+	if (result.content.length > encodedLimit) return undefined;
+	try {
+		const bytes =
+			result.encoding === 'base64'
+				? base64Decode(result.content)
+				: new TextEncoder().encode(result.content);
+		return bytes.byteLength <= maxBytes ? { success: true, bytes } : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 /** Decode a base64 string to raw bytes without depending on Node's `Buffer`. */

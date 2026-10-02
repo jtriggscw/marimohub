@@ -11,7 +11,7 @@ import https from 'node:https';
 import type { Duplex } from 'node:stream';
 import {
 	authorizeProxyRequest,
-	CREDENTIAL_HEADERS,
+	isCredentialHeader,
 	UNSAFE_RESPONSE_HEADERS,
 } from '@marimo-hub/api';
 import type { ApiDeps } from '@marimo-hub/api';
@@ -49,7 +49,14 @@ export function attachSandboxProxyUpgrade(server: UpgradeServer, deps: ApiDeps):
 	server.on('upgrade', (req, clientSocket, head) => {
 		clientSocket.on('error', () => clientSocket.destroy());
 
-		authorizeProxyRequest(toWebRequest(req), deps)
+		let request: Request;
+		try {
+			request = toWebRequest(req);
+		} catch {
+			rejectUpgrade(clientSocket, 400, 'Bad Request');
+			return;
+		}
+		authorizeProxyRequest(request, deps)
 			.then((decision) => {
 				// `pass` means this isn't a kernel route — leave it for any other handler.
 				if (decision.kind === 'pass') return;
@@ -76,7 +83,7 @@ export function attachSandboxProxyUpgrade(server: UpgradeServer, deps: ApiDeps):
 				// header passes through.
 				const forwarded: http.OutgoingHttpHeaders = {};
 				for (const [key, value] of Object.entries(req.headers)) {
-					if (CREDENTIAL_HEADERS.has(key.toLowerCase())) continue;
+					if (isCredentialHeader(key, deps.sandbox.credentialHeaders)) continue;
 					forwarded[key] = value;
 				}
 				const headers = {

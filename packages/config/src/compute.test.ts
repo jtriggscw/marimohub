@@ -1,4 +1,7 @@
-import { describe, it, expect } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, it, expect } from 'vitest';
 import { Millis, Seconds } from '@marimo-hub/core';
 import { ModalCompute } from '@marimo-hub/compute-modal';
 import { LocalCompute } from '@marimo-hub/compute-local';
@@ -7,6 +10,7 @@ import { PodmanCompute } from '@marimo-hub/compute-container/podman';
 import { CoreWeaveCompute } from '@marimo-hub/compute-coreweave';
 import { FargateCompute } from '@marimo-hub/compute-fargate';
 import { KubernetesCompute } from '@marimo-hub/compute-kubernetes';
+import type { KubernetesPodTemplate } from '@marimo-hub/compute-kubernetes';
 import {
 	makeCompute,
 	resolveLifetimeBackstop,
@@ -31,8 +35,11 @@ const configOf = (provider: unknown) =>
 	(
 		provider as {
 			config: {
+				podTemplate?: KubernetesPodTemplate;
+				imagePullPolicy?: string;
 				image?: string;
 				environment?: string;
+				secretNames?: string[];
 				template?: string;
 				host?: string;
 				bindHost?: string;
@@ -46,6 +53,8 @@ const configOf = (provider: unknown) =>
 				hostnameTemplate?: string;
 				ingressClassName?: string;
 				surfacePorts?: readonly number[];
+				extraLabels?: Record<string, string>;
+				runAsUser?: number;
 			};
 		}
 	).config;
@@ -53,8 +62,9 @@ const configOf = (provider: unknown) =>
 /**
  * Backend-selector tests for `makeCompute`. It takes an env object, so each case
  * is hermetic — no `process.env`, no live SDK. Adapter constructors that touch a
- * vendor SDK (CoreWeave/E2B/Kubernetes) are exercised only on the throw-before-
- * construct paths; the lazy ones (Modal/Docker/Local) are constructed directly.
+ * vendor SDK (CoreWeave/E2B) are exercised only on the throw-before-construct
+ * paths. Lazy adapters and KubernetesCompute are constructed directly;
+ * KubernetesCompute only validates pod template and ingress configuration.
  */
 
 const modalEnv = {
@@ -63,6 +73,74 @@ const modalEnv = {
 	MARIMOHUB_COMPUTE_MODAL_TOKEN_SECRET: 'tsecret',
 	MARIMOHUB_COMPUTE_IMAGE: 'img',
 };
+
+describe('Kubernetes pod template configuration', () => {
+	const key = 'MARIMOHUB_COMPUTE_KUBERNETES_POD_TEMPLATE_FILE';
+	const directories: string[] = [];
+	function templateFile(source: string): string {
+		const dir = mkdtempSync(join(tmpdir(), 'config-pod-template-'));
+		directories.push(dir);
+		const path = join(dir, 'pod.yaml');
+		writeFileSync(path, source);
+		return path;
+	}
+	afterEach(() => {
+		for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true });
+	});
+
+	it('loads a template at startup without contacting Kubernetes', () => {
+		const path = templateFile(
+			'spec:\n  serviceAccountName: fabric\n  automountServiceAccountToken: false\n',
+		);
+		const provider = makeCompute({ MARIMOHUB_COMPUTE_BACKEND: 'kubernetes', [key]: path });
+		expect(provider).toBeInstanceOf(KubernetesCompute);
+		expect(configOf(provider).podTemplate).toEqual({
+			spec: { serviceAccountName: 'fabric', automountServiceAccountToken: false },
+		});
+		writeFileSync(path, 'invalid');
+		expect(configOf(provider).podTemplate?.spec?.serviceAccountName).toBe('fabric');
+	});
+
+	it.each([undefined, '', '   '])(
+		'preserves existing configuration with no template: %j',
+		(value) => {
+			expect(
+				configOf(makeCompute({ MARIMOHUB_COMPUTE_BACKEND: 'kubernetes', [key]: value }))
+					.podTemplate,
+			).toBeUndefined();
+		},
+	);
+
+	it.each([
+		'spec: [',
+		'null',
+		'{"kind":"Deployment"}',
+		'spec:\n  containers:\n    - name: kernel',
+		'spec:\n  containers:\n    - name: marimo\n      image: image:v1',
+	])('reports invalid templates as startup ConfigErrors: %s', (source) => {
+		const error = getConfigError(() =>
+			makeCompute({ MARIMOHUB_COMPUTE_BACKEND: 'kubernetes', [key]: templateFile(source) }),
+		);
+		expect(error.opts.variable).toBe(key);
+		expect(error.opts.docs).toBe('docs/setup/compute/kubernetes.md');
+	});
+
+	it('reports a missing file as a ConfigError', () => {
+		const path = templateFile('{}');
+		rmSync(path);
+		const error = getConfigError(() =>
+			makeCompute({ MARIMOHUB_COMPUTE_BACKEND: 'kubernetes', [key]: path }),
+		);
+		expect(error.opts.variable).toBe(key);
+		expect(error.message).toContain('Cannot read pod template file');
+	});
+
+	it('does not read Kubernetes templates for other backends', () => {
+		expect(
+			makeCompute({ MARIMOHUB_COMPUTE_BACKEND: 'none', [key]: '/missing/pod.yaml' }),
+		).toBeDefined();
+	});
+});
 
 describe('makeCompute backend selection', () => {
 	it('requires an explicit backend (no default)', () => {
@@ -94,6 +172,45 @@ describe('makeCompute backend selection', () => {
 				}),
 			).environment,
 		).toBe('notebooks');
+	});
+
+	it('parses deployment-wide Modal secret names', () => {
+		expect(
+			configOf(
+				makeCompute({
+					...modalEnv,
+					MARIMOHUB_COMPUTE_MODAL_SECRETS: ' shared-credentials, , huggingface, ',
+				}),
+			).secretNames,
+		).toEqual(['shared-credentials', 'huggingface']);
+	});
+
+	it('collapses duplicate Modal secret names', () => {
+		expect(
+			configOf(
+				makeCompute({
+					...modalEnv,
+					MARIMOHUB_COMPUTE_MODAL_SECRETS: 'huggingface, shared, huggingface,shared',
+				}),
+			).secretNames,
+		).toEqual(['huggingface', 'shared']);
+	});
+
+	it.each(['my secret', 'a/b', 'x'.repeat(65), 'ap-0123456789abcdefghijkl'])(
+		'rejects an invalid Modal secret name: %j',
+		(name) => {
+			const error = getConfigError(() =>
+				makeCompute({ ...modalEnv, MARIMOHUB_COMPUTE_MODAL_SECRETS: `ok, ${name}` }),
+			);
+			expect(error.opts.variable).toBe('MARIMOHUB_COMPUTE_MODAL_SECRETS');
+			expect(error.message).toContain(JSON.stringify(name));
+		},
+	);
+
+	it.each([undefined, '', ' ,  , '])('adds no Modal secrets for an empty list: %j', (value) => {
+		expect(
+			configOf(makeCompute({ ...modalEnv, MARIMOHUB_COMPUTE_MODAL_SECRETS: value })).secretNames,
+		).toBeUndefined();
 	});
 
 	it('selects docker', () => {
@@ -361,6 +478,89 @@ describe('makeCompute fail-fast', () => {
 		).toThrow(/MARIMOHUB_COMPUTE_KUBERNETES_IMAGE_PULL_POLICY/);
 	});
 
+	it('parses kubernetes pod labels and leaves them unset when empty', () => {
+		expect(
+			configOf(
+				makeCompute({
+					MARIMOHUB_COMPUTE_BACKEND: 'kubernetes',
+					MARIMOHUB_COMPUTE_KUBERNETES_POD_LABELS:
+						' team = data , app.kubernetes.io/part-of=marimohub, flag= ',
+				}),
+			).extraLabels,
+		).toEqual({ team: 'data', 'app.kubernetes.io/part-of': 'marimohub', flag: '' });
+		expect(
+			configOf(
+				makeCompute({
+					MARIMOHUB_COMPUTE_BACKEND: 'kubernetes',
+					MARIMOHUB_COMPUTE_KUBERNETES_POD_LABELS: ' ',
+				}),
+			).extraLabels,
+		).toBeUndefined();
+	});
+
+	it.each(['team', '=owner', ' =owner', 'team=data,=x'])(
+		'rejects a kubernetes pod label without a key: %j',
+		(labels) => {
+			const error = getConfigError(() =>
+				makeCompute({
+					MARIMOHUB_COMPUTE_BACKEND: 'kubernetes',
+					MARIMOHUB_COMPUTE_KUBERNETES_POD_LABELS: labels,
+				}),
+			);
+			expect(error.opts.variable).toBe('MARIMOHUB_COMPUTE_KUBERNETES_POD_LABELS');
+			expect(error.message).toMatch(/expected key=value/);
+		},
+	);
+
+	it.each([
+		['__proto__=data', /label name/],
+		['team name=data', /label name/],
+		['team=data=prod', /label value/],
+		['team=da ta', /label value/],
+		[`team=${'x'.repeat(64)}`, /label value/],
+		['a/b/c=1', /label key/],
+		['-team=data', /label name/],
+		['Team.Example.com/owner=x', /DNS prefix/],
+	])('rejects a kubernetes pod label Kubernetes would refuse: %j', (labels, detail) => {
+		const error = getConfigError(() =>
+			makeCompute({
+				MARIMOHUB_COMPUTE_BACKEND: 'kubernetes',
+				MARIMOHUB_COMPUTE_KUBERNETES_POD_LABELS: labels,
+			}),
+		);
+		expect(error.opts.variable).toBe('MARIMOHUB_COMPUTE_KUBERNETES_POD_LABELS');
+		expect(error.message).toMatch(detail);
+	});
+
+	it('forwards a kubernetes run-as uid, including root', () => {
+		const k8s = (uid?: string) =>
+			configOf(
+				makeCompute({
+					MARIMOHUB_COMPUTE_BACKEND: 'kubernetes',
+					MARIMOHUB_COMPUTE_KUBERNETES_RUN_AS_USER: uid,
+				}),
+			).runAsUser;
+		expect(k8s(undefined)).toBeUndefined();
+		// Whitespace must not become uid 0 (root) via Number(' ') === 0.
+		expect(k8s(' ')).toBeUndefined();
+		expect(k8s('1000')).toBe(1000);
+		expect(k8s('0')).toBe(0);
+		expect(k8s('4294967295')).toBe(4294967295);
+	});
+
+	it.each(['-1', '4294967296', '1.5', 'nobody'])(
+		'rejects an invalid kubernetes run-as uid: %s',
+		(uid) => {
+			const error = getConfigError(() =>
+				makeCompute({
+					MARIMOHUB_COMPUTE_BACKEND: 'kubernetes',
+					MARIMOHUB_COMPUTE_KUBERNETES_RUN_AS_USER: uid,
+				}),
+			);
+			expect(error.opts.variable).toBe('MARIMOHUB_COMPUTE_KUBERNETES_RUN_AS_USER');
+		},
+	);
+
 	it('forwards kubernetes ingress annotations and default-certificate TLS mode', () => {
 		expect(
 			configOf(
@@ -564,6 +764,34 @@ describe('makeCompute fail-fast', () => {
 		);
 	});
 
+	it.each([
+		[undefined, 'auto'],
+		['', 'auto'],
+		['direct', 'direct'],
+		['auto', 'auto'],
+		['gateway', 'gateway'],
+		[' AUTO ', 'auto'],
+	])('configures CoreWeave data connections from %j as %s', (value, expected) => {
+		const provider = makeCompute({
+			MARIMOHUB_COMPUTE_BACKEND: 'coreweave',
+			MARIMOHUB_COMPUTE_COREWEAVE_API_KEY: 'key',
+			MARIMOHUB_COMPUTE_COREWEAVE_DATA_PLANE_MODE: value,
+		});
+		expect(configOf(provider)).toMatchObject({ dataPlaneMode: expected });
+	});
+
+	it('rejects an unknown CoreWeave data connection mode at startup', () => {
+		const error = getConfigError(() =>
+			makeCompute({
+				MARIMOHUB_COMPUTE_BACKEND: 'coreweave',
+				MARIMOHUB_COMPUTE_COREWEAVE_API_KEY: 'key',
+				MARIMOHUB_COMPUTE_COREWEAVE_DATA_PLANE_MODE: 'invalid',
+			}),
+		);
+		expect(error.opts.variable).toBe('MARIMOHUB_COMPUTE_COREWEAVE_DATA_PLANE_MODE');
+		expect(error.message).toContain('expected direct, auto, gateway');
+	});
+
 	it('requires the wandb api key before constructing the adapter', () => {
 		expect(() => makeCompute({ MARIMOHUB_COMPUTE_BACKEND: 'wandb' })).toThrow(
 			/MARIMOHUB_COMPUTE_WANDB_API_KEY/,
@@ -761,4 +989,28 @@ describe('makeCompute local port range', () => {
 			).toThrow(/Invalid MARIMOHUB_COMPUTE_LOCAL_PORTS/);
 		},
 	);
+});
+
+describe('optional compute configuration', () => {
+	describe('makeCompute coreweave', () => {
+		it('treats an empty MARIMOHUB_COMPUTE_COREWEAVE_OBJECT_STORAGE_PERMISSION as unset', () => {
+			expect(() =>
+				makeCompute({
+					MARIMOHUB_COMPUTE_BACKEND: 'coreweave',
+					MARIMOHUB_COMPUTE_COREWEAVE_API_KEY: 'key',
+					MARIMOHUB_COMPUTE_COREWEAVE_OBJECT_STORAGE_PERMISSION: '',
+				}),
+			).not.toThrow();
+		});
+	});
+
+	describe('makeCompute kubernetes', () => {
+		it('treats an empty MARIMOHUB_COMPUTE_KUBERNETES_IMAGE_PULL_POLICY as unset', () => {
+			const provider = makeCompute({
+				MARIMOHUB_COMPUTE_BACKEND: 'kubernetes',
+				MARIMOHUB_COMPUTE_KUBERNETES_IMAGE_PULL_POLICY: '',
+			});
+			expect(configOf(provider).imagePullPolicy).toBeUndefined();
+		});
+	});
 });

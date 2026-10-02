@@ -34,6 +34,8 @@ import deepLinksApp from './routes/deepLinks';
 import appsApp from './routes/apps';
 import sessionsApp from './routes/sessions';
 import systemApp from './routes/system';
+import themeApp from './routes/theme';
+import webManifestApp from './routes/webManifest';
 import tokensApp from './routes/tokens';
 import cliAuthorizationsApp, { cliTokenApp } from './routes/cliAuthorizations';
 import oauthAuthorizationsApp from './routes/oauthAuthorizations';
@@ -76,9 +78,8 @@ const OPENAPI_DOC = {
 		{ name: 'Audit', description: 'Deployment and project audit events' },
 		{ name: 'System', description: 'Deployment metadata' },
 	],
-	// Every documented `/api/v1/*` route sits behind the authN guard, satisfiable
-	// by either the session cookie or a personal access token (the schemes are
-	// registered on the app below), so the requirement is global and disjunctive.
+	// API routes require a session cookie or personal access token by default.
+	// The public theme route overrides this requirement with `security: []`.
 	security: [{ cookieAuth: [] }, { bearerAuth: [] }] as Record<string, string[]>[],
 };
 
@@ -109,9 +110,7 @@ async function rejectionDetails(response: Response): Promise<{ code: string; mes
 		if (result.success) {
 			return { code: result.data.error.code, message: result.data.error.message };
 		}
-	} catch {
-		// Unknown routes can return Hono's plain-text 404.
-	}
+	} catch {}
 	return {
 		code: `HTTP_${response.status}`,
 		message: response.statusText || 'Request rejected',
@@ -136,6 +135,15 @@ function requestResourceContext(path: string) {
  */
 export function createApi(rawDeps: ApiDeps) {
 	const app = createApp();
+	app.notFound((c) => {
+		if (c.req.path === AI_PROXY_PREFIX || c.req.path.startsWith(`${AI_PROXY_PREFIX}/`)) {
+			return c.json({ error: { type: 'invalid_request_error', message: 'Route not found' } }, 404);
+		}
+		return c.json(
+			{ success: false, error: { code: 'NOT_FOUND', message: 'Route not found' } },
+			404,
+		);
+	});
 
 	// Default the exposure mode and kernel probe so library callers need not wire them.
 	const deps: ApiDeps = {
@@ -385,6 +393,9 @@ export function createApi(rawDeps: ApiDeps) {
 			ok ? 200 : 503,
 		);
 	});
+
+	app.route(API_PREFIX, themeApp);
+	app.route('/', webManifestApp);
 
 	// Provider-specific auth routes (e.g. the OIDC login/callback/logout flow).
 	// Mounted before the authN guard so they stay public.

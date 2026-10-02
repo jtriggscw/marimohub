@@ -13,7 +13,8 @@
 		"./compute-profiles": "./src/computeProfiles.ts",
 		"./sandbox-auth": "./src/sandboxAuth.ts",
 		"./spec": "./src/spec.ts",
-		"./package.json": "./package.json"
+		"./package.json": "./package.json",
+		"./theme": "./src/theme.ts"
 	},
 	"scripts": {
 		"build": "vp pack",
@@ -23,6 +24,7 @@
 		"typecheck": "tsc --noEmit"
 	},
 	"dependencies": {
+		"@ai-sdk/amazon-bedrock": "catalog:",
 		"@ai-sdk/openai-compatible": "catalog:",
 		"@marimo-hub/api": "workspace:*",
 		"@marimo-hub/auth-dev": "workspace:*",
@@ -60,6 +62,7 @@
 		"hono": "catalog:"
 	},
 	"devDependencies": {
+		"@ai-sdk/provider": "catalog:",
 		"@aws-sdk/client-s3": "catalog:",
 		"@marimo-hub/tsconfig": "workspace:*",
 		"@types/node": "catalog:",

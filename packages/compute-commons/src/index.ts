@@ -1,3 +1,13 @@
+import { shellQuote } from './shell';
+export { shellQuote, withEnvPrefix } from './shell';
+export { ShellEnvironment, privateEnvironmentWriteCommand } from './shellEnvironment';
+export {
+	validateOutputBudget,
+	readBoundedFile,
+	readBoundedStream,
+	collectBoundedOutput,
+	waitWithSignal,
+} from './boundedRead';
 /**
  * @marimo-hub/compute-commons — vendor-free helpers shared by the compute
  * adapters (`compute-local`, `compute-coreweave`, …).
@@ -14,42 +24,6 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => {
 		setTimeout(resolve, ms);
 	});
-}
-
-/**
- * Single-quote a value for safe interpolation into a `sh -lc` / `sh -c` string.
- * Wraps the value in single quotes and escapes any embedded single quote as the
- * classic `'\''` sequence, so the result is injection-safe for arbitrary input
- * (paths, repo URLs, env values, …).
- *
- * @example shellQuote("a'b") // => "'a'\\''b'"
- */
-export function shellQuote(value: string): string {
-	return `'${value.replaceAll("'", `'\\''`)}'`;
-}
-
-/**
- * Build the `export K='v'; …` shell prefix that carries accumulated env vars into
- * a command, for backends whose `exec` has no per-command env (CoreWeave,
- * Docker, Podman, Kubernetes pod-exec). Values are {@link shellQuote}d. Returns
- * `cmd` unchanged when `env` and `defaults` are empty.
- *
- * `defaults` are fallbacks (`setEnvVars` with `onlyIfUnset`): each is exported
- * behind a `[ -n "${K:-}" ]` guard, so a value the sandbox already defines —
- * image ENV, profile script, or a forced export from `env` — wins. The guards
- * come after the forced exports, which is what lets a key present in both
- * resolve to the forced value.
- */
-export function withEnvPrefix(
-	cmd: string,
-	env: Record<string, string>,
-	defaults: Record<string, string> = {},
-): string {
-	const forced = Object.keys(env).map((k) => `export ${k}=${shellQuote(env[k])}; `);
-	const guarded = Object.keys(defaults).map(
-		(k) => `[ -n "\${${k}:-}" ] || export ${k}=${shellQuote(defaults[k])}; `,
-	);
-	return forced.join('') + guarded.join('') + cmd;
 }
 
 /**

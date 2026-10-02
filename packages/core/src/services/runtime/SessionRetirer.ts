@@ -2,7 +2,9 @@ import { captureThumbnail } from './captureThumbnail';
 import type { Bucket } from '../../ports/bucket';
 import type { SandboxProvider } from '../../ports/sandbox';
 import { sessionOwner } from './sessionOwner';
-import type { Session } from '../../schema';
+import { readStored, VersionSchema } from '../../schema';
+import type { GitSource, Session } from '../../schema';
+import { paths } from '../../paths';
 import { Millis } from '../../duration';
 import { ConflictError } from '../../errors';
 import { logOperationalError } from '../../operationalLog';
@@ -10,11 +12,17 @@ import { captureFilesystemSnapshot } from '../content/filesystemSnapshots';
 import type { NotebookService } from '../content/NotebookService';
 import { SandboxProvisioner } from './SandboxProvisioner';
 import { sessionPersistsEdits } from './sessionState';
+import { pullSourceRootPath, sandboxWorkspaceLayout } from './workspaceLayout';
 import type { SessionService, TakeoverDrainStage } from './SessionService';
 import { stopSurfaceProcessCommand, surfaceCancelFile, surfacePidFile } from './surfaces/state';
 import type { SurfaceId } from './surfaces/types';
 
+const DEFAULT_WORKDIR = '/workspace';
 const TAKEOVER_DRAIN_LEASE_RENEW_INTERVAL_MS = Millis.minutes(1);
+
+class SecondarySurfaceStopError extends Error {
+	override readonly name = 'SecondarySurfaceStopError';
+}
 
 export interface SessionRetirerDeps {
 	sessions: SessionService;
@@ -294,9 +302,21 @@ export class SessionRetirer {
 	): Promise<boolean> {
 		if (!session.sandbox_id) return true;
 		const sandbox = this.deps.compute.create(session.sandbox_id, { owner: sessionOwner(session) });
-		await this.stopSecondarySurfaces(sandbox, session);
+		let canCapture = captureBeforeDestroy;
+		try {
+			await this.stopSecondarySurfaces(sandbox, session);
+		} catch (error) {
+			if (!(error instanceof SecondarySurfaceStopError)) throw error;
+			// A live secondary writer makes a consistent capture unsafe.
+			canCapture = false;
+			logOperationalError(
+				'session_surface_stop_failed',
+				{ operation: 'session_retire.stop_surfaces', session_id: session.session_id },
+				error,
+			);
+		}
 		let persisted = false;
-		if (captureBeforeDestroy) {
+		if (canCapture) {
 			try {
 				const persistEdits =
 					sessionPersistsEdits(session) && (await this.deps.sessions.ownsEditorClaim(session));
@@ -357,7 +377,7 @@ export class SessionRetirer {
 				session.project_id,
 				session.notebook_id,
 				session.sandbox_id,
-				this.deps.workdir,
+				await this.workspaceDir(session),
 				Math.min(thumbnailDeadlineAt ?? Infinity, this.deps.thumbnailDeadline?.() ?? Infinity),
 			);
 		}
@@ -375,6 +395,40 @@ export class SessionRetirer {
 		);
 	}
 
+	/**
+	 * The sandbox was provisioned with the subtree of the session's pinned
+	 * version; a pull sync during the session can move the live `root_path`.
+	 * Versions without `git_source` fall back to the live setting. The thumbnail
+	 * is best-effort: any failure falls back to the workdir rather than blocking
+	 * the sandbox destroy that follows.
+	 */
+	private async workspaceDir(session: Session): Promise<string | undefined> {
+		const workdir = this.deps.workdir;
+		try {
+			const source = await this.deps.notebooks.getNotebookSource(
+				session.project_id,
+				session.notebook_id,
+			);
+			const rootPath = source.type === 'git' ? await this.pinnedRootPath(session, source) : '';
+			return sandboxWorkspaceLayout(workdir ?? DEFAULT_WORKDIR, rootPath).workdir;
+		} catch {
+			return workdir;
+		}
+	}
+
+	private async pinnedRootPath(session: Session, source: GitSource): Promise<string> {
+		const live = pullSourceRootPath(source);
+		if (source.sync_mode !== 'pull' || !session.source_version_id) return live;
+		const meta = paths
+			.project(session.project_id)
+			.notebook(session.notebook_id)
+			.version(session.source_version_id).meta;
+		const object = await this.deps.bucket.get(meta);
+		if (!object) return live;
+		const version = await readStored(VersionSchema, object, meta);
+		return version.git_source?.root_path ?? live;
+	}
+
 	private async stopSecondarySurfaces(
 		sandbox: ReturnType<SandboxProvider['create']>,
 		session: Session,
@@ -388,6 +442,7 @@ export class SessionRetirer {
 					state.status === 'stopping' ||
 					state.status === 'failed'),
 		);
+		if (surfaces.length === 0) return;
 		await Promise.all(
 			surfaces.map(([id]) =>
 				this.deps.sessions.beginSurfaceStop(
@@ -398,7 +453,7 @@ export class SessionRetirer {
 			),
 		);
 		const fenced = await this.deps.sessions.getSession(session.project_id, session.session_id);
-		await Promise.all(
+		const stopped = await Promise.allSettled(
 			surfaces.map(async ([id]) => {
 				const surface = id as SurfaceId;
 				const cancelledAttemptId = fenced.surfaces?.[id]?.cancelled_attempt_id;
@@ -407,9 +462,17 @@ export class SessionRetirer {
 						? surfaceCancelFile(session.session_id, surface, cancelledAttemptId)
 						: undefined,
 				});
-				const result = await sandbox.exec(command, { timeout: 10_000 });
-				if (!result.success) throw new Error(`Failed to stop ${id} before session retirement`);
+				try {
+					const result = await sandbox.exec(command, { timeout: 10_000 });
+					if (!result.success) throw new Error(`Failed to stop ${id} before session retirement`);
+				} catch (cause) {
+					throw new SecondarySurfaceStopError(`Failed to stop ${id} before session retirement`, {
+						cause,
+					});
+				}
 			}),
 		);
+		const failure = stopped.find((result) => result.status === 'rejected');
+		if (failure) throw failure.reason;
 	}
 }

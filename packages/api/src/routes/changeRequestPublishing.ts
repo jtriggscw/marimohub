@@ -1,4 +1,11 @@
-import { ConflictError, NotFoundError, sessionOwner, UnavailableError } from '@marimo-hub/core';
+import {
+	ConflictError,
+	NotFoundError,
+	pullSourceRootPath,
+	sandboxWorkspaceLayout,
+	sessionOwner,
+	UnavailableError,
+} from '@marimo-hub/core';
 import type {
 	AuthSubject,
 	GitSourceRevision,
@@ -32,8 +39,12 @@ export interface PreparedProposal {
 	state: 'new' | 'pending' | 'published';
 }
 
-function publisherFor(deps: PrepareProposalInput['deps'], provider: string) {
-	const publisher = deps.sourceControl?.getPublisher(provider);
+function publisherFor(
+	deps: PrepareProposalInput['deps'],
+	provider: string,
+	projectId: Project['id'],
+) {
+	const publisher = deps.sourceControl?.getPublisher(provider, projectId);
 	if (!publisher) {
 		throw new UnavailableError(`Change-request publishing is not configured for ${provider}`);
 	}
@@ -83,7 +94,7 @@ export async function prepareProposal(input: PrepareProposalInput): Promise<Prep
 		);
 		return {
 			proposal: reusable.proposal,
-			publisher: publisherFor(input.deps, reusable.proposal.source.provider),
+			publisher: publisherFor(input.deps, reusable.proposal.source.provider, input.project.id),
 			notebookTitle: notebook.meta.title,
 			state: 'pending',
 		};
@@ -124,7 +135,16 @@ export async function prepareProposal(input: PrepareProposalInput): Promise<Prep
 		session.source_version_id,
 		legacySourceRevision,
 	);
-	const publisher = publisherFor(input.deps, sourceRevision.provider);
+	const publisher = publisherFor(input.deps, sourceRevision.provider, input.project.id);
+	// The session was provisioned from this revision's subtree, so its layout
+	// follows the revision's root path rather than any pending settings edit.
+	const layout = sandboxWorkspaceLayout(
+		input.deps.sandbox.workdir,
+		pullSourceRootPath({
+			sync_mode: notebook.source.sync_mode,
+			root_path: sourceRevision.root_path,
+		}),
+	);
 	const { proposal, created, publicationState } =
 		await input.deps.services.proposals.captureProposalWithOutcome({
 			projectId: input.project.id,
@@ -132,7 +152,8 @@ export async function prepareProposal(input: PrepareProposalInput): Promise<Prep
 			proposalId: input.proposalId,
 			session,
 			sandbox: input.deps.compute.create(session.sandbox_id, { owner: sessionOwner(session) }),
-			workdir: input.deps.sandbox.workdir,
+			workdir: layout.workdir,
+			gitRoot: layout.gitRoot,
 			author: input.author,
 			targetProposalId: input.targetProposalId,
 			resolvedSourceRevision: sourceRevision,

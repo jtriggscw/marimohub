@@ -1,5 +1,8 @@
+import { vi } from 'vitest';
+import { MAX_REQUEST_BYTES } from '../constants';
 import type { SandboxId } from '../ids';
 import type {
+	BoundedReadOptions,
 	ActiveSandbox,
 	CreateSandboxOptions,
 	ExecOptions,
@@ -18,6 +21,18 @@ import type {
 	WaitForPortOptions,
 } from '../ports/sandbox';
 import { execResult, listFilesFailure, readFileFailure } from '../ports/sandbox';
+import { shellQuote } from '../services/runtime/shell';
+
+function validReadBudget({ maxBytes, timeoutMs }: BoundedReadOptions): boolean {
+	return (
+		Number.isSafeInteger(maxBytes) &&
+		maxBytes >= 0 &&
+		Number.isSafeInteger(4 * Math.ceil(maxBytes / 3)) &&
+		Number.isFinite(timeoutMs) &&
+		timeoutMs > 0 &&
+		timeoutMs <= 2 ** 31 - 1
+	);
+}
 
 /** URL the fake sandbox reports from `exposePort`. */
 export const EXPOSED_URL = 'https://sandbox.example/kernel';
@@ -47,6 +62,7 @@ export interface SandboxCalls {
 }
 
 export interface FakeSandboxOptions {
+	execResult?: ExecResult;
 	/** When set, `exec(cmd)` rejects if `cmd` matches this value. */
 	failExec?: string;
 	/** When true, `mountBucket` rejects (forcing the manual-copy fallback path). */
@@ -106,9 +122,17 @@ export function makeFakeSandbox(opts: FakeSandboxOptions = {}): {
 			if (opts.failExec !== undefined && cmd === opts.failExec) {
 				throw new Error('sandbox unreachable');
 			}
-			return { success: true, stdout: '', stderr: '' };
+			return opts.execResult ?? { success: true, stdout: '', stderr: '' };
 		},
 		execStream: async () => new ReadableStream(),
+		readFileBounded: async (path, options) => {
+			if (!validReadBudget(options)) return readFileFailure();
+			const result = await instance.readFile(path);
+			return result.success &&
+				new TextEncoder().encode(result.content).byteLength > options.maxBytes
+				? readFileFailure()
+				: result;
+		},
 		readFile: async (path: string): Promise<ReadFileResult> => {
 			calls.readFile.push(path);
 			const content = opts.files?.[path];
@@ -191,7 +215,7 @@ export interface FsSandboxOptions {
  * this one actually round-trips file contents, so it exercises the real
  * `sandboxFiles` codec:
  *   - restore stores the bytes `writeFiles` hands over, verbatim;
- *   - capture emits `base64 -w0 <path>`, since reads still come back over `exec`;
+ *   - bounded reads preserve bytes through base64 encoding;
  *   - `listFiles` reports current contents with real byte sizes;
  *   - `readFile` returns stored content (decoded as UTF-8).
  *
@@ -246,6 +270,13 @@ export function makeFsSandbox(opts: FsSandboxOptions = {}): {
 		},
 		async execStream() {
 			return new ReadableStream();
+		},
+		async readFileBounded(path: string, options: BoundedReadOptions): Promise<ReadFileResult> {
+			if (!validReadBudget(options)) return readFileFailure();
+			calls.readFile.push(path);
+			const bytes = fs.get(toRel(path));
+			if (bytes === undefined || bytes.length > options.maxBytes) return readFileFailure();
+			return { success: true, content: fsBase64Encode(bytes), encoding: 'base64' };
 		},
 		async readFile(path: string): Promise<ReadFileResult> {
 			calls.readFile.push(path);
@@ -303,6 +334,82 @@ export function makeFsSandbox(opts: FsSandboxOptions = {}): {
 	} satisfies SandboxInstance;
 
 	return { instance, fs, calls };
+}
+
+export interface GitWorkingTreeSandboxOptions extends FsSandboxOptions {
+	files: Record<string, string | Uint8Array>;
+	diff?: readonly (readonly [status: string, path: string])[];
+	untracked?: readonly string[];
+	/** Raw `git diff -z` stdout; overrides `diff`. */
+	diffOutput?: string;
+	/** Raw `git ls-files -z` stdout; overrides `untracked`. */
+	untrackedOutput?: string;
+	gitAvailable?: boolean;
+	baseCommitAvailable?: boolean;
+	baseCommitOutput?: string;
+	baseCommitStderr?: string;
+	diffFails?: boolean;
+	secureReadFailures?: readonly string[];
+}
+
+/**
+ * `makeFsSandbox` plus canned answers for the Git commands proposal capture
+ * runs, including the O_NOFOLLOW read script (served from the in-memory files
+ * under `root`).
+ */
+export function makeGitWorkingTreeSandbox(options: GitWorkingTreeSandboxOptions) {
+	const root = options.root ?? DEFAULT_FS_ROOT;
+	const sandbox = makeFsSandbox(options);
+	const cannedAnswer = (command: string): ExecResult | undefined => {
+		if (command.includes('test -e .git')) {
+			return options.gitAvailable === false
+				? execResult(false, '', 'not a repository')
+				: execResult(true, 'git-working-tree', '');
+		}
+		if (command.includes('rev-parse --verify')) {
+			return options.baseCommitAvailable === false
+				? execResult(false, '', options.baseCommitStderr ?? 'unknown revision')
+				: execResult(true, options.baseCommitOutput ?? `${'a'.repeat(40)}\n`, '');
+		}
+		if (command.includes('diff --name-status')) {
+			if (options.diffFails) return execResult(false, '', 'diff failed');
+			const output =
+				options.diffOutput ??
+				(options.diff ?? [])
+					.flatMap(([status, path]) => [status, path])
+					.map((field) => `${field}\0`)
+					.join('');
+			return execResult(true, output, '');
+		}
+		if (command.includes('ls-files --others')) {
+			return execResult(
+				true,
+				options.untrackedOutput ?? (options.untracked ?? []).map((path) => `${path}\0`).join(''),
+				'',
+			);
+		}
+		if (command.includes('os.O_NOFOLLOW')) {
+			const path = Object.keys(options.files).find((candidate) =>
+				command.endsWith(` ${shellQuote(root)} ${shellQuote(candidate)} ${MAX_REQUEST_BYTES}`),
+			);
+			if (!path || options.secureReadFailures?.includes(path)) {
+				return execResult(false, '', 'unsafe or missing file');
+			}
+			const bytes = sandbox.fs.get(path);
+			if (bytes === undefined) return execResult(false, '', 'not found');
+			return execResult(true, fsBase64Encode(bytes), '');
+		}
+		return undefined;
+	};
+	const exec = vi.fn<SandboxInstance['exec']>(async (command, execOptions) => {
+		const canned = cannedAnswer(command);
+		// Delegation records the call itself; canned answers must be recorded here.
+		if (canned === undefined) return sandbox.instance.exec(command, execOptions);
+		sandbox.calls.exec.push(command);
+		sandbox.calls.execOptions.push(execOptions);
+		return canned;
+	});
+	return { ...sandbox, instance: { ...sandbox.instance, exec }, exec };
 }
 
 /** A fake `SandboxProvider` that records the options of its last `create` call. */

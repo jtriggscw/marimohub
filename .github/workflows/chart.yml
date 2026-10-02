@@ -33,6 +33,79 @@ jobs:
       - name: helm lint
         run: helm lint --strict charts/marimohub
 
+      - name: Verify image references
+        run: bash charts/marimohub/ci/check-images.sh
+
+      - name: Verify Deployment annotations
+        run: bash charts/marimohub/ci/check-deployment-annotations.sh
+
+      - name: Verify sandbox pre-puller configuration
+        run: |
+          if error=$(helm template test charts/marimohub \
+            --set sandboxImagePrepuller.enabled=true \
+            --set sandboxImagePrepuller.nodeSelector.pool=sandboxes 2>&1); then
+            echo "Expected enabled pre-puller without images to fail"
+            exit 1
+          fi
+          grep -Fq 'sandboxImagePrepuller.images must list the sandbox images to pre-pull' <<< "$error"
+          if error=$(helm template test charts/marimohub \
+            --set sandboxImagePrepuller.enabled=true \
+            --set-json 'sandboxImagePrepuller.images=["example.com/sandbox:test"]' 2>&1); then
+            echo "Expected enabled pre-puller without a node selector to fail"
+            exit 1
+          fi
+          grep -Fq 'sandboxImagePrepuller.nodeSelector must select the sandbox node pool' <<< "$error"
+
+          for uid in 1000 2000; do
+            helm template test charts/marimohub \
+              -f charts/marimohub/ci/sandbox-prepuller-values.yaml \
+              --set podSecurityContext.runAsUser="$uid" | ruby -ryaml -e '
+              documents = YAML.load_stream(STDIN.read).compact
+              daemon = documents.find { |document| document["kind"] == "DaemonSet" }
+              abort "missing pre-puller" unless daemon
+              pod = daemon.fetch("spec").fetch("template").fetch("spec")
+              context = pod.fetch("securityContext")
+              abort "pod security context override ignored" unless context["runAsUser"] == ARGV[0].to_i
+              (pod.fetch("initContainers") + pod.fetch("containers")).each do |container|
+                security = context.merge(container.fetch("securityContext"))
+                abort "root container" unless security["runAsNonRoot"] == true && security["runAsUser"] > 0
+                abort "missing seccomp profile" unless security.dig("seccompProfile", "type") == "RuntimeDefault"
+                abort "privilege escalation allowed" unless security["allowPrivilegeEscalation"] == false
+                abort "capabilities retained" unless security.dig("capabilities", "drop") == ["ALL"]
+              end
+            ' "$uid"
+          done
+
+      - name: Verify reserved volumes and mounts
+        run: |
+          assert_reserved() {
+            local error
+            if error=$(helm template test charts/marimohub \
+              --set maintenance.enabled="$maintenance" --set-json "$1" 2>&1); then
+              echo "expected reserved volume or mount to fail"
+              return 1
+            fi
+            grep -Fq "$2" <<< "$error"
+          }
+          for maintenance in true false; do
+            assert_reserved \
+              'extraVolumes=[{"name":"data","emptyDir":{}},{"name":"tmp","emptyDir":{}}]' \
+              'extraVolumes[1].name: tmp is reserved by the chart'
+            assert_reserved \
+              'extraVolumeMounts=[{"name":"tmp","mountPath":"/other"}]' \
+              'extraVolumeMounts[0].name: tmp is reserved by the chart'
+            assert_reserved \
+              'extraVolumeMounts=[{"name":"data","mountPath":"/tmp"}]' \
+              'extraVolumeMounts[0].mountPath: /tmp is reserved by the chart'
+            helm template test charts/marimohub \
+              --set maintenance.enabled="$maintenance" >/dev/null
+            helm template test charts/marimohub \
+              --set maintenance.enabled="$maintenance" \
+              --set-json 'extraVolumes=[{"name":"data","emptyDir":{}}]' \
+              --set-json 'extraVolumeMounts=[{"name":"data","mountPath":"/data"},{"name":"data","mountPath":"/other","readOnly":true}]' \
+              >/dev/null
+          done
+
       - name: Verify surface image upgrade compatibility
         run: |
           legacy_image=ghcr.io/example/sandbox:legacy-vscode
@@ -60,7 +133,7 @@ jobs:
       # schema (none of our kinds are CRDs) as an error.
       - name: Render & validate manifests
         run: |
-          for values in "" "-f charts/marimohub/ci/example-values.yaml" "-f charts/marimohub/ci/kubernetes-secrets-values.yaml"; do
+          for values in "" "-f charts/marimohub/ci/example-values.yaml" "-f charts/marimohub/ci/kubernetes-secrets-values.yaml" "-f charts/marimohub/ci/sandbox-prepuller-values.yaml"; do
             echo "::group::helm template ${values:-(defaults)}"
             helm template test charts/marimohub $values \
               | kubeconform -strict -summary -verbose \

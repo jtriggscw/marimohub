@@ -29,7 +29,8 @@ Use these as the done-criteria for any change.
   It imports **no vendor SDK** — nothing that speaks to a specific provider or
   performs I/O. Its deps are generic, side-effect-free utilities only: `ulidx`,
   `croner` (cron evaluation for notebook jobs; no timers are ever started),
-  `zod`, `better-all`, `@opentelemetry/api` and `@opentelemetry/api-logs` (no-op
+  `zod`, `better-all`, `tldts` (public suffix parsing for cookie isolation),
+  `@opentelemetry/api` and `@opentelemetry/api-logs` (no-op
   tracing/logs facades unless an entrypoint registers a provider), the format
   serializers `smol-toml` and `yaml` (core renders `marimo.toml` and integration
   config files), and `fflate` (in-memory archive decompression for workspace
@@ -139,6 +140,7 @@ These CAS-managed records also have one writer each:
   `projects/{pid}/alerts.json`.
 - `SessionService` owns each editor claim at
   `_system/editors/{pid}/{nid}.json`.
+- `WarmPoolStore` owns each deployment warm-pool record at `_system/warm-pools/{backend}.json`, including creation reservations, claims, and pending reclamation.
 - `AppPoolStore` owns each app pool at `_system/app-pools/{pid}/{nid}.json`,
   including reservations, account assignments, visit leases, and retained deletion tombstones.
 - `SessionService.claimApp`/`releaseApp` owns each legacy app claim at

@@ -1,5 +1,23 @@
-import { describe, expect, it } from 'vitest';
-import { NotFoundError, SandboxFilesystemNotADirectoryError } from 'modal';
+import { describe, expect, it, vi } from 'vitest';
+import { spawn, spawnSync } from 'node:child_process';
+import { Readable } from 'node:stream';
+import {
+	App,
+	Image,
+	ModalClient,
+	NotFoundError,
+	Sandbox,
+	Secret,
+	SandboxFilesystemNotADirectoryError,
+} from 'modal';
+import type {
+	AppFromNameParams,
+	ContainerProcess,
+	FileInfo,
+	SandboxCreateParams,
+	SandboxExecParams,
+	Tunnel,
+} from 'modal';
 import { Millis } from '@marimo-hub/core/duration';
 import type { SandboxId } from '@marimo-hub/core/ids';
 import { listFilesFailure } from '@marimo-hub/core/ports/sandbox';
@@ -16,14 +34,19 @@ import {
 	scriptContractLaunch,
 } from '@marimo-hub/core/testing/compute-contract';
 import { modalProfileResources, ModalCompute } from './index';
-import type {
-	ModalClientLike,
-	ModalFileInfoLike,
-	ModalProcessLike,
-	ModalSandboxLike,
-} from './index';
 
 const SANDBOX_ID = 'sb-abc' as SandboxId;
+
+type ProcessFixture = {
+	stdin: Pick<ContainerProcess<string>['stdin'], 'close'>;
+	stdout: ReadableStream<string>;
+	stderr: ReadableStream<string>;
+	wait: ContainerProcess<string>['wait'];
+};
+
+function makeClient(): ModalClient {
+	return new ModalClient({ tokenId: 'token-id', tokenSecret: 'token-secret' });
+}
 
 function textStream(value: string): ReadableStream<string> {
 	return new ReadableStream({
@@ -34,8 +57,9 @@ function textStream(value: string): ReadableStream<string> {
 	});
 }
 
-function processResult(exitCode = 0, stdout = '', stderr = ''): ModalProcessLike {
+function processResult(exitCode = 0, stdout = '', stderr = ''): ProcessFixture {
 	return {
+		stdin: { close: async () => {} },
 		stdout: textStream(stdout),
 		stderr: textStream(stderr),
 		wait: async () => exitCode,
@@ -43,7 +67,7 @@ function processResult(exitCode = 0, stdout = '', stderr = ''): ModalProcessLike
 }
 
 function pendingProcessResult(): {
-	process: ModalProcessLike;
+	process: ProcessFixture;
 	resolve: (exitCode: number) => void;
 } {
 	let resolve = (_exitCode: number) => {};
@@ -52,6 +76,7 @@ function pendingProcessResult(): {
 	});
 	return {
 		process: {
+			stdin: { close: async () => {} },
 			stdout: textStream(''),
 			stderr: textStream(''),
 			wait: () => wait,
@@ -60,19 +85,45 @@ function pendingProcessResult(): {
 	};
 }
 
-class FakeSandbox implements ModalSandboxLike {
+class FakeSandbox extends Sandbox {
 	readonly files = new Map<string, string | Uint8Array>();
-	readonly directories = new Map<string, ModalFileInfoLike[]>();
+	readonly directories = new Map<string, Pick<FileInfo, 'name' | 'path' | 'type' | 'size'>[]>();
 	readonly execCalls: {
 		command: string[];
-		options?: Parameters<ModalSandboxLike['exec']>[1];
+		options?: SandboxExecParams;
 	}[] = [];
 	readonly tags: Record<string, string>;
 	terminated = false;
-	execImpl: (command: string[]) => ModalProcessLike = () => processResult();
+	execImpl: (command: string[]) => ProcessFixture = () => processResult();
 
 	constructor(tags: Record<string, string> = {}) {
+		super(makeClient(), 'sb-fake');
 		this.tags = tags;
+		vi.spyOn(this.filesystem, 'readText').mockImplementation(async (path) => {
+			const value = this.files.get(path);
+			if (typeof value !== 'string') throw new Error('not found');
+			return value;
+		});
+		vi.spyOn(this.filesystem, 'writeText').mockImplementation(async (content, path) => {
+			this.writeFile(path, content);
+		});
+		vi.spyOn(this.filesystem, 'writeBytes').mockImplementation(async (content, path) => {
+			this.writeFile(path, content instanceof ArrayBuffer ? new Uint8Array(content) : content);
+		});
+		vi.spyOn(this.filesystem, 'listFiles').mockImplementation(async (path) => {
+			if (this.files.has(path)) {
+				throw new SandboxFilesystemNotADirectoryError(`${path} is not a directory`);
+			}
+			return (this.directories.get(path) ?? []).map((file) => ({
+				...file,
+				mode: 0o644,
+				permissions: 'rw-r--r--',
+				owner: 'root',
+				group: 'root',
+				modifiedTime: 0,
+				symlinkTarget: null,
+			}));
+		});
 	}
 
 	private writeFile(path: string, content: string | Uint8Array): void {
@@ -88,44 +139,45 @@ class FakeSandbox implements ModalSandboxLike {
 		this.directories.set(directory, entries);
 	}
 
-	filesystem = {
-		readText: async (path: string) => {
-			const value = this.files.get(path);
-			if (typeof value !== 'string') throw new Error('not found');
-			return value;
-		},
-		writeText: async (content: string, path: string) => {
-			this.writeFile(path, content);
-		},
-		writeBytes: async (content: Uint8Array, path: string) => {
-			this.writeFile(path, content);
-		},
-		listFiles: async (path: string) => {
-			if (this.files.has(path)) {
-				throw new SandboxFilesystemNotADirectoryError(`${path} is not a directory`);
-			}
-			return this.directories.get(path) ?? [];
-		},
-	};
-
-	async exec(
+	override exec(
 		command: string[],
-		options?: Parameters<ModalSandboxLike['exec']>[1],
-	): Promise<ModalProcessLike> {
+		options?: SandboxExecParams & { mode?: 'text' },
+	): Promise<ContainerProcess<string>>;
+	override exec(
+		command: string[],
+		options: SandboxExecParams & { mode: 'binary' },
+	): Promise<ContainerProcess<Uint8Array>>;
+	override async exec(
+		command: string[],
+		options?: SandboxExecParams,
+	): Promise<ContainerProcess<string> | ContainerProcess<Uint8Array>> {
+		if (options?.mode === 'binary') throw new Error('Binary exec is not used by this adapter');
 		this.execCalls.push({ command, options });
-		return this.execImpl(command);
+		// Fixtures provide only the process members exercised by the adapter.
+		return this.execImpl(command) as ContainerProcess<string>;
 	}
 
-	async getTags(): Promise<Record<string, string>> {
+	override async getTags(): Promise<Record<string, string>> {
 		return this.tags;
 	}
 
-	async terminate(): Promise<void> {
+	override terminate(): Promise<void>;
+	override terminate(options: { wait: true }): Promise<number>;
+	override async terminate(options?: { wait: true }): Promise<void | number> {
 		this.terminated = true;
+		if (options?.wait) return 0;
 	}
 
-	async tunnels(): Promise<Record<number, { url: string }>> {
-		return { 2718: { url: 'https://sandbox.modal.host' } };
+	override async tunnels(): Promise<Record<number, Tunnel>> {
+		return {
+			2718: {
+				host: 'sandbox.modal.host',
+				port: 443,
+				url: 'https://sandbox.modal.host',
+				tlsSocket: ['sandbox.modal.host', 443],
+				tcpSocket: ['sandbox.modal.host', 443],
+			},
+		};
 	}
 }
 
@@ -133,44 +185,40 @@ function makeWorld() {
 	const existing = new Map<string, FakeSandbox>();
 	const listed: FakeSandbox[] = [];
 	const created: {
-		app: unknown;
-		image: unknown;
-		options: Parameters<ModalClientLike['sandboxes']['create']>[2];
+		app: App;
+		image: Image;
+		options: SandboxCreateParams;
 		sandbox: FakeSandbox;
 	}[] = [];
-	const appCalls: { name: string; options?: { createIfMissing?: boolean } }[] = [];
+	const appCalls: { name: string; options?: AppFromNameParams }[] = [];
 	const imageCalls: string[] = [];
 
-	const client: ModalClientLike = {
-		apps: {
-			async fromName(name, options) {
-				appCalls.push({ name, options });
-				return { appId: `ap-${name}` };
-			},
-		},
-		images: {
-			fromRegistry(image) {
-				imageCalls.push(image);
-				return { image };
-			},
-		},
-		sandboxes: {
-			async create(app, image, options) {
-				const sandbox = new FakeSandbox(options.tags);
-				existing.set(options.name, sandbox);
-				created.push({ app, image, options, sandbox });
-				return sandbox;
-			},
-			async fromName(_appName, name) {
-				const sandbox = existing.get(name);
-				if (!sandbox) throw new NotFoundError('missing');
-				return sandbox;
-			},
-			async *list() {
-				yield* listed;
-			},
-		},
-	};
+	const client = makeClient();
+	vi.spyOn(client.apps, 'fromName').mockImplementation(async (name, options) => {
+		appCalls.push({ name, options });
+		return new App(`ap-${name}`);
+	});
+	const fromRegistry = client.images.fromRegistry.bind(client.images);
+	vi.spyOn(client.images, 'fromRegistry').mockImplementation((image) => {
+		imageCalls.push(image);
+		return fromRegistry(image);
+	});
+	vi.spyOn(client.secrets, 'fromName').mockImplementation(async (name) => new Secret(`st-${name}`));
+	vi.spyOn(client.sandboxes, 'create').mockImplementation(async (app, image, options = {}) => {
+		if (!options.name) throw new Error('Sandbox name is required by the test fixture');
+		const sandbox = new FakeSandbox(options.tags);
+		existing.set(options.name, sandbox);
+		created.push({ app, image, options, sandbox });
+		return sandbox;
+	});
+	vi.spyOn(client.sandboxes, 'fromName').mockImplementation(async (_appName, name) => {
+		const sandbox = existing.get(name);
+		if (!sandbox) throw new NotFoundError('missing');
+		return sandbox;
+	});
+	vi.spyOn(client.sandboxes, 'list').mockImplementation(async function* () {
+		yield* listed;
+	});
 
 	return { client, existing, listed, created, appCalls, imageCalls };
 }
@@ -197,8 +245,9 @@ describe('ModalCompute', () => {
 			image: 'ghcr.io/acme/marimo:latest',
 			environment: 'notebooks',
 		});
-		const client = Reflect.get(compute, 'client') as { profile: { environment?: string } };
+		const client = Reflect.get(compute, 'client') as ModalClient;
 
+		expect(client).toBeInstanceOf(ModalClient);
 		expect(client.profile.environment).toBe('notebooks');
 	});
 
@@ -235,6 +284,214 @@ describe('ModalCompute', () => {
 		expect(world.created[0].options.command).toEqual(['sleep', 'infinity']);
 	});
 
+	it.each([false, true])(
+		'injects named secrets into every new sandbox (reuse: %s)',
+		async (reuse) => {
+			const world = makeWorld();
+			const compute = makeCompute(world, { secretNames: ['shared-credentials', 'huggingface'] });
+
+			await compute.create(SANDBOX_ID, { reuse }).exec('true');
+			await compute
+				.create('sb-other' as SandboxId, { reuse, image: 'ghcr.io/acme/other:latest' })
+				.exec('true');
+
+			expect(world.client.secrets.fromName).toHaveBeenCalledTimes(4);
+			expect(world.created).toHaveLength(2);
+			for (const { options } of world.created) {
+				expect(options.secrets?.map((secret) => secret.secretId)).toEqual([
+					'st-shared-credentials',
+					'st-huggingface',
+				]);
+			}
+		},
+	);
+
+	it('starts app and secret lookups concurrently before creating the sandbox', async () => {
+		const world = makeWorld();
+		const app = Promise.withResolvers<App>();
+		const firstSecret = Promise.withResolvers<Secret>();
+		const secondSecret = Promise.withResolvers<Secret>();
+		vi.spyOn(world.client.apps, 'fromName').mockReturnValue(app.promise);
+		vi.mocked(world.client.secrets.fromName)
+			.mockReturnValueOnce(firstSecret.promise)
+			.mockReturnValueOnce(secondSecret.promise);
+		const started = makeCompute(world, { secretNames: ['first', 'second'] })
+			.create(SANDBOX_ID, { reuse: false })
+			.exec('true');
+
+		await vi.waitFor(() => {
+			expect(world.client.apps.fromName).toHaveBeenCalledOnce();
+			expect(world.client.secrets.fromName).toHaveBeenCalledTimes(2);
+		});
+		expect(world.created).toHaveLength(0);
+
+		secondSecret.resolve(new Secret('st-second'));
+		firstSecret.resolve(new Secret('st-first'));
+		app.resolve(new App('ap-hub-app'));
+		await started;
+
+		expect(world.created).toHaveLength(1);
+		expect(world.created[0]).toMatchObject({
+			app: { appId: 'ap-hub-app' },
+			options: { secrets: [{ secretId: 'st-first' }, { secretId: 'st-second' }] },
+		});
+	});
+
+	it.each([
+		['app', 'resolve'],
+		['app', 'reject'],
+		['secret', 'resolve'],
+		['secret', 'reject'],
+	])(
+		'preserves the %s lookup failure when pending lookups later %s',
+		async (failedLookup, lateOutcome) => {
+			const world = makeWorld();
+			const app = Promise.withResolvers<App>();
+			const firstSecret = Promise.withResolvers<Secret>();
+			const secondSecret = Promise.withResolvers<Secret>();
+			vi.spyOn(world.client.apps, 'fromName').mockReturnValue(app.promise);
+			vi.mocked(world.client.secrets.fromName)
+				.mockReturnValueOnce(firstSecret.promise)
+				.mockReturnValueOnce(secondSecret.promise);
+			const create = vi.spyOn(world.client.sandboxes, 'create');
+			const error = new Error(`${failedLookup} lookup failed`);
+			const started = makeCompute(world, { secretNames: ['first', 'second'] })
+				.create(SANDBOX_ID, { reuse: false })
+				.exec('true');
+			const expected = failedLookup === 'app' ? error : expect.objectContaining({ cause: error });
+			const failure = expect(started).rejects.toEqual(expected);
+
+			await vi.waitFor(() => {
+				expect(world.client.apps.fromName).toHaveBeenCalledOnce();
+				expect(world.client.secrets.fromName).toHaveBeenCalledTimes(2);
+			});
+			(failedLookup === 'app' ? app : firstSecret).reject(error);
+			await failure;
+			expect(create).not.toHaveBeenCalled();
+
+			if (lateOutcome === 'reject') {
+				const lateError = new Error('Late lookup failure');
+				(failedLookup === 'app' ? firstSecret : app).reject(lateError);
+				secondSecret.reject(lateError);
+			} else {
+				if (failedLookup === 'app') firstSecret.resolve(new Secret('st-first'));
+				else app.resolve(new App('ap-hub-app'));
+				secondSecret.resolve(new Secret('st-second'));
+			}
+			await new Promise<void>((resolve) => setImmediate(resolve));
+
+			await expect(started).rejects.toEqual(expected);
+			expect(create).not.toHaveBeenCalled();
+		},
+	);
+
+	it('propagates sandbox creation failures after resolving app and secrets', async () => {
+		const world = makeWorld();
+		const error = new Error('Sandbox quota exceeded');
+		const create = vi.spyOn(world.client.sandboxes, 'create').mockRejectedValue(error);
+
+		await expect(
+			makeCompute(world, { secretNames: ['shared-credentials'] })
+				.create(SANDBOX_ID, { reuse: false })
+				.exec('true'),
+		).rejects.toBe(error);
+
+		expect(create).toHaveBeenCalledExactlyOnceWith(
+			new App('ap-hub-app'),
+			expect.any(Image),
+			expect.objectContaining({ secrets: [new Secret('st-shared-credentials')] }),
+		);
+	});
+
+	it.each([undefined, []])('omits secrets when none are configured: %j', async (secretNames) => {
+		const world = makeWorld();
+		await makeCompute(world, { secretNames }).create(SANDBOX_ID, { reuse: false }).exec('true');
+
+		expect(world.client.secrets.fromName).not.toHaveBeenCalled();
+		expect(world.created[0].options).not.toHaveProperty('secrets');
+	});
+
+	it.each([false, true])(
+		'does not create a sandbox if a secret lookup fails (reuse: %s)',
+		async (reuse) => {
+			const world = makeWorld();
+			const error = new NotFoundError('Secret not found');
+			vi.mocked(world.client.secrets.fromName).mockRejectedValue(error);
+
+			const failure = await makeCompute(world, { secretNames: ['missing'] })
+				.create(SANDBOX_ID, { reuse })
+				.exec('true')
+				.catch((caught: unknown) => caught);
+
+			expect(failure).toBeInstanceOf(Error);
+			expect(failure).not.toBeInstanceOf(NotFoundError);
+			expect(failure).toMatchObject({
+				name: 'ModalSecretLookupError',
+				message:
+					'could not resolve Modal secret "missing" (MARIMOHUB_COMPUTE_MODAL_SECRETS) in the default environment: Secret not found',
+				cause: error,
+			});
+			expect(world.created).toHaveLength(0);
+		},
+	);
+
+	it('names the Modal environment when a secret lookup fails', async () => {
+		const world = makeWorld();
+		vi.spyOn(world.client, 'environmentName').mockReturnValue('notebooks');
+		vi.mocked(world.client.secrets.fromName).mockImplementation(async (name) => {
+			if (name === 'typo') throw new NotFoundError("Secret 'typo' not found");
+			return new Secret(`st-${name}`);
+		});
+
+		await expect(
+			makeCompute(world, { secretNames: ['present', 'typo'] })
+				.create(SANDBOX_ID, { reuse: false })
+				.exec('true'),
+		).rejects.toThrow(
+			'could not resolve Modal secret "typo" (MARIMOHUB_COMPUTE_MODAL_SECRETS) in environment "notebooks"',
+		);
+	});
+
+	describe('healthCheck', () => {
+		it('passes when the app and every secret resolve', async () => {
+			const world = makeWorld();
+			await expect(
+				makeCompute(world, { secretNames: ['first', 'second'] }).healthCheck(),
+			).resolves.toBeUndefined();
+
+			expect(world.appCalls).toEqual([{ name: 'hub-app', options: undefined }]);
+			expect(world.client.secrets.fromName).toHaveBeenCalledTimes(2);
+			expect(world.created).toHaveLength(0);
+		});
+
+		it('passes before the first sandbox has created the app', async () => {
+			const world = makeWorld();
+			vi.spyOn(world.client.apps, 'fromName').mockRejectedValue(new NotFoundError('no app'));
+
+			await expect(makeCompute(world).healthCheck()).resolves.toBeUndefined();
+		});
+
+		it('fails naming the missing secret', async () => {
+			const world = makeWorld();
+			vi.mocked(world.client.secrets.fromName).mockImplementation(async (name) => {
+				if (name === 'typo') throw new NotFoundError('Secret not found');
+				return new Secret(`st-${name}`);
+			});
+
+			await expect(
+				makeCompute(world, { secretNames: ['present', 'typo'] }).healthCheck(),
+			).rejects.toThrow('could not resolve Modal secret "typo" (MARIMOHUB_COMPUTE_MODAL_SECRETS)');
+		});
+
+		it('propagates app lookup failures other than not-found', async () => {
+			const world = makeWorld();
+			const error = new Error('Permission denied');
+			vi.spyOn(world.client.apps, 'fromName').mockRejectedValue(error);
+
+			await expect(makeCompute(world).healthCheck()).rejects.toBe(error);
+		});
+	});
+
 	it('derives a per-sandbox idle fallback from the session deadline', async () => {
 		const world = makeWorld();
 		await makeCompute(world)
@@ -264,9 +521,12 @@ describe('ModalCompute', () => {
 		const existing = new FakeSandbox();
 		world.existing.set(SANDBOX_ID, existing);
 
-		await makeCompute(world).create(SANDBOX_ID).exec('echo hi');
+		await makeCompute(world, { secretNames: ['shared-credentials'] })
+			.create(SANDBOX_ID)
+			.exec('echo hi');
 
 		expect(world.created).toHaveLength(0);
+		expect(world.client.secrets.fromName).not.toHaveBeenCalled();
 		expect(existing.execCalls[0].command).toEqual(['sh', '-lc', 'echo hi']);
 	});
 
@@ -274,6 +534,23 @@ describe('ModalCompute', () => {
 		const world = makeWorld();
 		await makeCompute(world).create(SANDBOX_ID).exec('true');
 		expect(world.created).toHaveLength(1);
+	});
+
+	it('does not provision a replacement when reuse lookup fails with a permission error', async () => {
+		const world = makeWorld();
+		const error = new Error('Permission denied');
+		vi.spyOn(world.client.sandboxes, 'fromName').mockRejectedValue(error);
+		const create = vi.spyOn(world.client.sandboxes, 'create');
+
+		await expect(
+			makeCompute(world, { secretNames: ['shared-credentials'] })
+				.create(SANDBOX_ID)
+				.exec('true'),
+		).rejects.toBe(error);
+
+		expect(world.appCalls).toHaveLength(0);
+		expect(world.client.secrets.fromName).not.toHaveBeenCalled();
+		expect(create).not.toHaveBeenCalled();
 	});
 
 	it('maps process output and passes accumulated environment variables', async () => {
@@ -291,6 +568,59 @@ describe('ModalCompute', () => {
 		expect(sandbox.execCalls[0].options?.env).toEqual({ A: '1', B: '2' });
 	});
 
+	it.each([
+		[1, 1000],
+		[1000, 1000],
+		[119_999, 120_000],
+		[120_000, 120_000],
+	])('rounds exec timeout %i up to %i ms for Modal', async (timeout, timeoutMs) => {
+		const world = makeWorld();
+		const sandbox = new FakeSandbox();
+		world.existing.set(SANDBOX_ID, sandbox);
+		const instance = makeCompute(world).create(SANDBOX_ID);
+
+		await instance.exec('run', { timeout });
+		await instance.execStream('run', { timeout });
+
+		expect(sandbox.execCalls).toHaveLength(2);
+		for (const call of sandbox.execCalls) {
+			expect(call.options?.timeoutMs).toBe(timeoutMs);
+		}
+	});
+
+	it.each([0, undefined])('omits the Modal exec timeout for %s', async (timeout) => {
+		const world = makeWorld();
+		const sandbox = new FakeSandbox();
+		world.existing.set(SANDBOX_ID, sandbox);
+		const instance = makeCompute(world).create(SANDBOX_ID);
+
+		await instance.exec('run', { timeout });
+		await instance.execStream('run', { timeout });
+
+		expect(sandbox.execCalls).toHaveLength(2);
+		for (const call of sandbox.execCalls) {
+			expect(call.options).not.toHaveProperty('timeoutMs');
+		}
+	});
+
+	it.each([-1, -1000, Number.NaN, Infinity, -Infinity])(
+		'rejects invalid exec timeout %s before acquiring a sandbox',
+		async (timeout) => {
+			const world = makeWorld();
+			const instance = makeCompute(world).create(SANDBOX_ID);
+
+			await expect(instance.exec('run', { timeout })).rejects.toThrow(
+				new RangeError('Sandbox exec timeout must be finite and nonnegative'),
+			);
+			await expect(instance.execStream('run', { timeout })).rejects.toThrow(
+				new RangeError('Sandbox exec timeout must be finite and nonnegative'),
+			);
+
+			expect(world.client.sandboxes.fromName).not.toHaveBeenCalled();
+			expect(world.client.sandboxes.create).not.toHaveBeenCalled();
+		},
+	);
+
 	it('applies onlyIfUnset vars as a guarded prefix, not exec env', async () => {
 		const world = makeWorld();
 		const sandbox = new FakeSandbox();
@@ -305,13 +635,13 @@ describe('ModalCompute', () => {
 		expect(sandbox.execCalls[0].command).toEqual([
 			'sh',
 			'-lc',
-			'[ -n "${CACHE:-}" ] || export CACHE=\'/tmp/c\'; run',
+			'[ -n "${CACHE+x}" ] || export CACHE=\'/tmp/c\'; run',
 		]);
 		expect(sandbox.execCalls[0].options?.env).toEqual({ A: '1' });
 
 		await instance.startProcess('serve');
 		const started = sandbox.execCalls.at(-1)!;
-		expect(started.command[2].startsWith('[ -n "${CACHE:-}" ] || export CACHE=\'/tmp/c\'; ')).toBe(
+		expect(started.command[2].startsWith('[ -n "${CACHE+x}" ] || export CACHE=\'/tmp/c\'; ')).toBe(
 			true,
 		);
 		expect(started.options?.env).toEqual({ A: '1' });
@@ -461,6 +791,7 @@ describe('ModalCompute', () => {
 			const nonce = command[2]?.match(/[a-f0-9]{32}/)?.[0];
 			if (!nonce) return processResult();
 			return {
+				stdin: { close: async () => {} },
 				stdout: textStream('kernel output\n'),
 				stderr: textStream(
 					`__MARIMOHUB_LAUNCH_${nonce}__{"event":"ready","setupMs":8,"waitportMs":13}\n`,
@@ -489,8 +820,9 @@ describe('ModalCompute', () => {
 
 	describe('launchProcess failure paths', () => {
 		/** A process whose streams never emit and whose wait never resolves. */
-		function hangingProcess(): ModalProcessLike {
+		function hangingProcess(): ProcessFixture {
 			return {
+				stdin: { close: async () => {} },
 				stdout: new ReadableStream<string>({ start() {} }),
 				stderr: new ReadableStream<string>({ start() {} }),
 				wait: () => new Promise<number>(() => {}),
@@ -547,6 +879,7 @@ describe('ModalCompute', () => {
 				const nonce = command[2]?.match(/[a-f0-9]{32}/)?.[0];
 				if (!nonce) return processResult();
 				return {
+					stdin: { close: async () => {} },
 					stdout: new ReadableStream<string>({ start() {} }),
 					stderr: new ReadableStream<string>({
 						start(controller) {
@@ -594,6 +927,7 @@ describe('ModalCompute', () => {
 				const nonce = command[2]?.match(/[a-f0-9]{32}/)?.[0];
 				if (!nonce) return processResult();
 				return {
+					stdin: { close: async () => {} },
 					stdout: new ReadableStream<string>({ start() {} }),
 					stderr: new ReadableStream<string>({
 						start(controller) {
@@ -703,13 +1037,55 @@ describe('ModalCompute', () => {
 		).rejects.toThrow(/file copy fallback/);
 		expect(await compute.proxy(new Request('https://example.com'))).toBeNull();
 	});
+
+	it.each([undefined, 'kernel'])(
+		'logs SDK wait failures with sandbox and process context (processId=%s)',
+		async (processId) => {
+			const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+			const unhandled: unknown[] = [];
+			const onUnhandled = (reason: unknown) => {
+				unhandled.push(reason);
+			};
+			process.on('unhandledRejection', onUnhandled);
+			try {
+				const sandbox = new FakeSandbox();
+				sandbox.execImpl = () => ({
+					stdin: { close: async () => {} },
+					stdout: textStream(''),
+					stderr: textStream(''),
+					wait: () => Promise.reject(new Error('modal transport failure')),
+				});
+				const world = makeWorld();
+				world.existing.set(SANDBOX_ID, sandbox);
+				const compute = makeCompute(world);
+				const started = await compute
+					.create(SANDBOX_ID)
+					.startProcess('uv run marimo edit', { processId });
+				// Let the discarded `completed` promise settle and the runtime flush the
+				// unhandled-rejection queue.
+				await new Promise((resolve) => setTimeout(resolve, 20));
+				await new Promise((resolve) => setImmediate(resolve));
+				expect(log).toHaveBeenCalledOnce();
+				expect(JSON.parse(log.mock.calls[0][0])).toMatchObject({
+					event: 'sandbox_process_failed',
+					sandbox: SANDBOX_ID,
+					process_id: started.id,
+				});
+			} finally {
+				log.mockRestore();
+				process.off('unhandledRejection', onUnhandled);
+			}
+			expect(unhandled).toEqual([]);
+		},
+	);
 });
 
 function contractWorld() {
 	const world = makeWorld();
 	const create = world.client.sandboxes.create.bind(world.client.sandboxes);
 	world.client.sandboxes.create = async (app, image, options) => {
-		const sandbox = (await create(app, image, options)) as FakeSandbox;
+		const sandbox = await create(app, image, options);
+		if (!(sandbox instanceof FakeSandbox)) throw new Error('Expected a fake sandbox');
 		sandbox.execImpl = (command) => {
 			const launch = scriptContractLaunch(command[2]);
 			if (launch) {
@@ -717,6 +1093,7 @@ function contractWorld() {
 					// A live kernel: the ready marker arrives on stderr and the process
 					// keeps running (wait never resolves).
 					return {
+						stdin: { close: async () => {} },
 						stdout: textStream(''),
 						stderr: textStream(launch.transcript),
 						wait: () => new Promise<number>(() => {}),
@@ -753,4 +1130,84 @@ computeContract('ModalCompute', () => makeCompute(contractWorld()), {
 				]),
 		},
 	},
+});
+
+describe('bounded file transport', () => {
+	it.each([true, false])(
+		'cancels stdout, stderr, and the remote process (overflow: %s)',
+		async (overflow) => {
+			const world = makeWorld();
+			const sandbox = new FakeSandbox();
+			const stdoutCancel = vi.fn();
+			const stderrCancel = vi.fn();
+			const close = vi.fn(async () => {});
+			sandbox.execImpl = () => ({
+				stdin: { close },
+				stdout: new ReadableStream({
+					start(c) {
+						if (overflow) c.enqueue('12345');
+					},
+					cancel: stdoutCancel,
+				}),
+				stderr: new ReadableStream({ cancel: stderrCancel }),
+				wait: () => new Promise(() => {}),
+			});
+			world.existing.set(SANDBOX_ID, sandbox);
+			await expect(
+				makeCompute(world)
+					.create(SANDBOX_ID)
+					.exec('read', {
+						maxOutputBytes: 4,
+						timeout: overflow ? 10_000 : 20,
+					}),
+			).rejects.toThrow(overflow ? 'byte limit' : 'timed out');
+			expect(stdoutCancel).toHaveBeenCalledOnce();
+			expect(stderrCancel).toHaveBeenCalledOnce();
+			expect(close).toHaveBeenCalledOnce();
+		},
+	);
+
+	it('kills the supervised command on overflow without waiting for the remote deadline', async (context) => {
+		if (
+			process.platform === 'win32' ||
+			spawnSync('python3', ['--version']).status !== 0 ||
+			spawnSync('sh', ['-c', 'command -v sleep']).status !== 0
+		) {
+			context.skip('Requires Python 3 and a POSIX shell with sleep');
+		}
+		const world = makeWorld();
+		const sandbox = new FakeSandbox();
+		let child: ReturnType<typeof spawn> | undefined;
+		let exited: Promise<unknown> | undefined;
+		sandbox.execImpl = ([command, ...args]) => {
+			child = spawn(command, args);
+			exited = new Promise((resolve, reject) => {
+				child!.once('exit', resolve);
+				child!.once('error', reject);
+			});
+			return {
+				stdin: {
+					close: async () => {
+						child!.stdin!.end();
+					},
+				},
+				stdout: Readable.toWeb(child.stdout!) as ReadableStream<string>,
+				stderr: Readable.toWeb(child.stderr!) as ReadableStream<string>,
+				wait: async () => Number(await exited),
+			};
+		};
+		world.existing.set(SANDBOX_ID, sandbox);
+		try {
+			await expect(
+				makeCompute(world).create(SANDBOX_ID).exec('printf overflow; sleep 60', {
+					maxOutputBytes: 1,
+					timeout: 60_000,
+				}),
+			).rejects.toThrow('byte limit');
+			await exited;
+			expect(child!.exitCode).not.toBeNull();
+		} finally {
+			child?.kill('SIGKILL');
+		}
+	}, 3000);
 });

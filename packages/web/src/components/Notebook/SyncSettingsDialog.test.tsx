@@ -40,7 +40,7 @@ function setup(options: {
 		...activeSource,
 		provider: options.provider ?? activeSource.provider,
 		sync_mode: options.syncMode ?? activeSource.sync_mode,
-		root_path: options.syncMode === 'pull' ? '' : activeSource.root_path,
+		root_path: activeSource.root_path,
 	};
 	const source = options.pending
 		? {
@@ -147,11 +147,11 @@ describe('SyncSettingsDialog', () => {
 		expect(screen.getByText(/last synced/i)).toBeInTheDocument();
 	});
 
-	it('shows Sync now but no token, URL, or subtree controls for a pull source', async () => {
+	it('shows Sync now and subtree controls but no token or URL for a pull source', async () => {
 		setup({ syncMode: 'pull', syncProviders: ['github'], remoteCommit: 'fedcba9876543210' });
 
 		await waitFor(() => expect(screen.getByLabelText('Repository')).toHaveValue('acme/analytics'));
-		expect(screen.queryByLabelText('Folder in repo (optional)')).not.toBeInTheDocument();
+		expect(screen.getByLabelText('Folder in repo (optional)')).toHaveValue(activeSource.root_path);
 		expect(screen.queryByLabelText('Sync URL')).not.toBeInTheDocument();
 		expect(screen.queryByText('Sync credentials')).not.toBeInTheDocument();
 		expect(screen.getByRole('button', { name: 'Sync now' })).toBeInTheDocument();
@@ -199,6 +199,41 @@ describe('SyncSettingsDialog', () => {
 		expect(onClose).toHaveBeenCalled();
 	});
 
+	it('PATCHes a normalised subtree for a pull source', async () => {
+		const user = userEvent.setup();
+		const { calls } = setup({ syncMode: 'pull', syncProviders: ['github'] });
+
+		await waitFor(() => expect(screen.getByLabelText('Repository')).toHaveValue('acme/analytics'));
+		const folder = screen.getByLabelText('Folder in repo (optional)');
+		await user.clear(folder);
+		await user.type(folder, 'python/apps/');
+		await user.click(screen.getByRole('button', { name: 'Save' }));
+
+		await waitFor(() =>
+			expect(calls.find((call) => call.method === 'PATCH')?.body).toEqual({
+				repo: 'acme/analytics',
+				branch: 'main',
+				root_path: 'python/apps',
+				entry_notebook: 'dashboard.py',
+			}),
+		);
+	});
+
+	it('rejects an unsafe folder without PATCHing', async () => {
+		const user = userEvent.setup();
+		const { calls } = setup({ syncMode: 'pull', syncProviders: ['github'] });
+
+		await waitFor(() => expect(screen.getByLabelText('Repository')).toHaveValue('acme/analytics'));
+		const folder = screen.getByLabelText('Folder in repo (optional)');
+		await user.clear(folder);
+		await user.type(folder, '/apps/');
+		await user.tab();
+
+		expect(screen.getByText(/without a leading slash/i)).toBeInTheDocument();
+		expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled();
+		expect(calls.some((call) => call.method === 'PATCH')).toBe(false);
+	});
+
 	it('renders read-only settings for a viewer without operational controls', async () => {
 		setup({ canManage: false, canOperate: false });
 
@@ -209,15 +244,24 @@ describe('SyncSettingsDialog', () => {
 		expect(screen.queryByRole('button', { name: 'Rotate token' })).not.toBeInTheDocument();
 	});
 
-	it('keeps settings read-only while allowing editor operations', async () => {
-		setup({ canManage: false, canOperate: true, syncProviders: ['github'] });
+	it('allows editors to sync without managing settings or rotating credentials', async () => {
+		const user = userEvent.setup();
+		const { calls } = setup({ canManage: false, canOperate: true, syncProviders: ['github'] });
 
 		const repo = await screen.findByLabelText('Repository');
 		await waitFor(() => expect(repo).toHaveValue('acme/analytics'));
 		expect(repo).toHaveAttribute('readonly');
 		expect(screen.queryByRole('button', { name: 'Save' })).not.toBeInTheDocument();
-		expect(screen.getByRole('button', { name: 'Rotate token' })).toBeInTheDocument();
-		expect(await screen.findByRole('button', { name: 'Sync now' })).toBeInTheDocument();
+		expect(screen.queryByRole('button', { name: 'Rotate token' })).not.toBeInTheDocument();
+		expect(screen.queryByText(/Rotate it to mint a new one/)).not.toBeInTheDocument();
+		expect(screen.queryByRole('button', { name: 'Rotate' })).not.toBeInTheDocument();
+		await user.click(await screen.findByRole('button', { name: 'Sync now' }));
+		await waitFor(() =>
+			expect(
+				calls.some((call) => call.method === 'POST' && call.url.endsWith('/source/sync')),
+			).toBe(true),
+		);
+		expect(calls.some((call) => call.url.endsWith('/sync-token/rotate'))).toBe(false);
 	});
 
 	it('rotates the token after confirmation and displays it once', async () => {

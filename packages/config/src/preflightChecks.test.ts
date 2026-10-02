@@ -154,13 +154,61 @@ describe('sandbox.isolation check', () => {
 		MARIMOHUB_AUTH_OIDC_REDIRECT_URI: 'https://hub.example.com/api/auth/callback',
 	};
 
-	it('ok when the kernel host is on a separate domain', async () => {
-		const { by } = await run(
-			{ ...env, MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME: 'sandboxes.example.net' },
+	it('reports unknown proxy-header app origins as fatal, never verified', async () => {
+		const { by, report } = await run(
+			{
+				MARIMOHUB_AUTH_BACKEND: 'proxy-header',
+				MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME: 'kernels.example.net',
+			},
 			makeDeps(),
 		);
-		expect(by('sandbox.isolation')?.status).toBe('ok');
+		expect(by('sandbox.isolation')).toMatchObject({ status: 'fail', fatal: true });
+		expect(by('sandbox.isolation')?.message).toContain('MARIMOHUB_APP_BASE_URL');
+		expect(report.fatal).toBe(true);
 	});
+
+	it.each(['sandboxes.example.net', 'sandboxes.example.com'])(
+		'accepts kernel host %s',
+		async (hostname) => {
+			const { by } = await run(
+				{ ...env, MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME: hostname },
+				makeDeps(),
+			);
+			expect(by('sandbox.isolation')?.status).toBe('ok');
+		},
+	);
+
+	it.each([
+		{
+			hostname: 'sandboxes.example.net',
+			redirect: 'invalid-redirect',
+			remediation: 'Set MARIMOHUB_AUTH_OIDC_REDIRECT_URI to a valid absolute http(s) redirect URI.',
+		},
+		{
+			hostname: 'https://sandboxes.example.net',
+			redirect: 'https://hub.example.com/callback',
+			remediation:
+				'Set MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME to a hostname with an optional port, without a scheme or path.',
+		},
+		{
+			hostname: 'sandbox.hub.example.com',
+			redirect: 'https://hub.example.com/callback',
+			remediation:
+				'Use a different sandbox hostname that is not a parent or subdomain of the app hostname.',
+		},
+	])(
+		'recommends the repair for $hostname and $redirect',
+		async ({ hostname, redirect, remediation }) => {
+			const { by } = await run(
+				{
+					MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME: hostname,
+					MARIMOHUB_AUTH_OIDC_REDIRECT_URI: redirect,
+				},
+				makeDeps(),
+			);
+			expect(by('sandbox.isolation')).toMatchObject({ status: 'fail', fatal: true, remediation });
+		},
+	);
 
 	it('fatal when the kernel host shares the app domain', async () => {
 		const { report, by } = await run(
@@ -517,6 +565,65 @@ describe('ai.upstream check', () => {
 
 	it('skipped when managed AI is disabled', async () => {
 		expect((await run({}, makeDeps())).by('ai.upstream')).toBeUndefined();
+	});
+
+	it.each([
+		{ allowedModels: ['eu.anthropic.claude-opus-4-7'] },
+		{ allowedModels: ['eu.anthropic.claude-opus-4-7', 'anthropic.claude-sonnet'] },
+		{ allowedModels: [] },
+	])(
+		'skips the OpenAI probe for a Claude default with $allowedModels',
+		async ({ allowedModels }) => {
+			const globalFetch = upstream(404);
+			const upstreamFetch = vi.fn();
+			const converse = vi.fn();
+			const { by } = await run(
+				{},
+				ai({
+					model: 'eu.anthropic.claude-opus-4-7',
+					allowedModels,
+					upstreamFetch,
+					converse,
+				}),
+			);
+			expect(by('ai.upstream')).toMatchObject({
+				status: 'skipped',
+				message: 'Bedrock Converse inference access is checked on the first AI request',
+			});
+			expect(globalFetch).not.toHaveBeenCalled();
+			expect(upstreamFetch).not.toHaveBeenCalled();
+			expect(converse).not.toHaveBeenCalled();
+		},
+	);
+
+	it.each([
+		{
+			name: 'a mixed allowlist',
+			model: 'eu.anthropic.claude-opus-4-7',
+			allowedModels: ['eu.anthropic.claude-opus-4-7', 'openai.gpt-oss-120b-1:0'],
+		},
+		{
+			name: 'a non-Claude default outside the allowlist',
+			model: 'openai.gpt-oss-120b-1:0',
+			allowedModels: ['eu.anthropic.claude-opus-4-7'],
+		},
+		{
+			name: 'unrestricted models',
+			model: 'eu.anthropic.claude-opus-4-7',
+			allowedModels: undefined,
+		},
+	])('probes the signed OpenAI endpoint with $name', async ({ model, allowedModels }) => {
+		const globalFetch = upstream(200);
+		const converse = vi.fn();
+		for (const status of [200, 403]) {
+			const upstreamFetch = vi.fn(async (_request: Request) => new Response(null, { status }));
+			const { by } = await run({}, ai({ model, allowedModels, upstreamFetch, converse }));
+			expect(by('ai.upstream')?.status).toBe(status === 200 ? 'ok' : 'fail');
+			expect(upstreamFetch).toHaveBeenCalledOnce();
+			expect(upstreamFetch.mock.calls[0][0].url).toBe('https://api.example.com/v1/models');
+		}
+		expect(globalFetch).not.toHaveBeenCalled();
+		expect(converse).not.toHaveBeenCalled();
 	});
 
 	it('ok when an unsigned upstream answers /models', async () => {

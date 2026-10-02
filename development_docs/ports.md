@@ -43,6 +43,16 @@ implements `SubjectSecurityContextProvider`. Each factory receives the full
 `MARIMOHUB_*` environment. A compute factory also receives
 `sessionMaxLifetimeSeconds` and `sessionIdleTimeoutMs` in `context.compute`.
 
+Library compute adapters opt into profiles through `SandboxProvider.capabilities`:
+
+- `computeProfiles: true`: applies `CreateSandboxOptions.resources.cpu` and `resources.memoryBytes`.
+- `gpuProfiles: true`: also applies `resources.gpu` and implies `computeProfiles: true`.
+
+These flags enable configured profiles, notebook profile selection, and editor overrides.
+Without GPU support, the hub strips GPU values and warns at startup.
+Without either flag, profiles remain disabled and startup warns about ignored configuration.
+The adapter `apiVersion` remains `1`.
+
 At startup, the loader validates the five required `Bucket` methods and its CAS
 safety contract. For compute, it validates `create` and `proxy`, plus optional
 methods when present. It validates the first `SandboxInstance` after the provider
@@ -107,6 +117,21 @@ Then mount the file in the server image. Node ESM does not use `NODE_PATH`. See
 | ⬜     | Fly.io Machines                 | —                          | VM per sandbox, per-machine public hostname           |
 | ⬜     | Daytona                         | —                          | Sandbox SDK (exec/files/preview URLs)                 |
 | ⬜     | Runpod / Lambda / Beam          | —                          | For GPU kernels                                       |
+
+### Warm-pool support
+
+Pooling is optional on `SandboxProvider`. Built-in compute wiring advertises it for CoreWeave and Kubernetes.
+External compute libraries can provide the same contract without changes to the pool service:
+
+- Implement `connectExisting(id, options)`. Readiness and execution must fail if the sandbox is missing or stopped; reconnect must never create a replacement.
+- Preserve sandbox IDs across provider instances. `create(id).destroy()` must reclaim an existing sandbox without booting a new one and tolerate an absent sandbox.
+- Provide `warmPool.maxLifetimeMs`: a guaranteed lifetime measured from before creation, or `null` for no provider lifetime cap.
+- Include serializable creation inputs that do not come from environment variables in `warmPool.configuration`. Loaded templates and external deployment revisions belong here.
+
+Only advertise support when these guarantees hold. The operator must still enable pooling.
+The shared service handles readiness probes, expiry, reservation limits, claims, and cleanup retries.
+Pool cleanup uses ownership records under `_system/warm-pools/` without a backend registry.
+Provider-level orphan reconciliation requires `SandboxProvider.listActive()` to find sandboxes without ownership records. Pool records alone cannot discover those sandboxes.
 
 ## Auth (`Authenticator`)
 

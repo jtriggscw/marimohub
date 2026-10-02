@@ -97,7 +97,7 @@ describe('runtime inspection', () => {
 		const pool = new AppPoolService(
 			bucket,
 			sessions,
-			{ ...DEFAULT_APP_POOL_POLICY, maxUsersPerSession: 4 },
+			{ ...DEFAULT_APP_POOL_POLICY, maxVisitsPerSession: 4 },
 			undefined,
 			() => now,
 		);
@@ -148,7 +148,7 @@ describe('runtime inspection', () => {
 		});
 	});
 
-	it('counts accounts, keeps grace, drops expired visits, and never persists inspection', async () => {
+	it('counts visits, keeps grace, drops expired visits, and never persists inspection', async () => {
 		const m = member();
 		await saveSession(m);
 		await savePool(
@@ -184,7 +184,7 @@ describe('runtime inspection', () => {
 		const remove = vi.spyOn(bucket, 'delete');
 		const snapshot = await inspection.inspect();
 		const sandbox = snapshot.apps[0].sandboxes[0];
-		expect(sandbox.users).toBe(2);
+		expect(sandbox.users).toBe(3);
 		expect(sandbox.assignments).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({ user_id: ACTOR, visits: 2, state: 'active' }),
@@ -197,6 +197,91 @@ describe('runtime inspection', () => {
 		expect(put).not.toHaveBeenCalled();
 		expect(remove).not.toHaveBeenCalled();
 		expect(await (await bucket.get(paths.appPool(pid, nid)))!.text()).toBe(original);
+	});
+
+	it.each([
+		{ states: ['active', 'grace'], deadlines: [1000, 2000], expectedExpiry: 1000 },
+		{ states: ['grace', 'active'], deadlines: [2000, 1000], expectedExpiry: 1000 },
+		{ states: ['active', 'active'], deadlines: [1000, 2000], expectedExpiry: 2000 },
+		{ states: ['active', 'active'], deadlines: [2000, 1000], expectedExpiry: 2000 },
+		{ states: ['grace', 'grace'], deadlines: [1000, 2000], expectedExpiry: 2000 },
+		{ states: ['grace', 'grace'], deadlines: [2000, 1000], expectedExpiry: 2000 },
+	])(
+		'groups $states visits with deadlines $deadlines using the latest deadline for their state',
+		async ({ states, deadlines, expectedExpiry }) => {
+			const m = member();
+			await saveSession(m);
+			await savePool(
+				[m],
+				states.map((state, index) => ({
+					user_id: ACTOR,
+					session_id: m.session_id,
+					generation: `generation-${index}`,
+					visit_id: `visit-${index}`,
+					visits:
+						state === 'active'
+							? [{ visit_id: `visit-${index}`, expires_at: now + deadlines[index] }]
+							: [],
+					...(state === 'grace' ? { grace_until: now + deadlines[index] } : {}),
+				})),
+			);
+
+			expect((await inspection.inspect()).apps[0].sandboxes[0].assignments).toEqual([
+				{
+					user_id: ACTOR,
+					visits: states.filter((state) => state === 'active').length,
+					state: states.includes('active') ? 'active' : 'grace',
+					expires_at: new Date(now + expectedExpiry).toISOString(),
+				},
+			]);
+		},
+	);
+
+	it('switches a grouped account to its grace deadline when its last active visit expires', async () => {
+		const m = member();
+		const activeExpiry = now + 40_000;
+		const graceExpiry = now + 120_000;
+		await saveSession(m);
+		await savePool(
+			[m],
+			[
+				{
+					user_id: ACTOR,
+					session_id: m.session_id,
+					generation: 'active',
+					visit_id: 'active',
+					visits: [{ visit_id: 'active', expires_at: activeExpiry }],
+				},
+				{
+					user_id: ACTOR,
+					session_id: m.session_id,
+					generation: 'grace',
+					visit_id: 'grace',
+					visits: [],
+					grace_until: graceExpiry,
+				},
+			],
+		);
+
+		expect((await inspection.inspect()).apps[0].sandboxes[0].assignments).toEqual([
+			{
+				user_id: ACTOR,
+				visits: 1,
+				state: 'active',
+				expires_at: new Date(activeExpiry).toISOString(),
+			},
+		]);
+		now = activeExpiry;
+		expect((await inspection.inspect()).apps[0].sandboxes[0].assignments).toEqual([
+			{
+				user_id: ACTOR,
+				visits: 0,
+				state: 'grace',
+				expires_at: new Date(graceExpiry).toISOString(),
+			},
+		]);
+		now = graceExpiry;
+		expect((await inspection.inspect()).apps[0].sandboxes[0].assignments).toEqual([]);
 	});
 
 	it('compares against the committed head even before pool rollover and while editing', async () => {

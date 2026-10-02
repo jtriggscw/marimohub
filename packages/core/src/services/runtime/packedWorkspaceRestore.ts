@@ -1,11 +1,11 @@
-import { MAX_WORKSPACE_FILE_BYTES } from '../../constants';
+import { MAX_WORKSPACE_FILE_BYTES, MAX_WORKSPACE_FILES } from '../../constants';
+import { isSafeWorkspaceRootPath } from '../../integrations/remoteWorkspace';
 import { MAX_DECOMPRESSED_ARCHIVE_BYTES } from '../../integrations/workspaceArchive';
 import type { Bucket } from '../../ports/bucket';
 import { MAX_GIT_DIRECTORY_BYTES, MAX_GIT_DIRECTORY_FILES } from '../../ports/sourceControl';
 import type { SandboxInstance } from '../../ports/sandbox';
 import { shellQuote } from './shell';
 
-const MAX_WORKSPACE_FILES = 1000;
 // Valid workspace and Git trees top out at 200 MiB; the remainder covers ZIP metadata.
 const MAX_PACKED_ARCHIVE_BYTES = 256 * 1024 * 1024;
 
@@ -16,7 +16,7 @@ import stat
 import sys
 import zipfile
 
-archive, temporary_root, destination, require_git_value = sys.argv[1:]
+archive, temporary_root, destination, require_git_value, workspace_subdirectory = sys.argv[1:]
 require_git = require_git_value == '1'
 workspace_file_limit = ${MAX_WORKSPACE_FILES}
 workspace_byte_limit = ${MAX_DECOMPRESSED_ARCHIVE_BYTES}
@@ -49,6 +49,15 @@ try:
         or os.path.islink(destination)
     ):
         fail('unsafe extraction destination')
+    # Mirrors isSafeWorkspaceRootPath: no .git segment at any depth, any case.
+    subdirectory_parts = workspace_subdirectory.split('/') if workspace_subdirectory else []
+    if (
+        any(not part or part in ('.', '..') or part.lower() == '.git' for part in subdirectory_parts)
+        or '\\' in workspace_subdirectory
+        or any(ord(character) < 32 or ord(character) == 127 for character in workspace_subdirectory)
+        or (subdirectory_parts and subdirectory_parts[0] == temporary_name)
+    ):
+        fail('unsafe workspace subdirectory')
     shutil.rmtree(staging, ignore_errors=True)
     os.makedirs(staging)
     staging_prefix = staging + os.sep
@@ -78,7 +87,8 @@ try:
             declared_counts[group] += 1
             declared_bytes[group] += info.file_size
             check_limit(group, declared_counts[group], declared_bytes[group])
-            target = os.path.abspath(os.path.join(staging, *parts))
+            placed = parts if group == 'git' else subdirectory_parts + parts
+            target = os.path.abspath(os.path.join(staging, *placed))
             if not target.startswith(staging_prefix):
                 fail('unsafe archive path')
             seen.add(name)
@@ -151,16 +161,25 @@ function normalizeWorkingDir(workingDir: string): string {
 	return normalized;
 }
 
+/**
+ * Restore a packed workspace into `workingDir`. With `workspaceSubdirectory`,
+ * workspace entries land under `<workingDir>/<subdirectory>` while `.git`
+ * entries stay at `workingDir`: a subtree pull source's checkout layout.
+ */
 export async function restorePackedWorkspace(
 	sandbox: SandboxInstance,
 	bucket: Bucket,
 	archiveKey: string,
 	workingDir: string,
 	requireGit: boolean,
+	workspaceSubdirectory = '',
 ): Promise<PackedWorkspaceRestoreResult> {
 	let cleanup: (() => Promise<unknown>) | undefined;
 	try {
 		const normalizedWorkingDir = normalizeWorkingDir(workingDir);
+		if (!isSafeWorkspaceRootPath(workspaceSubdirectory)) {
+			throw new Error('Packed workspace restore requires a safe workspace subdirectory');
+		}
 		const temporaryRoot = `${normalizedWorkingDir}/.marimohub-packed-restore`;
 		const archivePath = `${temporaryRoot}/workspace.zip`;
 		const scriptPath = `${temporaryRoot}/extract.py`;
@@ -179,7 +198,7 @@ export async function restorePackedWorkspace(
 			{ path: scriptPath, content: EXTRACT_PACKED_WORKSPACE },
 		]);
 		const result = await sandbox.exec(
-			`python3 ${shellQuote(scriptPath)} ${shellQuote(archivePath)} ${shellQuote(temporaryRoot)} ${shellQuote(normalizedWorkingDir)} ${requireGit ? '1' : '0'}`,
+			`python3 ${shellQuote(scriptPath)} ${shellQuote(archivePath)} ${shellQuote(temporaryRoot)} ${shellQuote(normalizedWorkingDir)} ${requireGit ? '1' : '0'} ${shellQuote(workspaceSubdirectory)}`,
 		);
 		if (!result.success) {
 			const detail = result.stderr.trim().slice(-2000);

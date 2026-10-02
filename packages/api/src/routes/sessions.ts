@@ -2,6 +2,7 @@ import { createRoute, z } from '@hono/zod-openapi';
 import { all } from 'better-all';
 import type {
 	SecondarySurfaceId,
+	WarmPoolClaim,
 	ResourceSecurityLabels,
 	Role,
 	AuthenticatedPrincipal,
@@ -24,8 +25,10 @@ import {
 	sleep,
 	BadRequestError,
 	ConflictError,
+	WarmPoolClaimExpiredError,
 	createKernelAuthToken,
 	createSandboxId,
+	createSessionId,
 	DomainError,
 	marimoAiContributor,
 	marimoConfigToSessionEnv,
@@ -39,16 +42,20 @@ import {
 	resolveBaseImage,
 	resolveComputeProfile,
 	resolveLaunchStrategyForSession,
+	resolveNotebookLaunchSource,
 	resolveRestoreSnapshot,
+	pullSourceGitOptions,
 	recipientFromIdentity,
 	ResourceExhaustedError,
 	saga,
 	MODE_POLICY,
+	isPastAuthorizationDeadline,
 	SandboxProvisioner,
 	SESSION_MODES,
 	SessionId,
 	sessionMode,
 	sessionOwner,
+	sessionWorkspaceDir,
 	SubdomainExposure,
 	UnavailableError,
 	EditSessionOwnedError,
@@ -192,10 +199,10 @@ const createSession = createRoute({
 	summary: 'Create a session and provision a sandbox',
 	// `Idempotency-Key` is accepted and documented, but this route is already
 	// idempotent through session reuse. Edit reuse follows the configured sharing
-	// policy; app reuse follows the account assignment.
+	// policy; app reuse follows the visit assignment.
 	description:
 		'Create or reuse a notebook sandbox. Edit-session reuse follows the configured ' +
-		'editor sandbox-sharing policy. App sessions use sticky account assignments in a version-aware pool.',
+		'editor sandbox-sharing policy. App sessions use sticky visit assignments in a version-aware pool.',
 	request: {
 		params: NotebookIdParam,
 		headers: IdempotencyKeyHeader,
@@ -953,7 +960,10 @@ app.openapi(getEditorSession, async (c) => {
 				user_id: holder.user_id,
 				status: holder.status,
 				started_at: holder.started_at,
-				activity: await inspectEditorActivity(deps, holder),
+				activity:
+					holder.user_id === user.id
+						? { state: holder.status === 'starting' ? ('starting' as const) : ('unknown' as const) }
+						: await inspectEditorActivity(deps, holder),
 			}
 		: null;
 	return c.json(
@@ -1300,6 +1310,16 @@ export async function startNotebookSession(input: {
 		authorizationExpiresAt
 			? sessions.tightenAuthorizationDeadline(pid, session.session_id, authorizationExpiresAt)
 			: Promise.resolve(session);
+	const revalidateEditorReuse = async (session: Session) => {
+		const current = await sessions.getReusableEditor(pid, session.session_id);
+		if (!current) {
+			throw new ConflictError('The previous editor session is still shutting down. Retry shortly.');
+		}
+		if (isPastAuthorizationDeadline(current, Date.now())) {
+			throw new ConflictError('The editor session authorization expired. Retry shortly.');
+		}
+		return current;
+	};
 
 	const workspacePolicy = workspaceSourcePolicy(notebook.source);
 	// Synced sources are read-only mirrors served from the immutable workspace of the
@@ -1310,15 +1330,12 @@ export async function startNotebookSession(input: {
 	if (!workspacePolicy.persistSessionEdits && !syncedVersionId) {
 		throw new ConflictError('Synced notebook has not been synced yet');
 	}
-	const syncedVersionPaths = syncedVersionId
-		? paths.project(pid).notebook(nid).version(syncedVersionId)
-		: undefined;
+	const notebookPaths = paths.project(pid).notebook(nid);
+	const syncedVersionPaths = syncedVersionId ? notebookPaths.version(syncedVersionId) : undefined;
 	const workspacePrefix = syncedVersionPaths?.workspacePrefix;
 	const workspaceArchive = syncedVersionPaths?.workspaceArchive;
-	const gitPrefix =
-		notebook.source.type === 'git' && notebook.source.sync_mode === 'pull'
-			? syncedVersionPaths?.gitPrefix
-			: undefined;
+	const pullSourceGit = pullSourceGitOptions(notebook.source, syncedVersionPaths);
+	const workspaceDir = sessionWorkspaceDir(notebook.source, deps.sandbox.workdir);
 	// Staleness provenance: a session that serves a frozen snapshot — a
 	// non-persisting mode (`app`), or any mode on a synced source (a read-only
 	// mirror, even under `edit`) — is stamped with the head committed version it
@@ -1329,6 +1346,14 @@ export async function startNotebookSession(input: {
 		(MODE_POLICY[mode].persistsEdits
 			? undefined
 			: (notebook.source.current_version_id ?? undefined));
+	const launchSource = resolveNotebookLaunchSource({
+		entryNotebook: workspacePolicy.entryNotebook,
+		workspacePrefix: workspacePrefix ?? notebookPaths.workspacePrefix,
+		localVersion:
+			mode === 'app' && notebook.source.type === 'local' && sourceVersionId
+				? notebookPaths.version(sourceVersionId)
+				: undefined,
+	});
 	const logStoredConfigFallback = (config: 'base_image' | 'compute_profile') =>
 		logEvent({
 			level: 'error',
@@ -1420,9 +1445,7 @@ export async function startNotebookSession(input: {
 	const reusableCandidate = mode === 'edit' ? editorReuse?.session : await reusableApp();
 	if (reusableCandidate) {
 		let reusable = await tightenAuthorizationDeadline(reusableCandidate);
-		const authorizationExpired =
-			reusable.authorization_expires_at !== undefined &&
-			Date.now() >= Date.parse(reusable.authorization_expires_at);
+		const authorizationExpired = isPastAuthorizationDeadline(reusable, Date.now());
 		// A role change flips the session class the caller is entitled to (a demoted
 		// editor must not keep a persisting, WIF-holding kernel; a promoted viewer's
 		// edits must stop being discarded). A stale-class session is retired below
@@ -1447,12 +1470,14 @@ export async function startNotebookSession(input: {
 					session: reusable,
 					user,
 					ids: requestedSurfaces,
-					workspaceDir: sandbox.workdir,
+					workspaceDir,
 					exposure: sandboxExposure,
 					hostname,
 					appBaseUrl,
 				});
 			}
+			// Probing and surface startup can overlap a stop or an authorization update.
+			if (mode === 'edit') reusable = await revalidateEditorReuse(reusable);
 			return {
 				...(body?.replace_app_session_id
 					? withoutConnectionUrls(toSessionResponse(reusable, reusableGrants))
@@ -1487,20 +1512,27 @@ export async function startNotebookSession(input: {
 		? (await sessions.findReusableEditor(pid, nid, user.id, 'exclusive', true)).session
 		: undefined;
 
-	const sandboxId = admission?.member.sandbox_id ?? createSandboxId();
+	let sandboxId = admission?.member.sandbox_id ?? createSandboxId();
+	const sessionId = admission?.member.session_id ?? createSessionId();
+	let warmClaim: WarmPoolClaim | undefined;
 	const kernelAuthToken = sandbox.auth === 'on' ? createKernelAuthToken() : undefined;
 
 	// Provision as a saga: if a later step fails, completed steps compensate in
 	// reverse — the session record is terminated (so it does not linger in
 	// `starting` and the reaper collects it) and a provisioned sandbox is
-	// destroyed. A failure *inside* provisioning self-cleans (see
-	// SandboxProvisioner.provision); the saga handles failures after it.
+	// destroyed. Cold provisioning self-cleans on failure; warm claims are
+	// abandoned by the outer catch so pool ownership survives failed cleanup.
 	let session: Session | undefined;
 	let sessionRecordAttempted = false;
 	let sandboxMayExist = false;
 	const recordSandboxCleanup = async () => {
 		if (session) {
-			await sessions.markSandboxReclaimed(pid, session.session_id, new Date().toISOString());
+			await sessions.markSandboxReclaimed(
+				pid,
+				session.session_id,
+				new Date().toISOString(),
+				sandboxId,
+			);
 		}
 	};
 	let updated: Session | undefined;
@@ -1549,13 +1581,35 @@ export async function startNotebookSession(input: {
 			.step('capacity', () =>
 				enforceSessionCap(deps, mode, pid, user.id, temporaryToRetire?.session_id),
 			)
+			.step('warm_sandbox', async () => {
+				warmClaim = await deps.warmPool?.claim({
+					profile: requestedComputeProfile.name,
+					image,
+					userHome,
+					restoreSnapshotId: restoreFilesystemSnapshot?.snapshot_id,
+					destination: { project_id: pid, notebook_id: nid, session_id: sessionId },
+				});
+				if (!warmClaim) return;
+				sandboxId = warmClaim.member.sandbox_id;
+				sandboxMayExist = true;
+				observer.tag('sandbox_id', sandboxId);
+				observer.tag('warm_pool_hit', true);
+				if (admission) {
+					await appPool.bindWarmSandbox(
+						pid,
+						nid,
+						sessionId,
+						admission.member.operation_token,
+						sandboxId,
+					);
+				}
+			})
 			.step('session_record', async () => {
 				const create = () => {
 					sessionRecordAttempted = true;
 					return sessions.createSession({
-						...(admission
-							? { session_id: admission.member.session_id, app_pool: true as const }
-							: {}),
+						session_id: sessionId,
+						...(admission ? { app_pool: true as const } : {}),
 						notebook_id: nid,
 						project_id: pid,
 						user_id: user.id,
@@ -1723,11 +1777,9 @@ export async function startNotebookSession(input: {
 							if (integrationEnv) env = mergeSessionEnv(integrationEnv, env ?? {});
 							return env;
 						},
-						exposure: async () => sandboxExposure.prepare(exposureCtx),
 						launchStrategy: async () => {
 							const resolved = await resolveLaunchStrategyForSession({
-								entryNotebook: workspacePolicy.entryNotebook,
-								workspacePrefix,
+								entryNotebookKey: launchSource.entryNotebookKey,
 								bucket: bucketHandle,
 							});
 							observer.tag('launch_strategy', resolved.strategy);
@@ -1735,12 +1787,46 @@ export async function startNotebookSession(input: {
 							return resolved;
 						},
 						async provision() {
-							const { baseUrl } = await this.$.exposure;
 							const launchStrategy = await this.$.launchStrategy;
 							// A failed sibling may already have retired the record while these dependencies resolved.
 							if (this.$signal.aborted) throw this.$signal.reason;
+							if (warmClaim) {
+								try {
+									await deps.warmPool!.handoff(warmClaim);
+								} catch (error) {
+									if (!(error instanceof WarmPoolClaimExpiredError)) throw error;
+									const expired = warmClaim;
+									await deps.warmPool!.abandon(expired).catch(() => {});
+									// A late pool cleanup must never target the cold replacement.
+									sandboxId = createSandboxId();
+									sandboxMayExist = false;
+									if (admission) {
+										await appPool.bindWarmSandbox(
+											pid,
+											nid,
+											sessionId,
+											admission.member.operation_token,
+											sandboxId,
+										);
+									}
+									session = await sessions.replaceStartingSandbox(
+										pid,
+										sessionId,
+										expired.member.sandbox_id,
+										sandboxId,
+									);
+									warmClaim = undefined;
+									exposureCtx.sandboxId = sandboxId;
+									observer.tag('sandbox_id', sandboxId);
+									observer.tag('warm_pool_hit', false);
+									observer.tag('warm_pool_fallback', 'claim_expired');
+								}
+							}
+							const { baseUrl } = await sandboxExposure.prepare(exposureCtx);
+							if (this.$signal.aborted) throw this.$signal.reason;
 							sandboxMayExist = true;
 							return provisioner.provision({
+								existingSandbox: warmClaim?.sandbox,
 								onSandboxDestroyed: recordSandboxCleanup,
 								sandboxId,
 								projectId: pid,
@@ -1778,22 +1864,9 @@ export async function startNotebookSession(input: {
 										? 'copy-only'
 										: workspacePolicy.loadMode,
 								workspacePrefix,
-								gitPrefix,
+								...pullSourceGit,
 								workspaceArchive,
-								...(mode === 'app' && notebook.source.type === 'local' && sourceVersionId
-									? {
-											workspaceOverlay: [
-												{
-													path: 'notebook.py',
-													key: paths.project(pid).notebook(nid).version(sourceVersionId).code,
-												},
-												{
-													path: 'pyproject.toml',
-													key: paths.project(pid).notebook(nid).version(sourceVersionId).deps,
-												},
-											],
-										}
-									: {}),
+								workspaceOverlay: launchSource.workspaceOverlay,
 							});
 						},
 					});
@@ -1813,15 +1886,13 @@ export async function startNotebookSession(input: {
 					({ clientUrl, originUrl } = await sandboxExposure.finalize(url, exposureCtx));
 				},
 				compensate: async () => {
+					if (warmClaim) return;
 					await compute.create(sandboxId, { owner: { projectId: pid, userId: user.id } }).destroy();
 					await recordSandboxCleanup();
 				},
 			})
 			.step('mark_running', async () => {
-				if (
-					session!.authorization_expires_at &&
-					Date.now() >= Date.parse(session!.authorization_expires_at)
-				) {
+				if (isPastAuthorizationDeadline(session!, Date.now())) {
 					throw new ForbiddenError('Group authorization expired while starting the session');
 				}
 				// The lifetime clock starts here — when the kernel is live, not at record
@@ -1879,6 +1950,9 @@ export async function startNotebookSession(input: {
 			})
 			.run();
 	} catch (err) {
+		if (warmClaim) {
+			await deps.warmPool!.abandon(warmClaim).catch(() => {});
+		}
 		if (admission?.kind === 'reserve') {
 			// A failed session PUT may have committed; only release when it was never attempted.
 			await (
@@ -1899,18 +1973,17 @@ export async function startNotebookSession(input: {
 			if (session) await sessions.markTerminated(pid, session.session_id).catch(() => {});
 			const winnerCandidate = await sessions.getSession(pid, err.holder).catch(() => null);
 			if (winnerCandidate?.notebook_id === nid && sessionMode(winnerCandidate) === 'edit') {
-				const winner = await tightenAuthorizationDeadline(winnerCandidate);
-				if (
-					winner.authorization_expires_at &&
-					Date.now() >= Date.parse(winner.authorization_expires_at)
-				) {
-					throw new ConflictError('The editor session authorization expired. Retry shortly.');
-				}
+				// Revalidate before the ownership check: a dead holder must yield the
+				// retryable 409, not "owned by" a session that is already gone.
+				const winner = await revalidateEditorReuse(
+					await tightenAuthorizationDeadline(winnerCandidate),
+				);
 				if (sharing === 'exclusive' && winner.user_id !== user.id) {
 					throw new EditSessionOwnedError(`Editing is currently owned by ${winner.user_id}`);
 				}
+				const winnerGrants = await grants(winner);
 				return {
-					...toSessionResponse(winner, await grants(winner)),
+					...toSessionResponse(winner, winnerGrants),
 					reused: true,
 					editor_session: {
 						sharing,
@@ -1981,7 +2054,7 @@ export async function startNotebookSession(input: {
 			session: updated,
 			user,
 			ids: eagerSurfaces,
-			workspaceDir: sandbox.workdir,
+			workspaceDir,
 			exposure: sandboxExposure,
 			hostname,
 			appBaseUrl,
@@ -2151,7 +2224,10 @@ app.openapi(ensureSurfaceRoute, async (c) => {
 		session,
 		user,
 		id: surface,
-		workspaceDir: deps.sandbox.workdir,
+		workspaceDir: sessionWorkspaceDir(
+			await deps.services.notebooks.getNotebookSource(pid, session.notebook_id),
+			deps.sandbox.workdir,
+		),
 		exposure,
 		hostname: resolveSandboxHostname(c, deps.sandbox),
 		appBaseUrl,

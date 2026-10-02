@@ -32,6 +32,7 @@ import type {
 	K8sPodPhaseInfo,
 	KubernetesConfig,
 } from './index';
+import { MANAGED_BY_VALUE } from './shared';
 
 /**
  * Tests for the native Kubernetes compute adapter.
@@ -80,18 +81,28 @@ function makeWorld(opts?: {
 		stdin?: string | Uint8Array;
 		options?: K8sExecOptions;
 	}[] = [];
-	const pods = new Map<string, { sandboxId: SandboxId; phase: string }>();
+	const pods = new Map<
+		string,
+		{ sandboxId: SandboxId; phase: string; managedBy?: string; uid?: string }
+	>();
 
 	const client: K8sClient = {
+		reconcileRoutes: vi.fn(async () => {}),
 		ensure: async (o) => {
 			ensured.push(o);
 			const createdPod = !pods.has(o.name);
-			if (createdPod) pods.set(o.name, { sandboxId: o.sandboxId, phase: opts?.phase ?? 'Running' });
+			if (createdPod)
+				pods.set(o.name, {
+					sandboxId: o.sandboxId,
+					phase: opts?.phase ?? 'Running',
+					managedBy: MANAGED_BY_VALUE,
+					uid: 'pod-uid',
+				});
 			return { createdPod };
 		},
 		getPhase: async (name) => {
 			const p = pods.get(name);
-			return p ? { phase: p.phase, ...opts?.bootInfo } : undefined;
+			return p ? { ...p, ...opts?.bootInfo } : undefined;
 		},
 		getSchedulingFailure: async () => opts?.schedulingFailure,
 		getImagePullMessage: async () => opts?.imagePullMessage,
@@ -322,6 +333,45 @@ describe('KubernetesCompute', () => {
 	});
 
 	describe('lazy ensure()', () => {
+		it('validates programmatic templates before creating a sandbox', () => {
+			const world = makeWorld();
+			expect(() =>
+				makeCompute(world, {
+					...baseConfig,
+					podTemplate: {
+						spec: { containers: [{ name: 'wrong' }] },
+					} as unknown as KubernetesConfig['podTemplate'],
+				}),
+			).toThrow(/spec.containers.0.name/);
+			expect(world.ensured).toHaveLength(0);
+		});
+
+		it('keeps the startup template across sessions and profile overrides', async () => {
+			const world = makeWorld();
+			const podTemplate: NonNullable<KubernetesConfig['podTemplate']> = {
+				spec: {
+					serviceAccountName: 'fabric',
+					containers: [
+						{ name: 'marimo', env: [{ name: 'FABRIC_URL', value: 'https://fabric.example.com' }] },
+					],
+				},
+			};
+			const original = structuredClone(podTemplate);
+			const compute = makeCompute(world, { ...baseConfig, podTemplate });
+			podTemplate.spec!.containers![0].env![0].value = 'changed-after-startup';
+			await compute
+				.create(SANDBOX_ID, { image: 'profile-image', resources: { cpu: 2 } })
+				.exec('true');
+			await compute.create('sb-second' as SandboxId).exec('true');
+			expect(world.ensured).toHaveLength(2);
+			expect(world.ensured[0]).toMatchObject({
+				podTemplate: original,
+				image: 'profile-image',
+				resources: { cpu: '2000m', profileLimits: { cpu: true } },
+			});
+			expect(world.ensured[1]).toMatchObject({ podTemplate: original, image: baseConfig.image });
+		});
+
 		it('materialises the Pod with our name, image, port, and ingress host', async () => {
 			const world = makeWorld();
 			await makeCompute(world).create(SANDBOX_ID).exec('true');
@@ -371,6 +421,8 @@ describe('KubernetesCompute', () => {
 				imagePullSecret: 'regcred',
 				imagePullPolicy: 'Always',
 				resources: { cpu: '2', memory: '4Gi', gpu: '1' },
+				extraLabels: { team: 'data' },
+				runAsUser: 1000,
 			})
 				.create(SANDBOX_ID)
 				.exec('true');
@@ -381,6 +433,8 @@ describe('KubernetesCompute', () => {
 				imagePullSecret: 'regcred',
 				imagePullPolicy: 'Always',
 				resources: { cpu: '2', memory: '4Gi', gpu: '1' },
+				extraLabels: { team: 'data' },
+				runAsUser: 1000,
 			});
 		});
 
@@ -531,6 +585,27 @@ describe('KubernetesCompute', () => {
 		});
 	});
 
+	it('does not execute with an incomplete environment and retries preparation after failure', async () => {
+		let fail = true;
+		const world = makeWorld({
+			execImpl: (_cmd, stdin) =>
+				stdin && fail ? { stdout: '', stderr: 'private token value', exitCode: 1 } : undefined,
+		});
+		const sb = makeCompute(world).create(SANDBOX_ID);
+		await sb.setEnvVars({ TOKEN: 'private token value' });
+		await expect(sb.exec('run-user-command')).rejects.toThrow(
+			'Could not prepare sandbox environment',
+		);
+		expect(world.execCalls.some((call) => shCmd(call).includes('run-user-command'))).toBe(false);
+		fail = false;
+		await sb.exec('run-user-command');
+		await sb.exec('second-user-command');
+		expect(world.execCalls.filter((call) => call.stdin)).toHaveLength(2);
+		expect(world.execCalls.flatMap((call) => call.command).join(' ')).not.toContain(
+			'private token value',
+		);
+	});
+
 	describe('listFiles()', () => {
 		const findOutput = (lines: string[]) => `${lines.join('\0')}\0`;
 
@@ -659,8 +734,9 @@ describe('KubernetesCompute', () => {
 
 			const launch = world.execCalls.find((c) => shCmd(c).includes('setsid'))!;
 			expect(shCmd(launch)).toContain("cd '/workspace'");
-			expect(shCmd(launch)).toContain('export SESSION_TOKEN=');
-			expect(shCmd(launch)).toContain('a b');
+			expect(shCmd(launch)).not.toContain('export SESSION_TOKEN=');
+			expect(shCmd(launch)).not.toContain('a b');
+			expect(world.execCalls.find((c) => c.stdin)?.stdin).toContain("export SESSION_TOKEN='a b';");
 			expect(shCmd(launch)).not.toContain('OMITTED');
 			expect(shCmd(launch)).toContain('uv run marimo edit --port 2718');
 			// Outer shell non-login (its stdout is the parsed PID); the detached
@@ -823,6 +899,32 @@ describe('KubernetesCompute', () => {
 	});
 
 	describe('destroy()', () => {
+		it('prepares retained environment values at a new path when the same instance recreates its pod', async () => {
+			const world = makeWorld();
+			const inst = makeCompute(world).create(SANDBOX_ID);
+			await inst.setEnvVars({ TOKEN: 'secret' });
+			await inst.setEnvVars({ CACHE: '/tmp/cache' }, { onlyIfUnset: true });
+			await inst.exec('first');
+			await inst.exec('second');
+			const writes = () => world.execCalls.filter((call) => call.stdin !== undefined);
+			expect(writes()).toHaveLength(1);
+			const originalCommand = shCmd(world.execCalls.at(-1)!);
+			await inst.destroy();
+			expect(world.pods.size).toBe(0);
+			await inst.exec('first');
+			await inst.exec('second');
+
+			expect(world.ensured).toHaveLength(2);
+			expect(writes().map((call) => call.stdin)).toEqual([
+				"export TOKEN='secret'; [ -n \"${CACHE+x}\" ] || export CACHE='/tmp/cache'; ",
+				"export TOKEN='secret'; [ -n \"${CACHE+x}\" ] || export CACHE='/tmp/cache'; ",
+			]);
+			const newPath = shCmd(writes()[1]).match(/cat > '([^']+)'/)?.[1];
+			expect(newPath).toMatch(/^\/tmp\/marimohub-env-.+\/env.sh$/);
+			expect(originalCommand).not.toContain(newPath);
+			expect(shCmd(world.execCalls.at(-1)!)).toContain(`. '${newPath}'`);
+		});
+
 		it('deletes the session resources and is idempotent', async () => {
 			const world = makeWorld();
 			const inst = makeCompute(world).create(SANDBOX_ID);
@@ -867,8 +969,9 @@ describe('KubernetesCompute', () => {
 			await inst.exec('echo "$TOKEN:$MODE"');
 
 			const exec = world.execCalls.find((c) => shCmd(c).includes('echo "$TOKEN:$MODE"'));
-			expect(shCmd(exec!)).toBe(
-				"export TOKEN='a'\\''b'; export MODE='prod'; echo \"$TOKEN:$MODE\"",
+			expect(shCmd(exec!)).not.toContain('export TOKEN');
+			expect(world.execCalls.find((c) => c.stdin)?.stdin).toBe(
+				"export TOKEN='a'\\''b'; export MODE='prod'; ",
 			);
 		});
 
@@ -881,8 +984,9 @@ describe('KubernetesCompute', () => {
 			await inst.exec('echo defaults');
 
 			const exec = world.execCalls.find((c) => shCmd(c).includes('echo defaults'));
-			expect(shCmd(exec!)).toBe(
-				"export MODE='prod'; [ -n \"${CACHE:-}\" ] || export CACHE='/tmp/c'; echo defaults",
+			expect(shCmd(exec!)).not.toContain('export MODE');
+			expect(world.execCalls.find((c) => c.stdin)?.stdin).toBe(
+				"export MODE='prod'; [ -n \"${CACHE+x}\" ] || export CACHE='/tmp/c'; ",
 			);
 		});
 
@@ -1093,3 +1197,93 @@ computeContract(
 	},
 	{ mountFallsBack: true, secondaryPort: 8443, semantics: { failingCommand: 'false', launch: {} } },
 );
+
+describe('Kubernetes warm sandbox reconnect', () => {
+	it('repairs routes when reconnecting from another provider without ensuring a Pod', async () => {
+		const world = makeWorld();
+		await makeCompute(world).create(SANDBOX_ID).ready!();
+		expectExecResult(await makeCompute(world).connectExisting(SANDBOX_ID).exec('true'), {
+			success: true,
+		});
+		expect(world.ensured).toHaveLength(1);
+		expect(world.client.reconcileRoutes).toHaveBeenCalledExactlyOnceWith(world.ensured[0]);
+	});
+
+	it('rejects a running Pod when route repair fails, and retries on the next use', async () => {
+		const world = makeWorld();
+		await makeCompute(world).create(SANDBOX_ID).ready!();
+		vi.mocked(world.client.reconcileRoutes).mockRejectedValueOnce(new Error('route repair failed'));
+		const sandbox = makeCompute(world).connectExisting(SANDBOX_ID);
+		await expect(sandbox.exec('true')).rejects.toThrow('route repair failed');
+		expect(world.execCalls).toHaveLength(0);
+		expectExecResult(await sandbox.exec('true'), { success: true });
+		expect(world.execCalls).toHaveLength(1);
+		expect(world.client.reconcileRoutes).toHaveBeenCalledTimes(2);
+		expect(world.ensured).toHaveLength(1);
+	});
+
+	it.each([
+		{ managedBy: undefined },
+		{ managedBy: 'someone-else' },
+		{ sandboxId: undefined },
+		{ sandboxId: 'another-sandbox' as SandboxId },
+	])(
+		'rejects a Pod with mismatched ownership %j before route repair or exec',
+		async (ownership) => {
+			const world = makeWorld();
+			await makeCompute(world).create(SANDBOX_ID).ready!();
+			Object.assign(world.pods.get(NAME)!, ownership);
+			await expect(makeCompute(world).connectExisting(SANDBOX_ID).exec('true')).rejects.toThrow(
+				'does not belong',
+			);
+			expect(world.client.reconcileRoutes).not.toHaveBeenCalled();
+			expect(world.execCalls).toHaveLength(0);
+		},
+	);
+
+	it.each(['missing', 'Failed', 'replaced', 'foreign'])(
+		'rejects a Pod that becomes %s during route repair',
+		async (change) => {
+			const world = makeWorld();
+			await makeCompute(world).create(SANDBOX_ID).ready!();
+			vi.mocked(world.client.reconcileRoutes).mockImplementationOnce(async () => {
+				if (change === 'missing') world.pods.delete(NAME);
+				else if (change === 'Failed') world.setPhase(NAME, change);
+				else
+					Object.assign(
+						world.pods.get(NAME)!,
+						change === 'replaced' ? { uid: 'new-uid' } : { managedBy: 'someone-else' },
+					);
+			});
+			await expect(makeCompute(world).connectExisting(SANDBOX_ID).exec('true')).rejects.toThrow(
+				/no longer running|was replaced|does not belong/,
+			);
+			expect(world.execCalls).toHaveLength(0);
+			expect(world.ensured).toHaveLength(1);
+		},
+	);
+
+	it('fails without creating when the pod is missing', async () => {
+		const world = makeWorld();
+		await expect(makeCompute(world).connectExisting(SANDBOX_ID).ready!()).rejects.toThrow(
+			'no longer running',
+		);
+		expect(world.ensured).toHaveLength(0);
+		expect(world.pods.size).toBe(0);
+		expect(world.client.reconcileRoutes).not.toHaveBeenCalled();
+	});
+
+	it.each(['Pending', 'Succeeded', 'Failed'])(
+		'rejects a %s pod without recreating it',
+		async (phase) => {
+			const world = makeWorld();
+			await makeCompute(world).create(SANDBOX_ID).ready!();
+			world.setPhase(NAME, phase);
+			await expect(makeCompute(world).connectExisting(SANDBOX_ID).ready!()).rejects.toThrow(
+				'no longer running',
+			);
+			expect(world.ensured).toHaveLength(1);
+			expect(world.client.reconcileRoutes).not.toHaveBeenCalled();
+		},
+	);
+});
