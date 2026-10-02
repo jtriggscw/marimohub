@@ -2089,6 +2089,53 @@ describe('Session routes', () => {
 		).toHaveLength(1);
 	});
 
+	it('enforces the cap across replicas with warm terminal-record caches', async () => {
+		const replica = () =>
+			createTestApi({
+				bucket,
+				userId: ACTOR,
+				compute: makeFakeCompute(),
+				maxConcurrentSessionsPerUser: 1,
+			});
+		const first = replica();
+		const second = replica();
+		const terminal = await first.deps.services.sessions.createSession({
+			project_id: createProjectId(),
+			notebook_id: createNotebookId(),
+			user_id: ACTOR,
+		});
+		await first.deps.services.sessions.terminate(terminal.project_id, terminal.session_id);
+		await Promise.all(
+			[first, second].map((api) => api.deps.services.sessions.listActiveForUser(ACTOR)),
+		);
+		const other = await first.deps.services.notebooks.createNotebook(
+			pid,
+			{ title: 'Other', description: 'd', code: 'import marimo as mo' },
+			ACTOR,
+		);
+
+		const published = Promise.withResolvers<void>();
+		let creates = 0;
+		for (const api of [first, second]) {
+			const sessions = api.deps.services.sessions;
+			const create = sessions.createSession.bind(sessions);
+			vi.spyOn(sessions, 'createSession').mockImplementation(async (input) => {
+				const session = await create(input);
+				if (++creates === 2) published.resolve();
+				await published.promise;
+				return session;
+			});
+		}
+		const responses = await Promise.all([
+			first.request('POST', sessionsPath()),
+			second.request('POST', `/projects/${pid}/notebooks/${other.id}/sessions`),
+		]);
+		expect(responses.map((res) => res.status).sort((a, b) => a - b)).toEqual([200, 429]);
+		const live = await first.deps.services.sessions.listActiveForUser(ACTOR);
+		expect(live).toHaveLength(1);
+		expect(live[0].status).toBe('running');
+	});
+
 	it('POST /sessions reuses an existing running session instead of provisioning anew', async () => {
 		const first = await expectOk<ApiSession>(await owner('POST', sessionsPath()));
 		const second = await expectOk<ApiSession>(await owner('POST', sessionsPath()));

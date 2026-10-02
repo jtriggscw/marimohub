@@ -6,6 +6,7 @@ import { BUCKET_SCAN_CONCURRENCY, MARIMO_PORT } from '../../constants';
 import type { EditorSandboxSharing, SessionMode } from '../../constants';
 import { mapWithConcurrency } from '../../concurrency';
 import { Millis } from '../../duration';
+import { Stopwatch } from '../../timing';
 import {
 	ConflictError,
 	EditSessionChangedError,
@@ -78,6 +79,7 @@ export const SURFACE_START_LEASE_MS = Millis.minutes(3);
 
 const HEARTBEAT_TTL_MS = Millis.minutes(5);
 const TERMINAL_RETENTION_MS = Millis.hours(24);
+const INACTIVE_CAP_CACHE_SIZE = 4096;
 
 /** The deadline is inclusive: a session is unauthorized AT `authorization_expires_at`. */
 export function isPastAuthorizationDeadline(
@@ -149,6 +151,9 @@ const byCapOrder = (a: Session, b: Session) => {
 };
 
 export class SessionService {
+	// Cache only terminal records that cannot occupy either cap. Revalidate their ETags on every list.
+	private readonly inactiveCapRecords = new Map<string, string>();
+
 	constructor(
 		private bucket: Bucket,
 		private metrics: Metrics = noopMetrics,
@@ -709,25 +714,22 @@ export class SessionService {
 	): Promise<Awaited<T>[]> {
 		const objects = await listAllObjects(this.bucket, prefix);
 		const scanned = await mapWithConcurrency(objects, BUCKET_SCAN_CONCURRENCY, async (obj) => {
-			const body = await this.bucket.get(obj.key);
-			if (!body) return SKIP;
-			// A single corrupt/legacy record must not abort a deployment-wide scan
-			// (listing, reuse, reaper). Skip it (logged) so the good records survive.
-			let session: Session;
-			try {
-				session = await readStored(SessionSchema, body, obj.key);
-			} catch (err) {
-				if (invalidRecords === 'throw') throw err;
-				logOperationalError(
-					'stored_object_skipped',
-					{ operation: 'session.scan', object: obj.key },
-					err,
-				);
-				return SKIP;
-			}
-			return handle(session, obj, body.etag);
+			const record = await this.readScannedSession(obj.key, invalidRecords);
+			return record ? handle(record.session, obj, record.etag) : SKIP;
 		});
 		return scanned.filter((r): r is Awaited<T> => r !== SKIP);
+	}
+
+	private async readScannedSession(key: string, invalidRecords: 'skip' | 'throw' = 'skip') {
+		const body = await this.bucket.get(key);
+		if (!body) return;
+		try {
+			return { session: await readStored(SessionSchema, body, key), etag: body.etag };
+		} catch (err) {
+			if (invalidRecords === 'throw') throw err;
+			logOperationalError('stored_object_skipped', { operation: 'session.scan', object: key }, err);
+			return;
+		}
 	}
 
 	async inspectSessions(): Promise<{ sessions: Session[]; incomplete: boolean }> {
@@ -968,7 +970,7 @@ export class SessionService {
 		capScope: 'user' | 'project' = 'user',
 	): Promise<Session[]> {
 		const active = ACTIVE_STATUSES as readonly Session['status'][];
-		const sessions = await this.listSessions();
+		const sessions = await this.scanForUserCap();
 		return sessions
 			.filter(
 				(s) =>
@@ -978,6 +980,66 @@ export class SessionService {
 					sessionModePolicy(s).capScope === capScope,
 			)
 			.sort(byCapOrder);
+	}
+
+	private async scanForUserCap(): Promise<Session[]> {
+		const stopwatch = new Stopwatch();
+		let listed = 0;
+		let reads = 0;
+		let cacheHits = 0;
+		let maxReadMs = 0;
+		try {
+			const objects = await stopwatch.time('list_ms', () =>
+				listAllObjects(this.bucket, paths.sessionsPrefix),
+			);
+			listed = objects.length;
+			// New cache entries must not evict this scan's pending hits.
+			const inactiveRecords = new Map(this.inactiveCapRecords);
+			let failure: { error: unknown } | undefined;
+			const records = await stopwatch.time('read_ms', () =>
+				mapWithConcurrency(objects, BUCKET_SCAN_CONCURRENCY, async (obj) => {
+					if (failure) return;
+					if (obj.etag && inactiveRecords.get(obj.key) === obj.etag) {
+						cacheHits++;
+						return;
+					}
+					this.inactiveCapRecords.delete(obj.key);
+					reads++;
+					const started = Date.now();
+					const record = await this.readScannedSession(obj.key)
+						.catch((error: unknown) => {
+							failure ??= { error };
+						})
+						.finally(() => {
+							maxReadMs = Math.max(maxReadMs, Date.now() - started);
+						});
+					if (!record) return;
+					const { session, etag } = record;
+					if (
+						etag &&
+						isTerminal(session.status) &&
+						(!session.sandbox_id || !!session.sandbox_reclaimed_at)
+					) {
+						this.inactiveCapRecords.set(obj.key, etag);
+						if (this.inactiveCapRecords.size > INACTIVE_CAP_CACHE_SIZE) {
+							this.inactiveCapRecords.delete(this.inactiveCapRecords.keys().next().value!);
+						}
+					}
+					return session;
+				}),
+			);
+			// Drain started reads before reporting timings or rejecting the admission.
+			if (failure) throw failure.error;
+			return records.filter((record) => record !== undefined);
+		} finally {
+			for (const [phase, ms] of Object.entries(stopwatch.timings)) {
+				this.metrics.histogram?.(`sessions.cap_scan.${phase}`, ms);
+			}
+			this.metrics.histogram?.('sessions.cap_scan.objects', listed);
+			this.metrics.histogram?.('sessions.cap_scan.reads', reads);
+			this.metrics.histogram?.('sessions.cap_scan.cache_hits', cacheHits);
+			this.metrics.histogram?.('sessions.cap_scan.max_read_ms', maxReadMs);
+		}
 	}
 
 	/** App capacity remains occupied until sandbox reclamation is confirmed. */
